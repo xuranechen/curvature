@@ -1,0 +1,113 @@
+[
+  {
+    "id": "tmpl_32f3b6aec1e1c0c1",
+    "name": "bugfix",
+    "max_concurrency": 2,
+    "stages": [
+      {
+        "id": "tmpl_stage_5d3572c92dbaa487",
+        "position": 0,
+        "snapshot": {
+          "id": "",
+          "name": "backlog",
+          "role": "user",
+          "auto_advance": false,
+          "session_reuse_policy": "task_main",
+          "created_at": "0001-01-01T00:00:00Z",
+          "updated_at": "0001-01-01T00:00:00Z"
+        }
+      },
+      {
+        "id": "tmpl_stage_a0844dd9e9cdc033",
+        "position": 1,
+        "snapshot": {
+          "id": "",
+          "name": "修复",
+          "role": "agent",
+          "auto_advance": false,
+          "agent": "codex",
+          "session_reuse_policy": "task_main",
+          "prompt_template": "{previous_input}\n不要兜底式修改，找到明确的原因",
+          "created_at": "0001-01-01T00:00:00Z",
+          "updated_at": "0001-01-01T00:00:00Z"
+        }
+      }
+    ],
+    "created_at": "2026-07-02T15:14:07.049605Z",
+    "updated_at": "2026-07-15T07:14:39.36357Z"
+  },
+  {
+    "id": "tmpl_e688ddd455286695",
+    "name": "优化改进",
+    "max_concurrency": 2,
+    "stages": [
+      {
+        "id": "tmpl_stage_104a5418559b3c8a",
+        "position": 0,
+        "snapshot": {
+          "id": "",
+          "name": "backlog",
+          "role": "user",
+          "auto_advance": false,
+          "session_reuse_policy": "task_main",
+          "created_at": "0001-01-01T00:00:00Z",
+          "updated_at": "0001-01-01T00:00:00Z"
+        }
+      },
+      {
+        "id": "tmpl_stage_7c27fbc006071bc6",
+        "position": 1,
+        "snapshot": {
+          "id": "",
+          "name": "实现",
+          "role": "agent",
+          "auto_advance": false,
+          "agent": "codex",
+          "session_reuse_policy": "task_main",
+          "prompt_template": "{previous_input}",
+          "created_at": "0001-01-01T00:00:00Z",
+          "updated_at": "0001-01-01T00:00:00Z"
+        }
+      }
+    ],
+    "created_at": "2026-07-02T15:16:01.314156Z",
+    "updated_at": "2026-07-15T07:12:30.572117Z"
+  },
+  {
+    "id": "tmpl_0d34149b1d70c2f8",
+    "name": "新功能",
+    "max_concurrency": 2,
+    "stages": [
+      {
+        "id": "tmpl_stage_716bbf926befd477",
+        "position": 0,
+        "snapshot": {
+          "id": "",
+          "name": "backlog",
+          "role": "user",
+          "auto_advance": false,
+          "session_reuse_policy": "task_main",
+          "created_at": "0001-01-01T00:00:00Z",
+          "updated_at": "0001-01-01T00:00:00Z"
+        }
+      },
+      {
+        "id": "tmpl_stage_f759e53c158aed7e",
+        "position": 1,
+        "snapshot": {
+          "id": "",
+          "name": "方案",
+          "role": "agent",
+          "auto_advance": false,
+          "agent": "codex",
+          "session_reuse_policy": "task_main",
+          "prompt_template": "{previous_input}",
+          "created_at": "0001-01-01T00:00:00Z",
+          "updated_at": "0001-01-01T00:00:00Z"
+        }
+      }
+    ],
+    "created_at": "2026-07-02T15:19:30.351072Z",
+    "updated_at": "2026-07-15T07:13:49.411475Z"
+  }
+]

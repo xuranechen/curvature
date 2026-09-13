@@ -1,0 +1,3139 @@
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSessionStream, type TimelineItem } from "../hooks/useSessionStream";
+import type { TodoUpdate } from "../services/session";
+import { ThinkingBlock } from "./stream/ThinkingBlock";
+import { ToolCallCard, renderToolIcon } from "./stream/ToolCallCard";
+import { AgentIcon } from "./AgentIcon";
+import { InlineTokenText } from "./InlineTokenText";
+import { MarkdownViewer } from "./MarkdownViewer";
+import { fetchProofProtectedBlob } from "../services/file";
+import type { ExchangeAux, RelatedFile, TokenUsage, ToolCall } from "../services/session";
+import { savePrompt } from "../services/prompts";
+import { reportError } from "../services/error";
+import { rootBadgeButtonStyle } from "./rootBadgeStyle";
+import { copyText } from "../services/clipboard";
+import type { AgentStatus } from "../services/agents";
+import { useI18n, type Locale } from "../i18n";
+import { formatSessionDuration } from "../services/sessionDuration";
+import {
+  relatedFileStatKey,
+  useRelatedFileStats,
+} from "../hooks/useRelatedFileStats";
+
+type SessionItem = {
+  key?: string;
+  session_key?: string;
+  type?: string;
+  name?: string;
+  agent?: string;
+  context_window?: {
+    totalTokens: number;
+    modelContextWindow: number;
+  };
+  search_seq?: number;
+  scope?: string;
+  purpose?: string;
+  exchanges?: Array<{
+    seq?: number;
+    role?: string;
+    agent?: string;
+    model?: string;
+    model_display_name?: string;
+    effort?: string;
+    fast_service?: string;
+    content?: string;
+    timestamp?: string;
+    context_window?: {
+      totalTokens: number;
+      modelContextWindow: number;
+    };
+    token_usage?: TokenUsage;
+  }>;
+  closed_at?: string;
+  source?: string;
+  related_files?: RelatedFile[];
+  exchange_aux?: Record<string, ExchangeAux[]>;
+};
+
+type SessionViewerProps = {
+  session: SessionItem | null;
+  loading?: boolean;
+  slashCommandResult?: {
+    sessionKey?: string;
+    command: string;
+    content: string;
+    status: "running" | "complete" | "failed";
+    error?: string;
+    loginNotice?: {
+      status?: string;
+      loginId?: string;
+      verificationUrl?: string;
+      userCode?: string;
+      error?: string;
+      authMode?: string;
+      planType?: string;
+    };
+  } | null;
+  rootId?: string | null;
+  rootPath?: string | null;
+  interactionMode?: "main" | "drawer";
+  targetSeq?: number;
+  gitFileStatsByPath?: Record<
+    string,
+    { status: string; additions: number; deletions: number }
+  >;
+  onFileClick?: (file: RelatedFile & { name?: string }) => void;
+  onRootClick?: (rootId: string) => void;
+  onRemoveRelatedFile?: (path: string, head?: string, repoPath?: string, repoKind?: string) => void;
+  onAskUserAnswer?: (input: {
+    rootId: string;
+    sessionKey: string;
+    agent?: string;
+    toolUseId: string;
+    answers: Record<string, string>;
+  }) => void | Promise<void>;
+  onEditUserMessage?: (content: string) => void;
+  onForkAgentMessage?: (seq: number) => void | Promise<void>;
+  targetSeqRequestKey?: string | number;
+  agents?: AgentStatus[];
+  composerOverlayInset?: number;
+};
+
+type AskUserQuestionOption = {
+  label?: string;
+  description?: string;
+};
+
+type AskUserQuestionItem = {
+  question?: string;
+  header?: string;
+  options?: AskUserQuestionOption[];
+  multiSelect?: boolean;
+};
+
+type UploadAttachment = {
+  path: string;
+  name: string;
+  isImage: boolean;
+};
+
+function AttachmentImage({
+  rootId,
+  path,
+  name,
+}: {
+  rootId: string;
+  path: string;
+  name: string;
+}) {
+  const [url, setURL] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    let objectURL = "";
+    async function run() {
+      try {
+        const blob = await fetchProofProtectedBlob({ rootId, path });
+        if (cancelled) return;
+        objectURL = URL.createObjectURL(blob);
+        setURL(objectURL);
+      } catch {
+        if (!cancelled) {
+          setURL("");
+        }
+      }
+    }
+    if (rootId && path) {
+      void run();
+    }
+    return () => {
+      cancelled = true;
+      if (objectURL) {
+        URL.revokeObjectURL(objectURL);
+      }
+    };
+  }, [rootId, path]);
+
+  return (
+    <img
+      src={url}
+      alt={name}
+      style={{
+        display: "block",
+        width: "100%",
+        maxHeight: "220px",
+        objectFit: "cover",
+        background: "rgba(15,23,42,0.06)",
+      }}
+    />
+  );
+}
+
+const uploadTokenPattern = /\[(?:read file|file):\s*([^\]]+)\]/g;
+
+function basename(path: string): string {
+  const normalized = (path || "").replace(/\\/g, "/");
+  const parts = normalized.split("/");
+  return parts[parts.length - 1] || path;
+}
+
+function isImagePath(path: string): boolean {
+  return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(path);
+}
+
+function extractUploadAttachments(content: string): UploadAttachment[] {
+  const attachments: UploadAttachment[] = [];
+  uploadTokenPattern.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = uploadTokenPattern.exec(content || "")) !== null) {
+    const path = match[1].trim();
+    attachments.push({
+      path,
+      name: basename(path),
+      isImage: isImagePath(path),
+    });
+  }
+  return attachments;
+}
+
+function stripImageAttachmentTokens(content: string): string {
+  if (!content) {
+    return "";
+  }
+  const stripped = content.replace(
+    uploadTokenPattern,
+    (fullMatch, rawPath: string) => {
+      const path = String(rawPath || "").trim();
+      if (!isImagePath(path)) {
+        return fullMatch;
+      }
+      return "";
+    },
+  );
+  return stripped.replace(/\n{3,}/g, "\n\n").replace(/^[\n\s]+|[\n\s]+$/g, "");
+}
+
+function stripUploadAttachmentTokens(content: string): string {
+  if (!content) {
+    return "";
+  }
+  return content
+    .replace(uploadTokenPattern, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/^[\n\s]+|[\n\s]+$/g, "");
+}
+
+function formatContextWindowPercent(contextWindow?: {
+  totalTokens: number;
+  modelContextWindow: number;
+}) {
+  const usedTokens = Math.max(0, Number(contextWindow?.totalTokens || 0));
+  const modelContextWindow = Math.max(
+    0,
+    Number(contextWindow?.modelContextWindow || 0),
+  );
+  if (!usedTokens || !modelContextWindow) {
+    return null;
+  }
+  const usedRatio = Math.max(0, Math.min(1, usedTokens / modelContextWindow));
+  return {
+    usedTokens,
+    usedRatio,
+    percent: Math.round(usedRatio * 100),
+  };
+}
+
+function formatCompactTokenCount(value: number) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0";
+  }
+  if (value >= 1_000_000) {
+    return `${Math.round(value / 1_000_000)}M`;
+  }
+  if (value >= 1_000) {
+    return `${Math.round(value / 1_000)}K`;
+  }
+  return String(Math.round(value));
+}
+
+function formatTurnTokenCount(value: number) {
+  const tokens = Math.max(0, Number(value || 0));
+  const compact = (amount: number, suffix: string) => {
+    const digits = amount >= 100 ? 0 : amount >= 10 ? 1 : 2;
+    return `${Number(amount.toFixed(digits))}${suffix}`;
+  };
+  if (tokens >= 1_000_000) {
+    return compact(tokens / 1_000_000, "m");
+  }
+  if (tokens >= 1_000) {
+    return compact(tokens / 1_000, "k");
+  }
+  return String(Math.round(tokens));
+}
+
+function TurnTokenUsage({ usage }: { usage?: TokenUsage }) {
+  if (!usage) {
+    return null;
+  }
+  const inputTokens = Math.max(0, Number(usage.inputTokens || 0));
+  const outputTokens = Math.max(0, Number(usage.outputTokens || 0));
+  if (!inputTokens && !outputTokens) {
+    return null;
+  }
+  const cacheReadReported = Number.isFinite(usage.cacheReadTokens);
+  const cacheReadTokens = Math.max(0, Number(usage.cacheReadTokens || 0));
+  const hitPercent = inputTokens > 0 && cacheReadReported
+    ? Math.round(Math.min(1, cacheReadTokens / inputTokens) * 100)
+    : null;
+  const cacheLabel = hitPercent === null ? "—" : `${hitPercent}%`;
+  return (
+    <span
+      title={`${inputTokens}(♻ ${cacheLabel})→${outputTokens}`}
+      style={{
+        display: "inline-flex",
+        alignItems: "baseline",
+        flexWrap: "wrap",
+        minWidth: 0,
+        fontVariantNumeric: "tabular-nums",
+      }}
+    >
+      <span>{formatTurnTokenCount(inputTokens)}</span>
+      <span>{`(♻ ${cacheLabel})`}</span>
+      <span>→</span>
+      <span>{formatTurnTokenCount(outputTokens)}</span>
+    </span>
+  );
+}
+
+function modelDisplayName(
+  agents: AgentStatus[] | undefined,
+  agentName?: string,
+  modelID?: string,
+): string {
+  const model = `${modelID || ""}`.trim();
+  if (!model) {
+    return "";
+  }
+  const agent = (agents || []).find(
+    (item) => item.name === `${agentName || ""}`.trim(),
+  );
+  const match = (agent?.models || []).find((item) => item.id === model);
+  return `${match?.name || ""}`.trim() || model;
+}
+
+function formatAssistantExchangeMeta(
+  item: TimelineItem,
+  agents?: AgentStatus[],
+): string {
+  if (item.type !== "assistant_text") {
+    return "";
+  }
+  const parts = [
+    `${item.modelDisplayName || ""}`.trim() ||
+      modelDisplayName(agents, item.agent, item.model),
+    item.effort,
+  ]
+    .map((value) => `${value || ""}`.trim())
+    .filter(Boolean);
+  if (`${item.fastService || ""}`.trim().toLowerCase() === "on") {
+    parts.push("fast");
+  }
+  return parts.join(" · ");
+}
+
+function ContextWindowBadge({
+  contextWindow,
+}: {
+  contextWindow?: { totalTokens: number; modelContextWindow: number };
+}) {
+  const metrics = formatContextWindowPercent(contextWindow);
+  if (!metrics) {
+    return null;
+  }
+  const hue =
+    metrics.percent >= 90
+      ? "#dc2626"
+      : metrics.percent >= 75
+        ? "#ea580c"
+        : "#0f766e";
+  return (
+    <span
+      title={`Context Window ${metrics.percent}% used (${metrics.usedTokens}/${contextWindow?.modelContextWindow} used)`}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flexWrap: "wrap",
+        minWidth: 0,
+        color: hue,
+        lineHeight: 1.1,
+        fontSize: "10px",
+        fontWeight: 700,
+        letterSpacing: "0.01em",
+        fontVariantNumeric: "tabular-nums",
+        overflowWrap: "anywhere",
+      }}
+    >
+      <span>{metrics.percent}%</span>
+      <span>&middot;used</span>
+      <span>
+        {`(${formatCompactTokenCount(metrics.usedTokens)}/${formatCompactTokenCount(
+          contextWindow?.modelContextWindow || 0,
+        )})`}
+      </span>
+    </span>
+  );
+}
+
+function previousUserTimestamp(timeline: TimelineItem[], index: number): string {
+  for (let i = index - 1; i >= 0; i -= 1) {
+    const item = timeline[i];
+    if (item.type === "user_text") {
+      return item.timestamp || "";
+    }
+  }
+  return "";
+}
+
+const formatTime = (isoString: string | undefined, locale: Locale) => {
+  if (!isoString) return "";
+  try {
+    const date = new Date(isoString);
+    const now = new Date();
+    const isToday = date.toDateString() === now.toDateString();
+    const isThisYear = date.getFullYear() === now.getFullYear();
+    const timeStr = date.toLocaleTimeString(locale, {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+    if (isToday) return timeStr;
+    const month = (date.getMonth() + 1).toString().padStart(2, "0");
+    const day = date.getDate().toString().padStart(2, "0");
+    if (isThisYear) return `${month}-${day} ${timeStr}`;
+    return `${date.getFullYear()}-${month}-${day} ${timeStr}`;
+  } catch {
+    return "";
+  }
+};
+
+const formatToolCallFallbackResult = (toolCall: Partial<ToolCall>): string => {
+  const kind = (toolCall.kind || "").toLowerCase();
+  if (kind === "read") return "";
+  const rawInput = toolCall.meta?.input;
+  if (typeof rawInput === "string" && rawInput.trim() !== "") {
+    const todoMarkdown = formatTodoToolCallInput(rawInput);
+    if (todoMarkdown) return todoMarkdown;
+    return rawInput;
+  }
+  const rawOutput = toolCall.meta?.output;
+  if (typeof rawOutput === "string" && rawOutput.trim() !== "")
+    return rawOutput;
+  return "";
+};
+
+const formatTodoToolCallInput = (rawInput: string): string => {
+  try {
+    const parsed = JSON.parse(rawInput) as {
+      todos?: Array<{
+        content?: string;
+        status?: string;
+        activeForm?: string;
+      }>;
+    };
+    if (!Array.isArray(parsed?.todos) || parsed.todos.length === 0) {
+      return "";
+    }
+    const lines = parsed.todos
+      .map((todo) => {
+        const content = `${todo?.content || ""}`.trim();
+        const activeForm = `${todo?.activeForm || ""}`.trim();
+        const status = `${todo?.status || ""}`.trim().toLowerCase();
+        if (status === "completed") {
+          const label = content || activeForm;
+          return label ? `- [x] ${label}` : "";
+        }
+        if (status === "in_progress") {
+          const label = activeForm || content;
+          return label ? `- [ ] ${label} _(in progress)_` : "";
+        }
+        const label = content || activeForm;
+        return label ? `- [ ] ${label}` : "";
+      })
+      .filter(Boolean);
+    return lines.join("\n");
+  } catch {
+    return "";
+  }
+};
+
+function isAuxiliaryTimelineItem(item: TimelineItem | null): boolean {
+  return (
+    item?.type === "tool" ||
+    item?.type === "thought" ||
+    item?.type === "todo" ||
+    item?.type === "plan" ||
+    item?.type === "compact"
+  );
+}
+
+function PlanUpdateCard({ content, rootId }: { content: string; rootId?: string | null }) {
+  return (
+    <div
+      style={{
+        width: "100%",
+        minWidth: 0,
+        borderRadius: "10px",
+        border: "1px solid rgba(59, 130, 246, 0.24)",
+        background: "linear-gradient(180deg, rgba(59, 130, 246, 0.08), rgba(59, 130, 246, 0.03))",
+        overflow: "hidden",
+      }}
+    >
+      <div
+        style={{
+          padding: "6px 8px",
+          fontSize: "12px",
+          fontWeight: 600,
+          color: "var(--text-primary)",
+          borderBottom: "1px solid var(--border-color)",
+        }}
+      >
+        Plan
+      </div>
+      <div style={{ padding: "10px" }}>
+        <MarkdownViewer content={content || ""} root={rootId || undefined} />
+      </div>
+    </div>
+  );
+}
+
+function CompactNoticeCard({
+  status,
+  summary,
+}: {
+  status?: string;
+  summary?: string;
+}) {
+  const normalizedStatus = `${status || ""}`.toLowerCase();
+  const label =
+    normalizedStatus === "running"
+      ? "Compacting context"
+      : normalizedStatus === "error"
+        ? "Context compaction failed"
+        : "Context compacted";
+  return (
+    <div
+      style={{
+        width: "100%",
+        minWidth: 0,
+        borderRadius: "10px",
+        border: "1px solid rgba(148, 163, 184, 0.28)",
+        background: "rgba(148, 163, 184, 0.08)",
+        padding: "10px",
+        color: "var(--text-secondary)",
+        fontSize: "13px",
+      }}
+    >
+      <div style={{ fontWeight: 600, color: "var(--text-primary)" }}>{label}</div>
+      {summary ? <div style={{ marginTop: "6px" }}>{summary}</div> : null}
+    </div>
+  );
+}
+
+function TodoUpdateCard({ todoUpdate }: { todoUpdate: TodoUpdate }) {
+  const items = Array.isArray(todoUpdate?.items) ? todoUpdate.items : [];
+  return (
+    <div
+      style={{
+        width: "100%",
+        minWidth: 0,
+        borderRadius: "10px",
+        border: "1px solid rgba(16, 185, 129, 0.22)",
+        background:
+          "linear-gradient(180deg, rgba(16, 185, 129, 0.08), rgba(16, 185, 129, 0.03))",
+        overflow: "hidden",
+      }}
+    >
+      <div
+        style={{
+          padding: "6px 8px",
+          fontSize: "12px",
+          fontWeight: 600,
+          color: "var(--text-primary)",
+          borderBottom: "1px solid var(--border-color)",
+        }}
+      >
+        ✅ todos
+      </div>
+      <div
+        style={{
+          padding: "10px",
+          display: "flex",
+          flexDirection: "column",
+          gap: "6px",
+        }}
+      >
+        {items.map((item, index) => {
+          const status = `${item?.status || ""}`.trim().toLowerCase();
+          const content = `${item?.content || ""}`.trim();
+          const activeForm = `${item?.activeForm || ""}`.trim();
+          const label =
+            status === "in_progress" && activeForm
+              ? activeForm
+              : content || activeForm;
+          const checked = status === "completed";
+          return (
+            <div
+              key={`${index}-${label}`}
+              style={{
+                fontSize: "13px",
+                color: "var(--text-primary)",
+                opacity: checked ? 0.78 : 1,
+                textDecoration: checked ? "line-through" : "none",
+              }}
+            >
+              {checked ? "☑" : "☐"} {label}
+              {status === "in_progress" ? " (in progress)" : ""}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function getAskUserQuestions(toolCall: Partial<ToolCall>): AskUserQuestionItem[] {
+  const raw = toolCall.meta?.questions;
+  if (Array.isArray(raw)) {
+    return raw as AskUserQuestionItem[];
+  }
+  const input = toolCall.meta?.input;
+  if (typeof input !== "string" || input.trim() === "") {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(input) as { questions?: AskUserQuestionItem[] };
+    return Array.isArray(parsed.questions) ? parsed.questions : [];
+  } catch {
+    return [];
+  }
+}
+
+function getAskUserAnswers(toolCall: Partial<ToolCall>): Record<string, string> {
+  const raw = toolCall.meta?.answers;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+  const answers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const cleanKey = `${key || ""}`.trim();
+    const cleanValue = `${value || ""}`.trim();
+    if (cleanKey && cleanValue) {
+      answers[cleanKey] = cleanValue;
+    }
+  }
+  return answers;
+}
+
+function askUserQuestionTitle(question?: AskUserQuestionItem): string {
+  const questionText = `${question?.question || ""}`.trim();
+  const header = `${question?.header || ""}`.trim();
+  if (header && questionText) {
+    return `${header}：${questionText}`;
+  }
+  return questionText || header;
+}
+
+function AskUserIcon() {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width="16"
+      height="16"
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      style={{ color: "#ef4444", flexShrink: 0 }}
+    >
+      <g fill="currentColor">
+        <path d="M8 11a.75.75 0 1 1 0 1.5a.75.75 0 0 1 0-1.5m0-7c1.262 0 2.25.988 2.25 2.25c0 1.083-.566 1.648-1.021 2.104c-.408.407-.729.728-.729 1.396a.5.5 0 0 1-1 0c0-1.083.566-1.648 1.021-2.104c.408-.407.729-.728.729-1.396C9.25 5.538 8.712 5 8 5s-1.25.538-1.25 1.25a.5.5 0 0 1-1 0C5.75 4.988 6.738 4 8 4" />
+        <path
+          fillRule="evenodd"
+          d="M8 1a7 7 0 0 1 6.999 7.001a7 7 0 0 1-10.504 6.06l-2.728.91a.582.582 0 0 1-.744-.714l.83-2.906A7 7 0 0 1 8 1m.001 1.001c-3.308 0-6 2.692-6 6c0 1.003.252 1.996.73 2.871l.196.36l-.726 2.54l1.978-.659l.428-.143l.39.226A6 6 0 0 0 8 14l.001.001c3.308 0 6-2.692 6-6s-2.692-6-6-6"
+          clipRule="evenodd"
+        />
+      </g>
+    </svg>
+  );
+}
+
+function ForkIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+      style={{ transform: "rotate(180deg) scaleX(-1)" }}
+    >
+      <path d="M0 0h24v24H0z" fill="none" />
+      <path
+        fill="none"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.5"
+        d="M17 7a2 2 0 1 0 0-4a2 2 0 0 0 0 4M7 7a2 2 0 1 0 0-4a2 2 0 0 0 0 4m0 14a2 2 0 1 0 0-4a2 2 0 0 0 0 4M7 7v10M17 7v1c0 2.5-2 3-2 3l-6 2s-2 .5-2 3v1"
+      />
+      <circle cx="17" cy="5" r="2" fill="currentColor" />
+    </svg>
+  );
+}
+
+function AskUserQuestionCard({
+  toolCall,
+  rootId,
+  sessionKey,
+  agent,
+  active,
+  onAnswer,
+}: {
+  toolCall: ToolCall;
+  rootId?: string | null;
+  sessionKey?: string | null;
+  agent?: string;
+  active: boolean;
+  onAnswer?: SessionViewerProps["onAskUserAnswer"];
+}) {
+  const { t } = useI18n();
+  const questions = getAskUserQuestions(toolCall);
+  const [focusedCustomAnswerKey, setFocusedCustomAnswerKey] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const status = `${toolCall.status || ""}`.toLowerCase();
+  const isCurrent =
+    status === "running" || status === "pending" || status === "in_progress";
+  const [expanded, setExpanded] = useState(isCurrent);
+  const toolUseId =
+    toolCall.callId ||
+    (typeof toolCall.meta?.toolUseId === "string" ? toolCall.meta.toolUseId : "");
+  const persistedAnswers = getAskUserAnswers(toolCall);
+  const persistedAnswersKey = JSON.stringify(persistedAnswers);
+  const hasPersistedAnswers = Object.keys(persistedAnswers).length > 0;
+  const [answers, setAnswers] = useState<Record<string, string>>(persistedAnswers);
+  const [submitted, setSubmitted] = useState(hasPersistedAnswers);
+  const firstQuestionTitle = askUserQuestionTitle(questions[0]);
+  const title =
+    firstQuestionTitle ||
+    `${toolCall.title || ""}`.trim() ||
+    (typeof toolCall.meta?.title === "string" ? toolCall.meta.title : "") ||
+    "ask user";
+  const canSubmit =
+    !!rootId &&
+    !!sessionKey &&
+    !!toolUseId &&
+    !!onAnswer &&
+    questions.length > 0 &&
+    questions.every((_, index) => (answers[`q_${index}`] || "").trim() !== "") &&
+    !submitting &&
+    !submitted;
+
+  useEffect(() => {
+    if (hasPersistedAnswers) {
+      setAnswers(persistedAnswers);
+      setSubmitted(true);
+      setExpanded(false);
+      return;
+    }
+    setAnswers({});
+    setSubmitted(false);
+  }, [toolUseId, persistedAnswersKey, hasPersistedAnswers]);
+
+  useEffect(() => {
+    if (submitted) {
+      setExpanded(false);
+      return;
+    }
+    setExpanded(active && isCurrent);
+  }, [active, isCurrent, submitted, toolUseId]);
+
+  const setAnswer = (index: number, value: string) => {
+    setAnswers((prev) => ({ ...prev, [`q_${index}`]: value }));
+  };
+  const toggleMultiAnswer = (index: number, label: string, validLabels: string[]) => {
+    const key = `q_${index}`;
+    setAnswers((prev) => {
+      const current = (prev[key] || "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter((item) => item && validLabels.includes(item));
+      const next = current.includes(label)
+        ? current.filter((item) => item !== label)
+        : [...current, label];
+      return { ...prev, [key]: next.join(", ") };
+    });
+  };
+
+  return (
+    <div
+      style={{
+        width: "100%",
+        minWidth: 0,
+        borderRadius: "10px",
+        border: "1px solid rgba(239, 68, 68, 0.28)",
+        background:
+          "linear-gradient(180deg, rgba(239, 68, 68, 0.08), rgba(239, 68, 68, 0.03))",
+        overflow: "hidden",
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => setExpanded((value) => !value)}
+        style={{
+          width: "100%",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "flex-start",
+          padding: "6px 8px",
+          background: "rgba(239, 68, 68, 0.04)",
+          border: "none",
+          borderBottom: expanded ? "1px solid var(--border-color)" : "none",
+          cursor: "pointer",
+          fontSize: "12px",
+          gap: "6px",
+          minWidth: 0,
+        }}
+        title={title}
+      >
+        <AskUserIcon />
+        <span
+          style={{
+            minWidth: 0,
+            flex: 1,
+            fontWeight: 500,
+            color: "var(--text-primary)",
+            whiteSpace: expanded ? "normal" : "nowrap",
+            overflow: expanded ? "visible" : "hidden",
+            textOverflow: expanded ? "clip" : "ellipsis",
+            textAlign: "left",
+            overflowWrap: "anywhere",
+            lineHeight: 1.35,
+          }}
+        >
+          {title}
+        </span>
+        <span
+          style={{
+            flexShrink: 0,
+            transform: expanded ? "rotate(90deg)" : "rotate(0deg)",
+            transition: "transform 0.2s",
+            color: "var(--text-secondary)",
+            display: "inline-flex",
+            alignItems: "center",
+          }}
+        >
+          <svg
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.25"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <polyline points="9 18 15 12 9 6" />
+          </svg>
+        </span>
+      </button>
+      {expanded ? (
+        <div style={{ padding: "10px", display: "flex", flexDirection: "column", gap: "12px" }}>
+          {questions.map((question, index) => {
+            const key = `q_${index}`;
+            const options = Array.isArray(question.options) ? question.options : [];
+            const selected = answers[key] || "";
+            const optionLabels = options
+              .map((option) => `${option.label || ""}`.trim())
+              .filter(Boolean);
+            const selectedSet = new Set(
+              selected
+                .split(",")
+                .map((item) => item.trim())
+                .filter(Boolean),
+            );
+            const hasOptionSelection = question.multiSelect
+              ? optionLabels.some((label) => selectedSet.has(label))
+              : optionLabels.includes(selected);
+            const customAnswer = hasOptionSelection ? "" : selected;
+            const customAnswerActive =
+              customAnswer.trim() !== "" || focusedCustomAnswerKey === key;
+            const itemTitle = askUserQuestionTitle(question);
+            return (
+              <div key={key} style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                {itemTitle ? (
+                  <div
+                    style={{
+                      fontSize: "13px",
+                      fontWeight: 700,
+                      color: "var(--text-primary)",
+                      lineHeight: 1.45,
+                      overflowWrap: "anywhere",
+                    }}
+                  >
+                    {itemTitle}
+                  </div>
+                ) : null}
+                {options.length > 0 ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                    {options.map((option) => {
+                      const label = `${option.label || ""}`.trim();
+                      if (!label) return null;
+                      const checked = question.multiSelect
+                        ? selectedSet.has(label)
+                        : selected === label;
+                      return (
+                        <label
+                          key={label}
+                          style={{
+                            display: "flex",
+                            gap: "8px",
+                            alignItems: "flex-start",
+                            padding: "7px 8px",
+                            borderRadius: "8px",
+                            border: checked
+                              ? "1px solid rgba(239, 68, 68, 0.42)"
+                              : "1px solid var(--border-color)",
+                            background: checked ? "rgba(239, 68, 68, 0.10)" : "var(--content-bg)",
+                            cursor: submitted ? "default" : "pointer",
+                          }}
+                        >
+                          <input
+                            type={question.multiSelect ? "checkbox" : "radio"}
+                            name={`${toolUseId}-${key}`}
+                            checked={checked}
+                            disabled={submitted}
+                            onChange={() =>
+                              question.multiSelect
+                                ? toggleMultiAnswer(index, label, optionLabels)
+                                : setAnswer(index, label)
+                            }
+                            style={{ marginTop: "2px" }}
+                          />
+                          <span style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
+                            <span style={{ fontSize: "13px", color: "var(--text-primary)" }}>{label}</span>
+                            {option.description ? (
+                              <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
+                                {option.description}
+                              </span>
+                            ) : null}
+                          </span>
+                        </label>
+                      );
+                    })}
+                    <textarea
+                      value={customAnswer}
+                      disabled={submitted}
+                      onFocus={() => setFocusedCustomAnswerKey(key)}
+                      onBlur={() => setFocusedCustomAnswerKey((current) => (current === key ? "" : current))}
+                      onChange={(event) => setAnswer(index, event.target.value)}
+                      placeholder={t("session.askCustomAnswer")}
+                      rows={2}
+                      style={{
+                        width: "100%",
+                        resize: "vertical",
+                        borderRadius: "8px",
+                        border: customAnswerActive
+                          ? "1px solid rgba(239, 68, 68, 0.42)"
+                          : "1px solid var(--border-color)",
+                        outline: "none",
+                        background: "var(--content-bg)",
+                        color: "var(--text-primary)",
+                        padding: "8px",
+                        fontSize: "13px",
+                        boxSizing: "border-box",
+                      }}
+                    />
+                  </div>
+                ) : (
+                  <textarea
+                    value={selected}
+                    disabled={submitted}
+                    onChange={(event) => setAnswer(index, event.target.value)}
+                    placeholder={t("session.askAnswer")}
+                    rows={3}
+                    style={{
+                      width: "100%",
+                      resize: "vertical",
+                      borderRadius: "8px",
+                      border: "1px solid var(--border-color)",
+                      background: "var(--content-bg)",
+                      color: "var(--text-primary)",
+                      padding: "8px",
+                      fontSize: "13px",
+                      boxSizing: "border-box",
+                    }}
+                  />
+              )}
+            </div>
+          );
+        })}
+        <button
+          type="button"
+          disabled={!canSubmit}
+          onClick={async () => {
+            if (!canSubmit || !rootId || !sessionKey || !toolUseId || !onAnswer) return;
+            setSubmitting(true);
+            try {
+              await onAnswer({ rootId, sessionKey, agent, toolUseId, answers });
+              setSubmitted(true);
+              setExpanded(false);
+            } finally {
+              setSubmitting(false);
+            }
+          }}
+          style={{
+            alignSelf: "flex-start",
+            border: "none",
+            borderRadius: "999px",
+            padding: "6px 12px",
+            background: canSubmit ? "#ef4444" : "var(--border-color)",
+            color: canSubmit ? "#fff" : "var(--text-secondary)",
+            fontSize: "12px",
+            fontWeight: 700,
+            cursor: canSubmit ? "pointer" : "default",
+          }}
+        >
+          {submitted ? t("session.askSubmitted") : submitting ? t("session.askSubmitting") : t("session.askSubmit")}
+        </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function timelineItemSpacing(
+  previous: TimelineItem | null,
+  current: TimelineItem,
+): string {
+  if (!previous) {
+    return "0";
+  }
+  if (isAuxiliaryTimelineItem(previous) && isAuxiliaryTimelineItem(current)) {
+    return "6px";
+  }
+  return "16px";
+}
+
+function shouldDefaultCollapseRelatedFiles(
+  isMobile: boolean,
+  relatedFileCount: number,
+): boolean {
+  if (isMobile) {
+    return relatedFileCount > 0;
+  }
+  return relatedFileCount > 5;
+}
+
+const USER_MESSAGE_SUMMARY_LENGTH = 48;
+
+function normalizeUserMessageSummary(content: string, emptyLabel: string): string {
+  const text = stripUploadAttachmentTokens(content || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) {
+    return emptyLabel;
+  }
+  return text.length > USER_MESSAGE_SUMMARY_LENGTH
+    ? `${text.slice(0, USER_MESSAGE_SUMMARY_LENGTH)}...`
+    : text;
+}
+
+function UserMessageListIcon() {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 32 32" aria-hidden="true">
+      <path d="M0 0h32v32H0z" fill="none" />
+      <path fill="currentColor" d="M4.082 4.083v3h22.835v-3zm0 16.223h22.835v-3H4.082zm0-6.612h22.835v-3H4.082zm0 13.223h22.835v-3H4.082z" />
+    </svg>
+  );
+}
+
+function SessionViewerInner({
+  session,
+  loading = false,
+  slashCommandResult = null,
+  rootId,
+  rootPath,
+  interactionMode = "main",
+  targetSeq = 0,
+  targetSeqRequestKey = "",
+  gitFileStatsByPath = {},
+  onFileClick,
+  onRootClick,
+  onRemoveRelatedFile,
+  onAskUserAnswer,
+  onEditUserMessage,
+  onForkAgentMessage,
+  agents,
+  composerOverlayInset = 0,
+}: SessionViewerProps) {
+  const { locale, t } = useI18n();
+  const [relatedFilesCollapsed, setRelatedFilesCollapsed] = useState(false);
+  const [isMobile, setIsMobile] = useState(() => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    return window.matchMedia("(max-width: 767px)").matches;
+  });
+  const [savedPromptKeys, setSavedPromptKeys] = useState<Record<string, true>>(
+    {},
+  );
+  const [copiedMessageKeys, setCopiedMessageKeys] = useState<
+    Record<string, true>
+  >({});
+  const scrollEndRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const onFileClickRef = useRef(onFileClick);
+  const copyResetTimersRef = useRef<Record<string, number>>({});
+  const relatedFilesDefaultStateRef = useRef<string>("");
+  const userSummaryRootRef = useRef<HTMLDivElement | null>(null);
+  const userSummaryListRef = useRef<HTMLDivElement | null>(null);
+  const sessionKey = session?.key || session?.session_key || null;
+  const exchanges = Array.isArray(session?.exchanges) ? session.exchanges : [];
+  const isAwaiting = !!(session as any)?.pending;
+  const { timeline, isStreaming, streamVersion, streamStatusText } = useSessionStream(
+    sessionKey,
+    exchanges,
+    session?.exchange_aux || {},
+    session?.context_window,
+    isAwaiting,
+  );
+  const shouldStickToBottomRef = useRef(true);
+  const lastSessionKeyRef = useRef<string | null>(null);
+  const targetSeqScrollKeyRef = useRef("");
+  const targetSeqFrameRef = useRef<number | null>(null);
+  const targetSeqTimerRefs = useRef<number[]>([]);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const [userSummaryHoverOpen, setUserSummaryHoverOpen] = useState(false);
+  const [userSummaryPinnedOpen, setUserSummaryPinnedOpen] = useState(false);
+  const [currentUserMessageIndex, setCurrentUserMessageIndex] = useState(0);
+  const viewportStickFrameRef = useRef<number | null>(null);
+
+  const cancelTargetSeqScroll = () => {
+    if (targetSeqFrameRef.current !== null) {
+      window.cancelAnimationFrame(targetSeqFrameRef.current);
+      targetSeqFrameRef.current = null;
+    }
+    targetSeqTimerRefs.current.forEach((timer) => window.clearTimeout(timer));
+    targetSeqTimerRefs.current = [];
+  };
+
+  const stickSessionToBottom = (behavior: ScrollBehavior = "auto") => {
+    const container = scrollRef.current;
+    if (!container) {
+      return;
+    }
+    const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+    container.scrollTo({ top: maxTop, behavior });
+  };
+
+  useEffect(() => {
+    onFileClickRef.current = onFileClick;
+  }, [onFileClick]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const media = window.matchMedia("(max-width: 767px)");
+    const handleChange = () => {
+      setIsMobile(media.matches);
+    };
+    handleChange();
+    media.addEventListener("change", handleChange);
+    return () => {
+      media.removeEventListener("change", handleChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    setSavedPromptKeys({});
+    setCopiedMessageKeys({});
+    setUserSummaryHoverOpen(false);
+    setUserSummaryPinnedOpen(false);
+    setCurrentUserMessageIndex(0);
+    relatedFilesDefaultStateRef.current = "";
+    Object.values(copyResetTimersRef.current).forEach((timer) =>
+      window.clearTimeout(timer),
+    );
+    copyResetTimersRef.current = {};
+  }, [sessionKey]);
+
+  const userMessageSummaries = useMemo(
+    () =>
+      timeline
+        .filter((item): item is TimelineItem & { type: "user_text"; id: string; content: string } => item.type === "user_text")
+        .map((item, index) => ({
+          id: item.id || `user-${index}`,
+          index: index + 1,
+          summary: normalizeUserMessageSummary(item.content || "", t("session.emptyMessage")),
+        })),
+    [timeline, t],
+  );
+  const userSummaryOpen = userSummaryHoverOpen || userSummaryPinnedOpen;
+
+  const readCurrentUserMessageIndex = useCallback(() => {
+    const container = scrollRef.current;
+    if (!container) {
+      return 0;
+    }
+    const nodes = Array.from(
+      container.querySelectorAll<HTMLElement>("[data-user-message-index]"),
+    );
+    if (nodes.length === 0) {
+      return 0;
+    }
+    const containerRect = container.getBoundingClientRect();
+    const viewportTop = containerRect.top;
+    const viewportBottom = containerRect.bottom;
+    let firstVisible = 0;
+    let firstFullyEntered = 0;
+    let lastBeforeViewport = 0;
+    for (const node of nodes) {
+      const index = Number(node.dataset.userMessageIndex || 0);
+      if (!index) {
+        continue;
+      }
+      const rect = node.getBoundingClientRect();
+      if (rect.bottom < viewportTop) {
+        lastBeforeViewport = index;
+        continue;
+      }
+      if (rect.top > viewportBottom) {
+        break;
+      }
+      const isVisible = rect.bottom >= viewportTop && rect.top <= viewportBottom;
+      if (isVisible && !firstVisible) {
+        firstVisible = index;
+      }
+      if (rect.top >= viewportTop && !firstFullyEntered) {
+        firstFullyEntered = index;
+      }
+    }
+    return (
+      firstFullyEntered ||
+      firstVisible ||
+      lastBeforeViewport ||
+      Number(nodes[0]?.dataset.userMessageIndex || 0)
+    );
+  }, []);
+
+  const refreshCurrentUserMessageIndex = useCallback(() => {
+    setCurrentUserMessageIndex(readCurrentUserMessageIndex());
+  }, [readCurrentUserMessageIndex]);
+
+  const scrollToUserMessageSummary = (index: number) => {
+    const container = scrollRef.current;
+    if (!container) {
+      return;
+    }
+    const node = container.querySelector<HTMLElement>(
+      `[data-user-message-index="${index}"]`,
+    );
+    if (!node) {
+      return;
+    }
+    shouldStickToBottomRef.current = false;
+    cancelTargetSeqScroll();
+    const containerRect = container.getBoundingClientRect();
+    const nodeRect = node.getBoundingClientRect();
+    const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+    const nextTop = Math.max(
+      0,
+      Math.min(
+        maxTop,
+        container.scrollTop +
+          nodeRect.top -
+          containerRect.top -
+          container.clientHeight / 2 +
+          nodeRect.height / 2,
+      ),
+    );
+    container.scrollTop = nextTop;
+    setShowJumpToLatest(nextTop < maxTop - 40);
+    setUserSummaryPinnedOpen(false);
+    setUserSummaryHoverOpen(false);
+    setCurrentUserMessageIndex(index);
+  };
+
+  useEffect(() => {
+    if (!userSummaryOpen) {
+      return;
+    }
+    const nextIndex = readCurrentUserMessageIndex();
+    setCurrentUserMessageIndex(nextIndex);
+    if (!nextIndex) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      const list = userSummaryListRef.current;
+      const item = list?.querySelector<HTMLElement>(
+        `[data-user-summary-index="${nextIndex}"]`,
+      );
+      item?.scrollIntoView({ block: "center" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [readCurrentUserMessageIndex, userSummaryOpen, userMessageSummaries.length]);
+
+  useEffect(() => {
+    if (!userSummaryOpen) {
+      return;
+    }
+    const handlePointerDown = (event: PointerEvent) => {
+      const root = userSummaryRootRef.current;
+      if (!root || root.contains(event.target as Node)) {
+        return;
+      }
+      setUserSummaryPinnedOpen(false);
+      setUserSummaryHoverOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    return () => document.removeEventListener("pointerdown", handlePointerDown, true);
+  }, [userSummaryOpen]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(copyResetTimersRef.current).forEach((timer) =>
+        window.clearTimeout(timer),
+      );
+      copyResetTimersRef.current = {};
+      if (targetSeqFrameRef.current !== null) {
+        window.cancelAnimationFrame(targetSeqFrameRef.current);
+        targetSeqFrameRef.current = null;
+      }
+      if (viewportStickFrameRef.current !== null) {
+        window.cancelAnimationFrame(viewportStickFrameRef.current);
+        viewportStickFrameRef.current = null;
+      }
+      targetSeqTimerRefs.current.forEach((timer) => window.clearTimeout(timer));
+      targetSeqTimerRefs.current = [];
+    };
+  }, []);
+
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!container) {
+      return;
+    }
+    if (!scrollEndRef.current) {
+      return;
+    }
+    const nextKey = sessionKey;
+    const isSessionChanged = lastSessionKeyRef.current !== nextKey;
+    if (isSessionChanged) {
+      lastSessionKeyRef.current = nextKey;
+      shouldStickToBottomRef.current = true;
+    }
+    if (shouldStickToBottomRef.current) {
+      stickSessionToBottom("auto");
+    }
+  }, [sessionKey, timeline, isStreaming, streamVersion, slashCommandResult]);
+
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!container || typeof window === "undefined") {
+      return;
+    }
+    const queueStickToBottom = () => {
+      if (!shouldStickToBottomRef.current) {
+        return;
+      }
+      if (viewportStickFrameRef.current !== null) {
+        window.cancelAnimationFrame(viewportStickFrameRef.current);
+      }
+      viewportStickFrameRef.current = window.requestAnimationFrame(() => {
+        viewportStickFrameRef.current = null;
+        if (!shouldStickToBottomRef.current) {
+          return;
+        }
+        stickSessionToBottom("auto");
+      });
+    };
+    window.visualViewport?.addEventListener("resize", queueStickToBottom);
+    window.visualViewport?.addEventListener("scroll", queueStickToBottom);
+    window.addEventListener("curvature:safe-area-updated", queueStickToBottom as EventListener);
+    return () => {
+      window.visualViewport?.removeEventListener("resize", queueStickToBottom);
+      window.visualViewport?.removeEventListener("scroll", queueStickToBottom);
+      window.removeEventListener("curvature:safe-area-updated", queueStickToBottom as EventListener);
+      if (viewportStickFrameRef.current !== null) {
+        window.cancelAnimationFrame(viewportStickFrameRef.current);
+        viewportStickFrameRef.current = null;
+      }
+    };
+  }, [sessionKey]);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) {
+      shouldStickToBottomRef.current = true;
+      setShowJumpToLatest(false);
+      return;
+    }
+    let lastScrollTop = el.scrollTop;
+    const updateStickiness = () => {
+      const viewportGap = window.visualViewport
+        ? window.innerHeight - window.visualViewport.height - window.visualViewport.offsetTop
+        : 0;
+      const rawDistanceFromBottom = el.scrollHeight - el.clientHeight - el.scrollTop;
+      const distanceFromBottom = Math.max(0, rawDistanceFromBottom - viewportGap);
+      const isNearBottom = distanceFromBottom < 40;
+      const movedUp = el.scrollTop < lastScrollTop;
+      const movedDown = el.scrollTop > lastScrollTop;
+      if (isNearBottom) {
+        shouldStickToBottomRef.current = true;
+      } else if (movedUp) {
+        shouldStickToBottomRef.current = false;
+      } else if (movedDown && distanceFromBottom < 200) {
+        shouldStickToBottomRef.current = true;
+      }
+      setShowJumpToLatest(!shouldStickToBottomRef.current);
+      refreshCurrentUserMessageIndex();
+      lastScrollTop = el.scrollTop;
+    };
+    updateStickiness();
+    el.addEventListener("scroll", updateStickiness, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", updateStickiness);
+    };
+  }, [refreshCurrentUserMessageIndex, sessionKey]);
+
+  useEffect(() => {
+    if (!targetSeq) {
+      targetSeqScrollKeyRef.current = "";
+      return;
+    }
+    const scrollKey = `${sessionKey || ""}:${targetSeq}:${targetSeqRequestKey}`;
+    if (targetSeqScrollKeyRef.current === scrollKey) {
+      return;
+    }
+    const container = scrollRef.current;
+    if (!container || !timeline.length) {
+      return;
+    }
+    const node = container.querySelector<HTMLElement>(
+      `[data-session-seq="${targetSeq}"]`,
+    );
+    if (!node) {
+      return;
+    }
+    targetSeqScrollKeyRef.current = scrollKey;
+    shouldStickToBottomRef.current = false;
+    cancelTargetSeqScroll();
+    const scrollToNode = () => {
+      const latestContainer = scrollRef.current;
+      const latestNode = latestContainer?.querySelector<HTMLElement>(
+        `[data-session-seq="${targetSeq}"]`,
+      );
+      if (!latestContainer || !latestNode) {
+        return;
+      }
+      shouldStickToBottomRef.current = false;
+      const nextTop = Math.max(
+        0,
+        latestNode.offsetTop -
+          latestContainer.clientHeight / 2 +
+          latestNode.offsetHeight / 2,
+      );
+      latestContainer.scrollTo({ top: nextTop, behavior: "auto" });
+    };
+    targetSeqFrameRef.current = window.requestAnimationFrame(() => {
+      targetSeqFrameRef.current = window.requestAnimationFrame(() => {
+        targetSeqFrameRef.current = null;
+        scrollToNode();
+      });
+    });
+    [80, 220, 480].forEach((delay) => {
+      const timer = window.setTimeout(() => {
+        targetSeqTimerRefs.current = targetSeqTimerRefs.current.filter(
+          (item) => item !== timer,
+        );
+        if (targetSeqScrollKeyRef.current !== scrollKey) {
+          return;
+        }
+        scrollToNode();
+      }, delay);
+      targetSeqTimerRefs.current.push(timer);
+    });
+  }, [sessionKey, targetSeq, targetSeqRequestKey, timeline]);
+
+  const rawRelated = session?.related_files || (session as any)?.outputs || [];
+  const relatedFiles = (Array.isArray(rawRelated) ? rawRelated : [])
+    .map((f: any) => {
+      const path =
+        typeof f === "string" ? f : typeof f?.path === "string" ? f.path : "";
+      const name =
+        typeof f?.name === "string" ? f.name : path.split("/").pop() || path;
+      const head =
+        typeof f !== "string" && typeof f?.head === "string" ? f.head : "";
+      const repoPath =
+        typeof f !== "string" && typeof f?.repo_path === "string"
+          ? f.repo_path
+          : "";
+      const repoName =
+        typeof f !== "string" && typeof f?.repo_name === "string"
+          ? f.repo_name
+          : repoPath.split(/[\\/]/).filter(Boolean).pop() || "";
+      const repoKind =
+        typeof f !== "string" && typeof f?.repo_kind === "string"
+          ? f.repo_kind
+          : "";
+      const rootID =
+        typeof f !== "string" && typeof f?.root_id === "string"
+          ? f.root_id
+          : "";
+      return { path, name, head, repo_path: repoPath, repo_name: repoName, repo_kind: repoKind, root_id: rootID };
+    })
+    .filter((f) => f.path);
+  const gitStatsRefreshKey = Object.entries(gitFileStatsByPath)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([path, stats]) => `${path}:${stats.status}:${stats.additions}:${stats.deletions}`)
+    .join("|");
+  const relatedFileStatsByKey = useRelatedFileStats(
+    rootId,
+    relatedFiles,
+    gitStatsRefreshKey,
+  );
+  const activeAskUserCallId = (() => {
+    if (!isAwaiting) {
+      return "";
+    }
+    for (let i = timeline.length - 1; i >= 0; i -= 1) {
+      const item = timeline[i];
+      if (item.type === "user_text" || item.type === "assistant_text") {
+        return "";
+      }
+      if (item.type !== "tool") continue;
+      const toolCall = item.toolCall || {};
+      const kind = `${toolCall.kind || ""}`.toLowerCase();
+      const status = `${toolCall.status || ""}`.toLowerCase();
+      if (kind !== "ask_user") continue;
+      if (
+        status !== "running" &&
+        status !== "pending" &&
+        status !== "in_progress"
+      ) {
+        continue;
+      }
+      if (getAskUserQuestions(toolCall).length === 0) continue;
+      return (
+        toolCall.callId ||
+        (typeof toolCall.meta?.toolUseId === "string"
+          ? toolCall.meta.toolUseId
+          : "")
+      );
+    }
+    return "";
+  })();
+  const defaultRelatedFilesCollapsed = shouldDefaultCollapseRelatedFiles(
+    isMobile,
+    relatedFiles.length,
+  );
+  const relatedFilesDefaultStateKey = `${sessionKey || ""}:${isMobile ? "mobile" : "desktop"}:${defaultRelatedFilesCollapsed ? "collapsed" : "expanded"}`;
+
+  useEffect(() => {
+    if (relatedFilesDefaultStateRef.current === relatedFilesDefaultStateKey) {
+      return;
+    }
+    relatedFilesDefaultStateRef.current = relatedFilesDefaultStateKey;
+    setRelatedFilesCollapsed(defaultRelatedFilesCollapsed);
+  }, [defaultRelatedFilesCollapsed, relatedFilesDefaultStateKey]);
+
+  if (!session) {
+    return (
+      <div
+        style={{
+          padding: "40px",
+          textAlign: "center",
+          color: "var(--text-secondary)",
+        }}
+      >
+        {t("session.empty")}
+      </div>
+    );
+  }
+
+  const displayFiles = relatedFiles;
+  const displayFileGroups = (() => {
+    const currentRootPath = String(rootPath || "").replace(/[\\/]+$/, "");
+    const repoGroups = displayFiles.reduce<
+      Array<{
+        key: string;
+        repoPath: string;
+        repoName: string;
+        repoKind: string;
+        headGroups: Array<{ key: string; head: string; files: typeof displayFiles }>;
+      }>
+    >((groups, file) => {
+    const head = file.head || "";
+    const rawRepoPath = file.repo_path || "";
+    const normalizedRepoPath = String(rawRepoPath || "").replace(/[\\/]+$/, "");
+    const isCurrentRepoRecord =
+      !rawRepoPath ||
+      file.repo_name === t("session.currentProject") ||
+      (!!currentRootPath && normalizedRepoPath === currentRootPath);
+    const repoPath = isCurrentRepoRecord ? "" : rawRepoPath;
+    const rawRepoKind = file.repo_kind || "";
+    const repoKind = isCurrentRepoRecord && rawRepoKind !== "plain" ? "" : rawRepoKind;
+    const repoKey = `${repoKind}\0${repoPath}`;
+    let repoGroup = groups.find((group) => group.key === repoKey);
+    if (!repoGroup) {
+      repoGroup = {
+        key: repoKey,
+        repoPath,
+        repoName: isCurrentRepoRecord
+          ? t("session.currentProject")
+          : file.repo_name || repoPath.split(/[\\/]/).filter(Boolean).pop() || t("session.currentProject"),
+        repoKind,
+        headGroups: [],
+      };
+      groups.push(repoGroup);
+    }
+    const headKey = `${repoKey}\0${head}`;
+    const existing = repoGroup.headGroups.find((group) => group.key === headKey);
+    if (existing) {
+      existing.files.push(file);
+    } else {
+      repoGroup.headGroups.push({
+        key: headKey,
+        head,
+        files: [file],
+      });
+    }
+    return groups;
+    }, []);
+    return repoGroups.flatMap((repoGroup) =>
+      repoGroup.headGroups.map((headGroup) => ({
+        key: headGroup.key,
+        head: headGroup.head,
+        repoPath: repoGroup.repoPath,
+        repoName: repoGroup.repoName,
+        repoKind: repoGroup.repoKind,
+        files: headGroup.files,
+      })),
+    );
+  })();
+  const displayName =
+    session.name ||
+    session.purpose ||
+    session.key ||
+    session.session_key ||
+    "Session";
+  const hasVisibleTimeline = timeline.length > 0;
+  const userMetaButtonStyle: React.CSSProperties = {
+    width: "18px",
+    height: "18px",
+    border: "none",
+    background: "transparent",
+    padding: 0,
+    margin: 0,
+    color: "#2563eb",
+    cursor: "pointer",
+    fontSize: "14px",
+    fontWeight: 800,
+    lineHeight: 1,
+    opacity: 1,
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: "6px",
+    flexShrink: 0,
+  };
+
+  const makePromptKey = (
+    item: Extract<TimelineItem, { type: "user_text" | "assistant_text" }>,
+  ): string =>
+    `${item.id}\n${item.timestamp || ""}\n${item.content || ""}`;
+
+  const renderTimelineItem = (
+    item: TimelineItem,
+    idx: number,
+    spacing: string = "0",
+  ) => {
+    const timelineItemKey = item.id || `${item.type}-${idx}`;
+    if (item.type === "thought") {
+      return (
+        <div key={timelineItemKey} style={{ marginTop: spacing }}>
+          <ThinkingBlock content={item.content || ""} defaultExpanded={false} />
+        </div>
+      );
+    }
+    if (item.type === "tool") {
+      const tc = item.toolCall || {};
+      const isAskUser =
+        `${tc.kind || ""}`.toLowerCase() === "ask_user" &&
+        getAskUserQuestions(tc).length > 0;
+      const isUserShell =
+        `${tc.kind || ""}`.toLowerCase() === "execute" &&
+        tc.meta?.source === "userShell";
+      const toolUseId =
+        tc.callId ||
+        (typeof tc.meta?.toolUseId === "string" ? tc.meta.toolUseId : "");
+      return (
+        <div key={timelineItemKey} style={{ marginTop: spacing }}>
+          {isAskUser ? (
+            <AskUserQuestionCard
+              toolCall={tc}
+              rootId={rootId}
+              sessionKey={sessionKey}
+              agent={session?.agent}
+              active={!!toolUseId && toolUseId === activeAskUserCallId}
+              onAnswer={onAskUserAnswer}
+            />
+          ) : (
+            <ToolCallCard
+              kind={tc.kind}
+              title={
+                (tc as any).title ||
+                (tc.meta && typeof tc.meta.title === "string"
+                  ? (tc.meta.title as string)
+                  : "")
+              }
+              callId={tc.callId || ""}
+              status={tc.status || "running"}
+              content={tc.content}
+              result={formatToolCallFallbackResult(tc)}
+              locations={tc.locations}
+              meta={tc.meta}
+              rootPath={rootPath || undefined}
+              rootId={rootId}
+              sessionKey={sessionKey}
+              defaultExpanded={isUserShell}
+            />
+          )}
+        </div>
+      );
+    }
+    if (item.type === "todo") {
+      return (
+        <div key={timelineItemKey} style={{ marginTop: spacing }}>
+          <TodoUpdateCard todoUpdate={item.todoUpdate} />
+        </div>
+      );
+    }
+    if (item.type === "plan") {
+      return (
+        <div key={timelineItemKey} style={{ marginTop: spacing }}>
+          <PlanUpdateCard content={item.planUpdate?.content || ""} rootId={rootId} />
+        </div>
+      );
+    }
+    if (item.type === "compact") {
+      return (
+        <div key={timelineItemKey} style={{ marginTop: spacing }}>
+          <CompactNoticeCard
+            status={item.compactNotice?.status}
+            summary={item.compactNotice?.summary}
+          />
+        </div>
+      );
+    }
+    const isUser = item.type === "user_text";
+    const userMessageIndex = isUser
+      ? timeline.slice(0, idx + 1).filter((timelineItem) => timelineItem.type === "user_text").length
+      : undefined;
+    const next = idx + 1 < timeline.length ? timeline[idx + 1] : null;
+    const hasFollowingAssistantFlow =
+      !isUser && !!next && next.type !== "user_text";
+    const hideAssistantMeta =
+      !isUser &&
+      (hasFollowingAssistantFlow ||
+        (isStreaming && idx === timeline.length - 1));
+    const time = formatTime(item.timestamp, locale);
+    const uploadAttachments = isUser
+      ? extractUploadAttachments(item.content || "")
+      : [];
+    const imageAttachments = uploadAttachments.filter(
+      (attachment) => attachment.isImage,
+    );
+    const displayContent = isUser
+      ? stripImageAttachmentTokens(item.content || "")
+      : item.content || "";
+    const promptSaveContent = isUser
+      ? stripUploadAttachmentTokens(item.content || "")
+      : "";
+    const promptKey = makePromptKey(item);
+    const promptSaved = !!savedPromptKeys[promptKey];
+    const copySucceeded = !!copiedMessageKeys[promptKey];
+    const userMessageWidth =
+      imageAttachments.length > 0 ? "min(320px, 100%)" : "auto";
+    const hasRichUserAttachments = imageAttachments.length > 0;
+    const assistantMarkdownContent = !isUser ? (item.content || "").trim() : "";
+    const assistantExchangeMeta = !isUser
+      ? formatAssistantExchangeMeta(item, agents)
+      : "";
+    const assistantDurationLabel = !isUser
+      ? formatSessionDuration(previousUserTimestamp(timeline, idx), item.timestamp)
+      : "";
+    const canForkAgentMessage = !isUser && Number(item.seq || 0) > 0 && !!onForkAgentMessage;
+    return (
+      <div
+        key={timelineItemKey}
+        data-session-seq={item.seq || undefined}
+        data-user-message-index={userMessageIndex}
+        style={{
+          marginTop: spacing,
+          alignSelf: isUser ? "flex-end" : "flex-start",
+          width: isUser ? userMessageWidth : "100%",
+          maxWidth: isUser ? "80%" : "100%",
+          minWidth: 0,
+          position: "relative",
+          display: "flex",
+          flexDirection: "column",
+        }}
+      >
+        {isUser ? (
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "stretch",
+              gap: "6px",
+              width: userMessageWidth,
+              maxWidth: "100%",
+              minWidth: 0,
+            }}
+          >
+            {hasRichUserAttachments ? (
+              <div
+                style={{
+                  width: "100%",
+                  maxWidth: "100%",
+                  minWidth: 0,
+                  padding: "8px",
+                  borderRadius: "18px 18px 4px 18px",
+                  background: "rgba(148,163,184,0.14)",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "8px",
+                  boxSizing: "border-box",
+                }}
+              >
+                {imageAttachments.length > 0 ? (
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns:
+                        imageAttachments.length > 1
+                          ? "repeat(2, minmax(0, 1fr))"
+                          : "minmax(0, 1fr)",
+                      gap: "8px",
+                      width: "100%",
+                    }}
+                  >
+                    {imageAttachments.map((attachment) => (
+                      <button
+                        key={attachment.path}
+                        type="button"
+                        onClick={() =>
+                          onFileClickRef.current?.({ path: attachment.path })
+                        }
+                        style={{
+                          border: "none",
+                          padding: 0,
+                          background: "transparent",
+                          cursor: "pointer",
+                          borderRadius: "12px",
+                          overflow: "hidden",
+                        }}
+                        title={attachment.name}
+                      >
+                        <AttachmentImage
+                          rootId={rootId || ""}
+                          path={attachment.path}
+                          name={attachment.name}
+                        />
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                {displayContent ? (
+                  <div
+                    style={{
+                      padding:
+                        imageAttachments.length > 0 ? "2px 6px 0" : "6px 8px",
+                      color: "var(--text-primary)",
+                      fontSize: "14px",
+                      lineHeight: "1.5",
+                      whiteSpace: "pre-wrap",
+                      overflowWrap: "anywhere",
+                      wordBreak: "break-word",
+                    }}
+                  >
+                    <InlineTokenText
+                      content={displayContent}
+                      isDark={false}
+                      variant="inverse"
+                    />
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            {!hasRichUserAttachments && displayContent ? (
+              <div
+                style={{
+                  padding: "10px 16px",
+                  borderRadius: "18px 18px 4px 18px",
+                  background: "rgba(148,163,184,0.14)",
+                  color: "var(--text-primary)",
+                  fontSize: "14px",
+                  lineHeight: "1.5",
+                  boxShadow: "none",
+                  whiteSpace: "pre-wrap",
+                  overflowWrap: "anywhere",
+                  wordBreak: "break-word",
+                  alignSelf: "flex-end",
+                  maxWidth: "100%",
+                  minWidth: 0,
+                }}
+              >
+                <InlineTokenText
+                  content={displayContent}
+                  isDark={false}
+                  variant="inverse"
+                />
+              </div>
+            ) : null}
+            <span
+              style={{
+                fontSize: "10px",
+                color: "var(--text-secondary)",
+                opacity: 0.5,
+                alignSelf: "flex-end",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "4px",
+              }}
+            >
+              {item.pendingAck ? (
+                <span
+                  aria-label={t("session.sending")}
+                  style={{
+                    width: "8px",
+                    height: "8px",
+                    border: "1px solid var(--text-secondary)",
+                    borderTopColor: "transparent",
+                    borderRadius: "50%",
+                    display: "inline-block",
+                    animation: "spin 0.8s linear infinite",
+                  }}
+                />
+              ) : null}
+              <span>{time}</span>
+              <button
+                type="button"
+                onClick={() => {
+                  onEditUserMessage?.(item.content || "");
+                }}
+                style={userMetaButtonStyle}
+                aria-label={t("session.editMessage")}
+                title={t("session.editMessage")}
+              >
+                {renderToolIcon("edit")}
+              </button>
+              {promptSaved ? (
+                <span
+                  aria-label={t("session.promptSaved")}
+                  title={t("session.promptSaved")}
+                  style={{
+                    ...userMetaButtonStyle,
+                    color: "#2563eb",
+                    fontSize: "13px",
+                  }}
+                >
+                  ✓
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!promptSaveContent) {
+                      reportError(
+                        "file.write_failed",
+                        t("session.emptyPromptCannotSave"),
+                      );
+                      return;
+                    }
+                    void savePrompt(promptSaveContent)
+                      .then(() => {
+                        setSavedPromptKeys((prev) => ({
+                          ...prev,
+                          [promptKey]: true,
+                        }));
+                      })
+                      .catch((err) => {
+                        reportError(
+                          "file.write_failed",
+                          String((err as Error)?.message || t("session.savePromptFailed")),
+                        );
+                      });
+                  }}
+                  style={userMetaButtonStyle}
+                  aria-label={t("session.addPrompt")}
+                  title={t("session.addPrompt")}
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 16 16"
+                    aria-hidden="true"
+                  >
+                    <path
+                      fill="currentColor"
+                      stroke="currentColor"
+                      strokeWidth="0.45"
+                      strokeLinejoin="round"
+                      d="M1.086 5.183A2.5 2.5 0 0 1 2.854 2.12l3.863-1.035A2.5 2.5 0 0 1 9.78 2.854L10.354 5H9.32l-.506-1.888a1.5 1.5 0 0 0-1.837-1.06L3.112 3.087a1.5 1.5 0 0 0-1.06 1.837l1.035 3.864a1.5 1.5 0 0 0 1.837 1.06L5 9.828v1.028a2.5 2.5 0 0 1-2.879-1.81zM8 6a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h5a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zM7 8a1 1 0 0 1 1-1h5a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1zm4 .5a.5.5 0 0 0-1 0V10H8.5a.5.5 0 0 0 0 1H10v1.5a.5.5 0 0 0 1 0V11h1.5a.5.5 0 0 0 0-1H11z"
+                    />
+                  </svg>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  if (!promptSaveContent) {
+                    reportError("clipboard.write_failed", t("session.emptyMessageCannotCopy"));
+                    return;
+                  }
+                  const markCopied = () => {
+                    setCopiedMessageKeys((prev) => ({
+                      ...prev,
+                      [promptKey]: true,
+                    }));
+                    if (copyResetTimersRef.current[promptKey]) {
+                      window.clearTimeout(copyResetTimersRef.current[promptKey]);
+                    }
+                    copyResetTimersRef.current[promptKey] = window.setTimeout(() => {
+                      setCopiedMessageKeys((prev) => {
+                        const next = { ...prev };
+                        delete next[promptKey];
+                        return next;
+                      });
+                      delete copyResetTimersRef.current[promptKey];
+                    }, 1000);
+                  };
+                  void copyText(promptSaveContent)
+                    .then(markCopied)
+                    .catch((err) => {
+                      reportError(
+                        "clipboard.write_failed",
+                        String((err as Error)?.message || t("session.copyFailed")),
+                      );
+                    });
+                }}
+                style={userMetaButtonStyle}
+                aria-label={t("session.copyMessage")}
+                title={t("session.copyMessage")}
+              >
+                {copySucceeded ? (
+                  <span
+                    aria-hidden="true"
+                    style={{ fontSize: "13px", fontWeight: 800, lineHeight: 1 }}
+                  >
+                    ✓
+                  </span>
+                ) : (
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    aria-hidden="true"
+                  >
+                    <path
+                      fill="currentColor"
+                      d="M20 2H10c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2m0 12H10V4h10z"
+                    />
+                    <path
+                      fill="currentColor"
+                      d="M14 20H4V10h2V8H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2v-2h-2z"
+                    />
+                  </svg>
+                )}
+              </button>
+            </span>
+          </div>
+        ) : (
+          <div
+            style={{
+              width: "100%",
+              minWidth: 0,
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "flex-start",
+            }}
+          >
+            <div
+              style={{
+                color: "var(--text-primary)",
+                fontSize: "15px",
+                lineHeight: "1.7",
+                width: "100%",
+                minWidth: 0,
+              }}
+            >
+              <MarkdownViewer
+                content={item.content || ""}
+                root={rootId || undefined}
+                onFileClick={(path) => onFileClickRef.current?.({ path })}
+              />
+            </div>
+            {!hideAssistantMeta && (
+              <span
+                style={{
+                  alignSelf: "flex-start",
+                  display: "inline-flex",
+                  flexWrap: "nowrap",
+                  alignItems: "center",
+                  gap: "8px",
+                  maxWidth: "100%",
+                  minWidth: 0,
+                  fontSize: "10px",
+                  color: "var(--text-secondary)",
+                  opacity: 0.5,
+                  marginTop: "-10px",
+                  marginBottom: "4px",
+                }}
+              >
+                <span
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "3px",
+                    flexShrink: 0,
+                  }}
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!assistantMarkdownContent) {
+                        reportError(
+                          "clipboard.write_failed",
+                          t("session.emptyMessageCannotCopy"),
+                        );
+                        return;
+                      }
+                      void copyText(assistantMarkdownContent)
+                        .then(() => {
+                          setCopiedMessageKeys((prev) => ({
+                            ...prev,
+                            [promptKey]: true,
+                          }));
+                          if (copyResetTimersRef.current[promptKey]) {
+                            window.clearTimeout(
+                              copyResetTimersRef.current[promptKey],
+                            );
+                          }
+                          copyResetTimersRef.current[promptKey] =
+                            window.setTimeout(() => {
+                              setCopiedMessageKeys((prev) => {
+                                const next = { ...prev };
+                                delete next[promptKey];
+                                return next;
+                              });
+                              delete copyResetTimersRef.current[promptKey];
+                            }, 1000);
+                        })
+                        .catch((err) => {
+                          reportError(
+                            "clipboard.write_failed",
+                            String((err as Error)?.message || t("session.copyFailed")),
+                          );
+                        });
+                    }}
+                    style={userMetaButtonStyle}
+                    aria-label={t("session.copyMarkdown")}
+                    title={t("session.copyMarkdown")}
+                  >
+                    {copySucceeded ? (
+                      <span
+                        aria-hidden="true"
+                        style={{
+                          fontSize: "13px",
+                          fontWeight: 800,
+                          lineHeight: 1,
+                        }}
+                      >
+                        ✓
+                      </span>
+                    ) : (
+                      <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        width="14"
+                        height="14"
+                        viewBox="0 0 24 24"
+                        aria-hidden="true"
+                      >
+                        <path
+                          fill="currentColor"
+                          d="M20 2H10c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2m0 12H10V4h10z"
+                        />
+                        <path
+                          fill="currentColor"
+                          d="M14 20H4V10h2V8H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2v-2h-2z"
+                        />
+                      </svg>
+                    )}
+                  </button>
+                  {canForkAgentMessage ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const seq = Number(item.seq || 0);
+                        if (seq > 0) {
+                          void onForkAgentMessage?.(seq);
+                        }
+                      }}
+                      style={userMetaButtonStyle}
+                      aria-label={t("session.forkFromMessage")}
+                      title={t("session.forkFromMessage")}
+                    >
+                      <ForkIcon />
+                    </button>
+                  ) : null}
+                  <AgentIcon
+                    agentName={item.agent || ""}
+                    style={{ width: "12px", height: "12px", flexShrink: 0 }}
+                  />
+                </span>
+                <span
+                  style={{
+                    display: "inline-flex",
+                    flex: "1 1 auto",
+                    flexWrap: "wrap",
+                    alignItems: "center",
+                    gap: "0 8px",
+                    minWidth: 0,
+                    lineHeight: "16px",
+                  }}
+                >
+                  {assistantExchangeMeta ? (
+                    <span
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        minHeight: "16px",
+                        minWidth: 0,
+                        maxWidth: "100%",
+                        overflowWrap: "anywhere",
+                      }}
+                    >
+                      {assistantExchangeMeta}
+                    </span>
+                  ) : null}
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      minHeight: "16px",
+                      minWidth: 0,
+                      maxWidth: "100%",
+                      overflowWrap: "anywhere",
+                    }}
+                  >
+                    <TurnTokenUsage usage={item.tokenUsage} />
+                  </span>
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      minHeight: "16px",
+                      minWidth: 0,
+                      maxWidth: "100%",
+                      fontVariantNumeric: "tabular-nums",
+                      overflowWrap: "anywhere",
+                    }}
+                  >
+                    {time}{assistantDurationLabel ? ` ${assistantDurationLabel}` : ""}
+                  </span>
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      minHeight: "16px",
+                      minWidth: 0,
+                      maxWidth: "100%",
+                      overflowWrap: "anywhere",
+                    }}
+                  >
+                    <ContextWindowBadge contextWindow={item.contextWindow} />
+                  </span>
+                </span>
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderSlashCommandResult = () => {
+    if (!slashCommandResult) {
+      return null;
+    }
+    const commandLabel = `/${slashCommandResult.command || "status"}`;
+    const loginNotice = slashCommandResult.loginNotice;
+    const isLogin = (slashCommandResult.command || "") === "login";
+    const content =
+      slashCommandResult.error ||
+      loginNotice?.error ||
+      slashCommandResult.content ||
+      (slashCommandResult.status === "running"
+        ? isLogin
+          ? t("session.loginWaiting")
+          : t("session.statusFetching")
+        : "");
+    const loginCodeCopyKey = loginNotice?.loginId
+      ? `login-code:${loginNotice.loginId}`
+      : `login-code:${slashCommandResult.sessionKey}`;
+    const loginCodeCopied = !!copiedMessageKeys[loginCodeCopyKey];
+    return (
+      <div
+        style={{
+          marginTop: hasVisibleTimeline ? "18px" : "0",
+          width: "100%",
+          boxSizing: "border-box",
+          border: "1px solid rgba(148,163,184,0.36)",
+          background: "rgba(148,163,184,0.10)",
+          borderRadius: "8px",
+          padding: "10px 12px",
+          color: "var(--text-primary)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "8px",
+            marginBottom: content ? "6px" : 0,
+            fontSize: "11px",
+            lineHeight: 1.4,
+            color: "var(--text-secondary)",
+          }}
+        >
+          <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" }}>
+            {commandLabel}
+          </span>
+          <span>
+            {slashCommandResult.status === "running"
+              ? t("session.statusRunning")
+              : slashCommandResult.status === "failed"
+                ? t("session.statusFailed")
+                : t("session.statusComplete")}
+          </span>
+        </div>
+        {isLogin && loginNotice?.userCode ? (
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "8px",
+              fontSize: "13px",
+              lineHeight: 1.5,
+            }}
+          >
+            {loginNotice.verificationUrl ? (
+              <a
+                href={loginNotice.verificationUrl}
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: "var(--accent)", overflowWrap: "anywhere" }}
+              >
+                {loginNotice.verificationUrl}
+              </a>
+            ) : null}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+                flexWrap: "wrap",
+              }}
+            >
+              <span
+                style={{
+                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                  fontSize: "20px",
+                  letterSpacing: "0",
+                  color: "var(--text-primary)",
+                }}
+              >
+                {loginNotice.userCode}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  const userCode = loginNotice.userCode || "";
+                  if (!userCode) {
+                    reportError("clipboard.write_failed", t("session.emptyCodeCannotCopy"));
+                    return;
+                  }
+                  void copyText(userCode)
+                    .then(() => {
+                      setCopiedMessageKeys((prev) => ({
+                        ...prev,
+                        [loginCodeCopyKey]: true,
+                      }));
+                      if (copyResetTimersRef.current[loginCodeCopyKey]) {
+                        window.clearTimeout(
+                          copyResetTimersRef.current[loginCodeCopyKey],
+                        );
+                      }
+                      copyResetTimersRef.current[loginCodeCopyKey] =
+                        window.setTimeout(() => {
+                          setCopiedMessageKeys((prev) => {
+                            const next = { ...prev };
+                            delete next[loginCodeCopyKey];
+                            return next;
+                          });
+                          delete copyResetTimersRef.current[loginCodeCopyKey];
+                        }, 1000);
+                    })
+                    .catch((err) => {
+                      reportError(
+                        "clipboard.write_failed",
+                        String((err as Error)?.message || t("session.copyFailed")),
+                      );
+                    });
+                }}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  width: "22px",
+                  height: "22px",
+                  border: "none",
+                  background: "transparent",
+                  color: "var(--text-secondary)",
+                  borderRadius: "6px",
+                  padding: 0,
+                  cursor: "pointer",
+                }}
+                aria-label={loginCodeCopied ? t("session.codeCopied") : t("session.copyCode")}
+                title={loginCodeCopied ? t("session.copied") : t("session.copyCode")}
+              >
+                {loginCodeCopied ? (
+                  <span
+                    aria-hidden="true"
+                    style={{ fontSize: "13px", fontWeight: 800, lineHeight: 1 }}
+                  >
+                    ✓
+                  </span>
+                ) : (
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    aria-hidden="true"
+                  >
+                    <path
+                      fill="currentColor"
+                      d="M20 2H10c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2m0 12H10V4h10z"
+                    />
+                    <path
+                      fill="currentColor"
+                      d="M14 20H4V10h2V8H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2v-2h-2z"
+                    />
+                  </svg>
+                )}
+              </button>
+            </div>
+            {slashCommandResult.status === "complete" ? (
+              <div style={{ color: "var(--text-secondary)" }}>
+                {t("session.loginComplete")}
+                {loginNotice.planType ? ` · ${loginNotice.planType}` : ""}
+              </div>
+            ) : null}
+          </div>
+        ) : content ? (
+          <div
+            style={{
+              fontSize: "13px",
+              lineHeight: "1.6",
+              minWidth: 0,
+              overflowWrap: "anywhere",
+            }}
+          >
+            <MarkdownViewer
+              content={content}
+              root={rootId || undefined}
+              onFileClick={(path) => onFileClickRef.current?.({ path })}
+            />
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+
+  return (
+    <div
+      style={{
+        flex: 1,
+        minHeight: 0,
+        minWidth: 0,
+        display: "flex",
+        flexDirection: "column",
+        background: "transparent",
+      }}
+    >
+      {interactionMode === "drawer" ? null : (
+        <header
+          style={{
+            height: "36px",
+            padding: "0 16px",
+            borderBottom: "1px solid var(--border-color)",
+            display: "flex",
+            alignItems: "center",
+            background: "var(--curvature-topbar-bg, transparent)",
+            boxSizing: "border-box",
+            zIndex: 10,
+            flexShrink: 0,
+          }}
+        >
+          <h1
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              fontSize: "14px",
+              fontWeight: 600,
+              margin: 0,
+              minWidth: 0,
+            }}
+          >
+            {rootId ? (
+              <button
+                type="button"
+                onClick={() => onRootClick?.(rootId)}
+                style={{
+                  ...rootBadgeButtonStyle,
+                  flexShrink: 0,
+                  cursor: onRootClick ? "pointer" : "default",
+                }}
+              >
+                {rootId}
+              </button>
+            ) : null}
+            <span
+              style={{
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {displayName}
+            </span>
+          </h1>
+        </header>
+      )}
+
+      {/* 滚动容器 */}
+      <div style={{ flex: 1, minHeight: 0, minWidth: 0, position: "relative" }}>
+        <div ref={scrollRef} style={{ flex: 1, minHeight: 0, minWidth: 0, height: "100%", overflowY: "auto", overflowX: "hidden", position: "relative", WebkitOverflowScrolling: "touch" }}>
+          <div style={{
+            width: "100%",
+            minWidth: 0,
+            display: "block",
+            padding: "24px 16px",
+            boxSizing: "border-box",
+            overflowX: "hidden",
+          }} data-curvature-session-content-width="1">
+          <div style={{ width: "100%", minWidth: 0, margin: "0", display: "flex", flexDirection: "column" }}>
+            {loading && !hasVisibleTimeline ? (
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "10px",
+                  padding: "6px 0 8px",
+                }}
+              >
+                {[0, 1, 2].map((index) => (
+                  <div
+                    key={index}
+                    style={{
+                      width: index === 1 ? "78%" : index === 2 ? "64%" : "52%",
+                      height: index === 0 ? "18px" : "72px",
+                      alignSelf:
+                        index === 0
+                          ? "flex-start"
+                          : index === 1
+                            ? "flex-end"
+                            : "flex-start",
+                      borderRadius: index === 0 ? "8px" : "18px",
+                      background:
+                        "linear-gradient(90deg, rgba(148,163,184,0.12) 0%, rgba(148,163,184,0.24) 50%, rgba(148,163,184,0.12) 100%)",
+                      backgroundSize: "200% 100%",
+                      animation:
+                        "sessionLoadingPulse 1.1s ease-in-out infinite",
+                    }}
+                  />
+                ))}
+              </div>
+            ) : null}
+            {timeline.map((item, idx) =>
+              renderTimelineItem(
+                item,
+                idx,
+                timelineItemSpacing(idx > 0 ? timeline[idx - 1] : null, item),
+              ),
+            )}
+            {renderSlashCommandResult()}
+            {(isAwaiting || isStreaming) && (
+              <div
+                style={{
+                  marginTop: "16px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  fontSize: "12px",
+                  color: "var(--text-secondary)",
+                }}
+              >
+                <span
+                  style={{
+                    width: "8px",
+                    height: "8px",
+                    borderRadius: "50%",
+                    background: "var(--accent-color)",
+                    animation: "pulse 1s infinite",
+                  }}
+                />
+                {isStreaming
+                  ? streamStatusText || t("session.generating")
+                  : t("session.sentWaiting")}
+              </div>
+            )}
+
+            {relatedFiles.length > 0 && (
+              <div
+                style={{
+                  marginTop: "18px",
+                  paddingTop: "14px",
+                  borderTop: "1px solid var(--border-color)",
+                  width: "100%",
+                  boxSizing: "border-box",
+                }}
+              >
+                <div
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => setRelatedFilesCollapsed((value) => !value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      setRelatedFilesCollapsed((value) => !value);
+                    }
+                  }}
+                  style={{
+                    fontSize: "12px",
+                    fontWeight: 500,
+                    color: "var(--text-secondary)",
+                    marginBottom: "6px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    cursor: "pointer",
+                    borderRadius: "6px",
+                    padding: "2px 0",
+                    outline: "none",
+                  }}
+                >
+                  <span>{t("session.relatedFiles", { count: relatedFiles.length })}</span>
+                  <div
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "10px",
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setRelatedFilesCollapsed((value) => !value)
+                      }}
+                      aria-label={
+                        relatedFilesCollapsed ? t("session.expandRelatedFiles") : t("session.collapseRelatedFiles")
+                      }
+                      title={
+                        relatedFilesCollapsed ? t("session.expandRelatedFiles") : t("session.collapseRelatedFiles")
+                      }
+                      style={{
+                        border: "none",
+                        background: "transparent",
+                        padding: 0,
+                        margin: 0,
+                        cursor: "pointer",
+                        color: "var(--text-secondary)",
+                        width: "16px",
+                        height: "16px",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        flexShrink: 0,
+                      }}
+                    >
+                      <span
+                        aria-hidden="true"
+                        style={{
+                          flexShrink: 0,
+                          transform: relatedFilesCollapsed
+                            ? "rotate(0deg)"
+                            : "rotate(90deg)",
+                          transition: "transform 0.2s",
+                          color: "var(--text-secondary)",
+                          display: "inline-flex",
+                          alignItems: "center",
+                        }}
+                      >
+                        <svg
+                          width="12"
+                          height="12"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2.25"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
+                          <polyline points="9 18 15 12 9 6" />
+                        </svg>
+                      </span>
+                    </button>
+                  </div>
+                </div>
+                {!relatedFilesCollapsed ? (
+                  <div
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "4px",
+                    }}
+                  >
+                    {displayFileGroups.map((group) => {
+                      const normalizedRepoPath = String(group.repoPath || "").replace(/[\\/]+$/, "");
+                      const normalizedRootPath = String(rootPath || "").replace(/[\\/]+$/, "");
+                      const isCurrentRepo =
+                        !group.repoPath ||
+                        group.repoName === t("session.currentProject") ||
+                        normalizedRepoPath === normalizedRootPath;
+                      const showGroupHeader = group.repoKind === "plain" || group.head || !isCurrentRepo;
+                      return (
+                        <div
+                          key={group.key}
+                          style={{
+                            display: "flex",
+                            flexDirection: "column",
+                            gap: "4px",
+                          }}
+                        >
+                          {showGroupHeader ? (
+                            <div
+                              title={[group.repoPath, group.head].filter(Boolean).join(" · ") || group.repoName || t("session.currentProject")}
+                              style={{
+                                padding: "2px 6px 0",
+                                fontSize: "11px",
+                                color: "var(--text-secondary)",
+                                fontFamily: group.head
+                                  ? "var(--mono-font, monospace)"
+                                  : undefined,
+                              }}
+                            >
+                              {group.repoKind === "plain"
+                                ? `${group.repoName || t("session.currentProject")} · ${t("session.nonGit")}`
+                                : group.head
+                                  ? isCurrentRepo
+                                    ? `HEAD ${group.head.slice(0, 8)}`
+                                    : `${group.repoName || t("session.currentProject")} · HEAD ${group.head.slice(0, 8)}`
+                                  : group.repoName || t("session.currentProject")}
+                            </div>
+                          ) : null}
+                          {group.files.map((file) => {
+                            const stats =
+                              relatedFileStatsByKey[relatedFileStatKey(file)] ||
+                              gitFileStatsByPath[file.path];
+                            return (
+                          <div
+                            key={`${file.head || "legacy"}:${file.path}`}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "6px",
+                            }}
+                          >
+                            <div
+                              onClick={() => onFileClickRef.current?.(file)}
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "8px",
+                                flex: 1,
+                                minWidth: 0,
+                                padding: "3px 6px",
+                                borderRadius: "6px",
+                                cursor: "pointer",
+                                transition: "background 0.15s",
+                              }}
+                              onMouseEnter={(e) => {
+                                e.currentTarget.style.background =
+                                  "rgba(0,0,0,0.04)";
+                              }}
+                              onMouseLeave={(e) => {
+                                e.currentTarget.style.background =
+                                  "transparent";
+                              }}
+                            >
+                              <svg
+                                xmlns="http://www.w3.org/2000/svg"
+                                width="13"
+                                height="13"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="#94a3b8"
+                                strokeWidth="2"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                aria-hidden="true"
+                                style={{ flexShrink: 0 }}
+                              >
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                                <polyline points="14 2 14 8 20 8" />
+                                <line x1="16" x2="8" y1="13" y2="13" />
+                                <line x1="16" x2="8" y1="17" y2="17" />
+                                <line x1="10" x2="8" y1="9" y2="9" />
+                              </svg>
+                              <div
+                                style={{
+                                  flex: 1,
+                                  minWidth: 0,
+                                  fontSize: "12px",
+                                  color: "var(--text-primary)",
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                  whiteSpace: "nowrap",
+                                }}
+                              >
+                                {file.name}
+                              </div>
+                              {stats ? (
+                                <div
+                                  style={{
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    gap: "8px",
+                                    fontSize: "11px",
+                                    color: "var(--text-secondary)",
+                                    flexShrink: 0,
+                                  }}
+                                >
+                                  <span
+                                    style={{
+                                      color: "#15803d",
+                                      fontVariantNumeric: "tabular-nums",
+                                    }}
+                                  >
+                                    +{stats.additions}
+                                  </span>
+                                  <span
+                                    style={{
+                                      color: "#b91c1c",
+                                      fontVariantNumeric: "tabular-nums",
+                                    }}
+                                  >
+                                    -{stats.deletions}
+                                  </span>
+                                </div>
+                              ) : null}
+                            </div>
+                            <button
+                              type="button"
+                              aria-label={t("session.removeRelatedFile", { name: file.name || file.path })}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                onRemoveRelatedFile?.(
+                                  file.path,
+                                  file.head,
+                                  file.repo_path,
+                                  file.repo_kind,
+                                );
+                              }}
+                              style={{
+                                border: "none",
+                                background: "transparent",
+                                color: "#dc2626",
+                                cursor: "pointer",
+                                fontSize: "14px",
+                                lineHeight: 1,
+                                padding: "2px 4px",
+                                borderRadius: "4px",
+                                flexShrink: 0,
+                              }}
+                            >
+                              x
+                            </button>
+                          </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </div>
+            )}
+            <div ref={scrollEndRef} style={{ height: "1px" }} />
+          </div>
+          </div>
+        </div>
+        {userMessageSummaries.length > 0 || showJumpToLatest ? (
+          <div
+            style={{
+              position: "absolute",
+              right: "16px",
+              bottom: `${16 + composerOverlayInset}px`,
+              zIndex: 4,
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+            }}
+          >
+            {showJumpToLatest ? (
+              <button
+                type="button"
+                onClick={() => {
+                  cancelTargetSeqScroll();
+                  if (targetSeq) {
+                    targetSeqScrollKeyRef.current = `${sessionKey || ""}:${targetSeq}:${targetSeqRequestKey}`;
+                  }
+                  shouldStickToBottomRef.current = true;
+                  setShowJumpToLatest(false);
+                  stickSessionToBottom("smooth");
+                }}
+                aria-label={t("session.jumpLatest")}
+                title={t("session.jumpLatest")}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  height: "34px",
+                  border: "1px solid rgba(37,99,235,0.35)",
+                  background: "#2563eb",
+                  color: "#ffffff",
+                  borderRadius: "999px",
+                  padding: "0 12px",
+                  boxShadow: "0 8px 24px rgba(15, 23, 42, 0.14)",
+                  cursor: "pointer",
+                  fontSize: "12px",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                <span>{t("session.jumpBottom")}</span>
+              </button>
+            ) : null}
+            {userMessageSummaries.length > 0 ? (
+              <div
+                ref={userSummaryRootRef}
+                onMouseEnter={() => {
+                  refreshCurrentUserMessageIndex();
+                  setUserSummaryHoverOpen(true);
+                }}
+                onMouseLeave={() => setUserSummaryHoverOpen(false)}
+                style={{
+                  position: "relative",
+                  display: "inline-flex",
+                }}
+              >
+                {userSummaryOpen ? (
+                  <>
+                    <div
+                      aria-hidden="true"
+                      style={{
+                        position: "absolute",
+                        right: 0,
+                        bottom: "100%",
+                        width: "min(320px, calc(100vw - 72px))",
+                        height: "8px",
+                      }}
+                    />
+                    <div
+                      role="dialog"
+                      aria-label={t("session.userSummary")}
+                      style={{
+                        position: "absolute",
+                        right: 0,
+                        bottom: "calc(100% + 8px)",
+                        width: "min(320px, calc(100vw - 72px))",
+                        maxHeight: "260px",
+                        overflowY: "auto",
+                        padding: "6px",
+                        borderRadius: "8px",
+                        border: "1px solid var(--menu-border)",
+                        background: "var(--menu-bg)",
+                        boxShadow: "0 16px 34px rgba(15, 23, 42, 0.18)",
+                        color: "var(--text-primary)",
+                        boxSizing: "border-box",
+                      }}
+                    >
+                      <div
+                        ref={userSummaryListRef}
+                        style={{ display: "flex", flexDirection: "column", gap: "2px" }}
+                      >
+                        {userMessageSummaries.map((item) => {
+                          const isCurrent = item.index === currentUserMessageIndex;
+                          return (
+                            <button
+                              key={item.id}
+                              type="button"
+                              data-user-summary-index={item.index}
+                              onClick={() => scrollToUserMessageSummary(item.index)}
+                              style={{
+                                width: "100%",
+                                border: "none",
+                                background: isCurrent
+                                  ? "rgba(148, 163, 184, 0.22)"
+                                  : "transparent",
+                                display: "block",
+                                padding: "6px 8px",
+                                borderRadius: "6px",
+                                cursor: "pointer",
+                                textAlign: "left",
+                                color: "var(--text-primary)",
+                              }}
+                              onMouseEnter={(event) => {
+                                event.currentTarget.style.background = "var(--menu-active-bg)";
+                              }}
+                              onMouseLeave={(event) => {
+                                event.currentTarget.style.background = isCurrent
+                                  ? "rgba(148, 163, 184, 0.22)"
+                                  : "transparent";
+                              }}
+                            >
+                              <span
+                                title={item.summary}
+                                style={{
+                                  display: "block",
+                                  minWidth: 0,
+                                  fontSize: "12px",
+                                  lineHeight: "18px",
+                                  color: "var(--text-primary)",
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                  whiteSpace: "nowrap",
+                                }}
+                              >
+                                {item.summary}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </>
+                ) : null}
+                <button
+                  type="button"
+                  onClick={() => {
+                    refreshCurrentUserMessageIndex();
+                    setUserSummaryPinnedOpen((open) => {
+                      const nextOpen = !open;
+                      if (!nextOpen) {
+                        setUserSummaryHoverOpen(false);
+                      }
+                      return nextOpen;
+                    });
+                  }}
+                  aria-label={userSummaryOpen ? t("session.hideUserSummary") : t("session.showUserSummary")}
+                  title={userSummaryOpen ? t("session.hideUserSummary") : t("session.showUserSummary")}
+                  style={{
+                    position: "relative",
+                    width: "34px",
+                    height: "34px",
+                    border: "none",
+                    borderRadius: "8px",
+                    background: userSummaryOpen ? "var(--accent-color)" : "var(--menu-bg)",
+                    color: userSummaryOpen ? "#ffffff" : "var(--text-secondary)",
+                    boxShadow: "0 10px 24px rgba(15, 23, 42, 0.16)",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    cursor: "pointer",
+                    fontSize: "18px",
+                  }}
+                >
+                  <UserMessageListIcon />
+                  <span
+                    aria-hidden="true"
+                    style={{
+                      position: "absolute",
+                      top: "-7px",
+                      right: "-7px",
+                      minWidth: "18px",
+                      height: "18px",
+                      padding: "0 5px",
+                      borderRadius: "999px",
+                      background: "#2563eb",
+                      color: "#ffffff",
+                      border: "2px solid var(--menu-bg)",
+                      fontSize: "10px",
+                      fontWeight: 800,
+                      lineHeight: "14px",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      boxSizing: "border-box",
+                      fontVariantNumeric: "tabular-nums",
+                    }}
+                  >
+                    {userMessageSummaries.length > 99 ? "99+" : userMessageSummaries.length}
+                  </span>
+                </button>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.5; }
+        }
+        @keyframes sessionLoadingPulse {
+          0% { background-position: 100% 0; opacity: 0.7; }
+          50% { opacity: 1; }
+          100% { background-position: -100% 0; opacity: 0.7; }
+        }
+        @keyframes spin {
+          to { transform: rotate(360deg); }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+export const SessionViewer = memo(
+  SessionViewerInner,
+  (prev, next) =>
+    prev.session === next.session &&
+    prev.loading === next.loading &&
+    prev.rootId === next.rootId &&
+    prev.rootPath === next.rootPath &&
+    prev.interactionMode === next.interactionMode &&
+    prev.targetSeq === next.targetSeq &&
+    prev.targetSeqRequestKey === next.targetSeqRequestKey &&
+    prev.composerOverlayInset === next.composerOverlayInset &&
+    prev.gitFileStatsByPath === next.gitFileStatsByPath &&
+    prev.onRootClick === next.onRootClick,
+);

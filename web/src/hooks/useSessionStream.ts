@@ -1,0 +1,534 @@
+import { useEffect, useMemo, useState } from "react";
+import {
+  sessionService,
+  type CompactNotice,
+  type ExchangeAux,
+  type PlanUpdate,
+  type TodoUpdate,
+  type ToolCall,
+  type TokenUsage,
+} from "../services/session";
+import { translateNow } from "../i18n";
+
+type ExchangeLike = {
+  seq?: number;
+  role?: string;
+  agent?: string;
+  model?: string;
+  model_display_name?: string;
+  effort?: string;
+  fast_service?: string;
+  content?: string;
+  thought_id?: string;
+  context_window?: {
+    totalTokens: number;
+    modelContextWindow: number;
+  };
+  token_usage?: TokenUsage;
+  timestamp?: string;
+  toolCall?: ToolCall;
+  todoUpdate?: TodoUpdate;
+  planUpdate?: PlanUpdate;
+  compactNotice?: CompactNotice;
+  pending_ack?: boolean;
+};
+
+type ExchangeAuxMapLike = Record<string, ExchangeAux[]>;
+
+export type TimelineItem =
+  | {
+      id: string;
+      type: "user_text" | "assistant_text";
+      content: string;
+      timestamp?: string;
+      agent?: string;
+      model?: string;
+      modelDisplayName?: string;
+      effort?: string;
+      fastService?: string;
+      pendingAck?: boolean;
+      seq?: number;
+      contextWindow?: {
+        totalTokens: number;
+        modelContextWindow: number;
+      };
+      tokenUsage?: TokenUsage;
+    }
+  | { id: string; type: "thought"; content: string }
+  | { id: string; type: "tool"; toolCall: ToolCall }
+  | { id: string; type: "todo"; todoUpdate: TodoUpdate; timestamp?: string }
+  | { id: string; type: "plan"; planUpdate: PlanUpdate; timestamp?: string }
+  | { id: string; type: "compact"; compactNotice: CompactNotice; timestamp?: string };
+
+type UseSessionStreamResult = {
+  timeline: TimelineItem[];
+  isStreaming: boolean;
+  streamVersion: number;
+  streamStatusText: string;
+};
+
+type ContextWindowLike = {
+  totalTokens: number;
+  modelContextWindow: number;
+};
+
+function hashText(input: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function stableTimelineID(
+  prefix: string,
+  index: number,
+  content: string,
+  timestamp?: string,
+  agent?: string,
+): string {
+  return `${prefix}:${index}:${timestamp || ""}:${agent || ""}:${hashText(content)}`;
+}
+
+function normalizeRole(role?: string): string {
+  return (role || "").toLowerCase();
+}
+
+function normalizeToolCallStatus(status?: string): string {
+  const value = (status || "").toLowerCase();
+  if (value === "completed") return "complete";
+  if (value === "pending") return "running";
+  return value || "running";
+}
+
+function normalizeToolCall(input: ToolCall): ToolCall {
+  const raw = input as ToolCall & {
+    toolCallId?: string;
+    tool_call_id?: string;
+  };
+  const callId = raw.callId || raw.toolCallId || raw.tool_call_id || "";
+  return {
+    ...input,
+    callId,
+    status: normalizeToolCallStatus(raw.status),
+  };
+}
+
+function settleRunningTools(items: TimelineItem[]): TimelineItem[] {
+  return items.map((item) => {
+    if (item.type !== "tool") return item;
+    const kind = (item.toolCall.kind || "").toLowerCase();
+    if (kind === "ask_user" || kind === "task") return item;
+    const status = (item.toolCall.status || "").toLowerCase();
+    if (
+      status === "running" ||
+      status === "in_progress" ||
+      status === "pending"
+    ) {
+      return {
+        ...item,
+        toolCall: {
+          ...item.toolCall,
+          status: "complete",
+        },
+      };
+    }
+    return item;
+  });
+}
+
+function assistantSegmentItem(
+  index: number,
+  ex: ExchangeLike,
+  content: string,
+  segmentIndex: number,
+  includeContextWindow: boolean,
+): TimelineItem | null {
+  if (!content) {
+    return null;
+  }
+  return {
+    id: stableTimelineID(
+      "assistant",
+      index * 1000 + segmentIndex,
+      content,
+      ex.timestamp,
+      ex.agent,
+    ),
+    type: "assistant_text",
+    content,
+    timestamp: ex.timestamp,
+    agent: ex.agent,
+    model: ex.model,
+    modelDisplayName: ex.model_display_name,
+    effort: ex.effort,
+    fastService: ex.fast_service,
+    seq: ex.seq,
+    contextWindow: includeContextWindow ? ex.context_window : undefined,
+    tokenUsage: includeContextWindow ? ex.token_usage : undefined,
+  };
+}
+
+function buildAssistantTimeline(
+  ex: ExchangeLike,
+  index: number,
+  auxList: ExchangeAux[],
+): TimelineItem[] {
+  const content = ex.content || "";
+  if (!auxList.length) {
+    const single = assistantSegmentItem(index, ex, content, 0, true);
+    return single ? [single] : [];
+  }
+
+  const lines = content === "" ? [] : content.split("\n");
+  const totalLines = lines.length;
+  const out: TimelineItem[] = [];
+  const normalizedAux = auxList.map((aux, auxIndex) => ({
+    ...aux,
+    auxIndex,
+    line: Math.max(0, Math.min(totalLines, Number(aux.line || 0))),
+  }));
+  normalizedAux.sort((left, right) => {
+    if (left.line !== right.line) {
+      return left.line - right.line;
+    }
+    return left.auxIndex - right.auxIndex;
+  });
+
+  let emittedLines = 0;
+  let segmentIndex = 0;
+  for (const aux of normalizedAux) {
+    if (aux.line > emittedLines) {
+      const segment = assistantSegmentItem(
+        index,
+        ex,
+        lines.slice(emittedLines, aux.line).join("\n"),
+        segmentIndex,
+        false,
+      );
+      if (segment) {
+        out.push(segment);
+        segmentIndex += 1;
+      }
+      emittedLines = aux.line;
+    }
+    if (aux.thought) {
+      out.push({
+        id:
+          aux.thought_id ||
+          stableTimelineID(
+            "thought",
+            index * 1000 + segmentIndex,
+            aux.thought,
+            ex.timestamp,
+            ex.agent,
+          ),
+        type: "thought",
+        content: aux.thought,
+      });
+      segmentIndex += 1;
+    } else if (aux.plan) {
+      out.push({
+        id:
+          aux.plan.id ||
+          stableTimelineID(
+            "plan",
+            index * 1000 + segmentIndex,
+            aux.plan.content || "",
+            ex.timestamp,
+            ex.agent,
+          ),
+        type: "plan",
+        planUpdate: aux.plan,
+        timestamp: ex.timestamp,
+      });
+      segmentIndex += 1;
+    } else if (aux.todo) {
+      out.push({
+        id: stableTimelineID(
+          "todo",
+          index * 1000 + segmentIndex,
+          JSON.stringify(aux.todo),
+          ex.timestamp,
+          ex.agent,
+        ),
+        type: "todo",
+        todoUpdate: aux.todo,
+        timestamp: ex.timestamp,
+      });
+      segmentIndex += 1;
+    } else if (aux.compact) {
+      out.push({
+        id:
+          aux.compact.id ||
+          stableTimelineID(
+            "compact",
+            index * 1000 + segmentIndex,
+            JSON.stringify(aux.compact),
+            ex.timestamp,
+            ex.agent,
+          ),
+        type: "compact",
+        compactNotice: aux.compact,
+        timestamp: ex.timestamp,
+      });
+      segmentIndex += 1;
+    } else if (aux.toolcall) {
+      const normalizedTool = normalizeToolCall(aux.toolcall);
+      out.push({
+        id:
+          normalizedTool.callId ||
+          stableTimelineID(
+            "tool",
+            index * 1000 + segmentIndex,
+            JSON.stringify(normalizedTool),
+            ex.timestamp,
+            ex.agent,
+          ),
+        type: "tool",
+        toolCall: normalizedTool,
+      });
+      segmentIndex += 1;
+    }
+  }
+
+  if (emittedLines < totalLines) {
+    const segment = assistantSegmentItem(
+      index,
+      ex,
+      lines.slice(emittedLines).join("\n"),
+      segmentIndex,
+      true,
+    );
+    if (segment) {
+      out.push(segment);
+      segmentIndex += 1;
+    }
+  } else {
+    for (let i = out.length - 1; i >= 0; i -= 1) {
+      const item = out[i];
+      if (item.type === "assistant_text") {
+        out[i] = {
+          ...item,
+          contextWindow: ex.context_window,
+          tokenUsage: ex.token_usage,
+        };
+        break;
+      }
+    }
+  }
+
+  return out;
+}
+
+function buildBaseTimeline(
+  exchanges: ExchangeLike[],
+  exchangeAux: ExchangeAuxMapLike,
+): TimelineItem[] {
+  const out: TimelineItem[] = [];
+  let inferredSeq = 0;
+  for (let index = 0; index < exchanges.length; index += 1) {
+    const ex = exchanges[index];
+    const role = normalizeRole(ex.role);
+    const content = ex.content || "";
+    if (role === "user") {
+      inferredSeq += 1;
+      const seq = Number(ex.seq || 0) > 0 ? Number(ex.seq || 0) : inferredSeq;
+      if (!content) continue;
+      out.push({
+        id: stableTimelineID("user", index, content, ex.timestamp, ex.agent),
+        type: "user_text",
+        content,
+        timestamp: ex.timestamp,
+        agent: ex.agent,
+        pendingAck: ex.pending_ack === true,
+        seq,
+      });
+      continue;
+    }
+    if (role === "agent" || role === "assistant") {
+      inferredSeq += 1;
+      const seq = Number(ex.seq || 0) > 0 ? Number(ex.seq || 0) : inferredSeq;
+      const auxList = seq ? exchangeAux[String(seq)] || [] : [];
+      out.push(...buildAssistantTimeline({ ...ex, seq }, index, auxList));
+      continue;
+    }
+    if (role === "thought") {
+      if (!content) continue;
+      out.push({
+        id:
+          ex.thought_id ||
+          stableTimelineID("thought", index, content, ex.timestamp, ex.agent),
+        type: "thought",
+        content,
+      });
+      continue;
+    }
+    if (role === "tool") {
+      if (!ex.toolCall) continue;
+      const normalizedTool = normalizeToolCall(ex.toolCall);
+      out.push({
+        id:
+          normalizedTool.callId ||
+          stableTimelineID(
+            "tool",
+            index,
+            JSON.stringify(normalizedTool),
+            ex.timestamp,
+            ex.agent,
+          ),
+        type: "tool",
+        toolCall: normalizedTool,
+      });
+      continue;
+    }
+    if (role === "todo") {
+      if (!ex.todoUpdate) continue;
+      out.push({
+        id: stableTimelineID(
+          "todo",
+          index,
+          JSON.stringify(ex.todoUpdate),
+          ex.timestamp,
+          ex.agent,
+        ),
+        type: "todo",
+        todoUpdate: ex.todoUpdate,
+        timestamp: ex.timestamp,
+      });
+      continue;
+    }
+    if (role === "plan") {
+      if (!ex.planUpdate) continue;
+      out.push({
+        id: ex.planUpdate.id || stableTimelineID("plan", index, ex.planUpdate.content || "", ex.timestamp, ex.agent),
+        type: "plan",
+        planUpdate: ex.planUpdate,
+        timestamp: ex.timestamp,
+      });
+      continue;
+    }
+    if (role === "compact") {
+      if (!ex.compactNotice) continue;
+      out.push({
+        id: ex.compactNotice.id || stableTimelineID("compact", index, JSON.stringify(ex.compactNotice), ex.timestamp, ex.agent),
+        type: "compact",
+        compactNotice: ex.compactNotice,
+        timestamp: ex.timestamp,
+      });
+    }
+  }
+  return out;
+}
+
+function applySessionContextWindow(
+  items: TimelineItem[],
+  contextWindow?: ContextWindowLike,
+): TimelineItem[] {
+  const totalTokens = Math.max(0, Number(contextWindow?.totalTokens || 0));
+  const modelContextWindow = Math.max(
+    0,
+    Number(contextWindow?.modelContextWindow || 0),
+  );
+  if (!totalTokens || !modelContextWindow) {
+    return items;
+  }
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const item = items[i];
+    if (item.type !== "assistant_text") {
+      continue;
+    }
+    if (
+      item.contextWindow?.totalTokens &&
+      item.contextWindow?.modelContextWindow
+    ) {
+      return items;
+    }
+    const next = [...items];
+    next[i] = {
+      ...item,
+      contextWindow: {
+        totalTokens,
+        modelContextWindow,
+      },
+    };
+    return next;
+  }
+  return items;
+}
+
+export function useSessionStream(
+  sessionKey: string | null,
+  exchanges: ExchangeLike[] = [],
+  exchangeAux: ExchangeAuxMapLike = {},
+  sessionContextWindow?: ContextWindowLike,
+  sessionPending = false,
+): UseSessionStreamResult {
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamVersion, setStreamVersion] = useState(0);
+  const [streamStatusText, setStreamStatusText] = useState("");
+
+  const baseTimeline = useMemo(
+    () =>
+      applySessionContextWindow(
+        buildBaseTimeline(exchanges, exchangeAux),
+        sessionContextWindow,
+      ),
+    [exchanges, exchangeAux, sessionContextWindow],
+  );
+
+  useEffect(() => {
+    setStreamVersion(0);
+    setStreamStatusText("");
+    if (!sessionKey) {
+      setIsStreaming(false);
+      return;
+    }
+    setIsStreaming(
+      sessionPending && sessionService.isSessionStreaming(sessionKey),
+    );
+
+    const unsubscribe = sessionService.subscribe(sessionKey, {
+      onStream: (event) => {
+        setStreamVersion((value) => value + 1);
+        if (event.type === "recovery") {
+          setStreamStatusText(event.data?.message || translateNow("session.recovering"));
+          setIsStreaming(true);
+          return;
+        }
+        if (event.type === "message_chunk") {
+          setStreamStatusText("");
+        }
+        if (event.type === "message_done") {
+          return;
+        }
+        if (event.type === "error") {
+          setStreamStatusText("");
+          setIsStreaming(false);
+        } else {
+          setIsStreaming(true);
+        }
+      },
+      onDone: () => {
+        setStreamStatusText("");
+        setIsStreaming(false);
+      },
+      onError: () => {
+        setStreamStatusText("");
+        setIsStreaming(false);
+      },
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [sessionKey, sessionPending]);
+
+  return {
+    timeline: settleRunningTools(baseTimeline),
+    isStreaming,
+    streamVersion,
+    streamStatusText,
+  };
+}

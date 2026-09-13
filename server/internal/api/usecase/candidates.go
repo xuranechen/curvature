@@ -1,0 +1,733 @@
+package usecase
+
+import (
+	"context"
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"syscall"
+
+	"curvature/server/internal/agent"
+	rootfs "curvature/server/internal/fs"
+	"curvature/server/internal/session"
+
+	"gopkg.in/yaml.v3"
+)
+
+type CandidateType string
+
+const (
+	CandidateTypeFile         CandidateType = "file"
+	CandidateTypePrompt       CandidateType = "prompt"
+	CandidateTypeSkill        CandidateType = "skill"
+	CandidateTypeSlashCommand CandidateType = "slash_command"
+	CandidateTypeCommand      CandidateType = "command"
+)
+
+type CandidateItem struct {
+	Type        CandidateType `json:"type"`
+	Name        string        `json:"name"`
+	Description string        `json:"description,omitempty"`
+}
+
+type SearchCandidatesInput struct {
+	RootID string
+	Type   CandidateType
+	Query  string
+	Agent  string
+}
+
+type SearchCandidatesOutput struct {
+	Items []CandidateItem
+}
+
+const maxCandidateItems = 10
+
+type CandidateProvider interface {
+	Type() CandidateType
+	Search(ctx context.Context, root rootfs.RootInfo, agent, query string) ([]CandidateItem, error)
+}
+
+type CandidateRegistry struct {
+	providers map[CandidateType]CandidateProvider
+}
+
+func NewCandidateRegistry() *CandidateRegistry {
+	return &CandidateRegistry{providers: make(map[CandidateType]CandidateProvider)}
+}
+
+func (r *CandidateRegistry) Register(provider CandidateProvider) {
+	if r == nil || provider == nil {
+		return
+	}
+	r.providers[provider.Type()] = provider
+}
+
+func (r *CandidateRegistry) Search(ctx context.Context, candidateType CandidateType, root rootfs.RootInfo, agent, query string) ([]CandidateItem, error) {
+	if r == nil {
+		return nil, errors.New("candidate registry not configured")
+	}
+	provider := r.providers[candidateType]
+	if provider == nil {
+		return nil, errors.New("candidate provider not found")
+	}
+	return provider.Search(ctx, root, agent, query)
+}
+
+func (s *Service) SearchCandidates(ctx context.Context, in SearchCandidatesInput) (SearchCandidatesOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return SearchCandidatesOutput{}, err
+	}
+	if err := validateSearchCandidatesInput(in); err != nil {
+		return SearchCandidatesOutput{}, err
+	}
+	var root rootfs.RootInfo
+	if in.Type != CandidateTypePrompt {
+		var err error
+		root, err = s.Registry.GetRoot(in.RootID)
+		if err != nil {
+			return SearchCandidatesOutput{}, err
+		}
+	}
+	registry := s.Registry.GetCandidateRegistry()
+	if in.Type == CandidateTypeSkill {
+		skillItems, err := registry.Search(ctx, CandidateTypeSkill, root, in.Agent, in.Query)
+		if err != nil {
+			return SearchCandidatesOutput{}, err
+		}
+		slashItems, err := registry.Search(ctx, CandidateTypeSlashCommand, root, in.Agent, in.Query)
+		if err != nil {
+			return SearchCandidatesOutput{}, err
+		}
+		return SearchCandidatesOutput{Items: mergeCandidateItemsPreferSlash(slashItems, skillItems, in.Query)}, nil
+	}
+	items, err := registry.Search(ctx, in.Type, root, in.Agent, in.Query)
+	if err != nil {
+		return SearchCandidatesOutput{}, err
+	}
+	return SearchCandidatesOutput{Items: items}, nil
+}
+
+func mergeCandidateItemsPreferSlash(primary []CandidateItem, secondary []CandidateItem, query string) []CandidateItem {
+	items := make([]CandidateItem, 0, len(primary)+len(secondary))
+	seen := make(map[string]struct{}, len(primary)+len(secondary))
+	appendUnique := func(list []CandidateItem) {
+		for _, item := range list {
+			normalizedName := normalizeCandidateName(item.Name)
+			if normalizedName == "" {
+				continue
+			}
+			if _, ok := seen[normalizedName]; ok {
+				continue
+			}
+			seen[normalizedName] = struct{}{}
+			items = append(items, item)
+		}
+	}
+	appendUnique(primary)
+	appendUnique(secondary)
+	sortCandidateItems(items, query)
+	return limitCandidateItems(items)
+}
+
+type FileCandidateProvider struct{}
+
+func NewFileCandidateProvider() *FileCandidateProvider {
+	return &FileCandidateProvider{}
+}
+
+func (p *FileCandidateProvider) Type() CandidateType {
+	return CandidateTypeFile
+}
+
+func (p *FileCandidateProvider) Search(ctx context.Context, root rootfs.RootInfo, _ string, query string) ([]CandidateItem, error) {
+	rootDir, err := root.RootDir()
+	if err != nil {
+		return nil, err
+	}
+	query = strings.TrimSpace(strings.ToLower(query))
+	items := make([]CandidateItem, 0, 32)
+	err = filepath.WalkDir(rootDir, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if path == rootDir {
+			return nil
+		}
+		relPath, err := root.NormalizePath(path)
+		if err != nil {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if shouldIgnoreCandidatePath(relPath, entry.IsDir()) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if !matchesCandidateName(relPath, query) {
+			return nil
+		}
+		items = append(items, CandidateItem{
+			Type: CandidateTypeFile,
+			Name: relPath,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sortCandidateItems(items, query)
+	return limitCandidateItems(items), nil
+}
+
+type SkillCandidateProvider struct{}
+
+func NewSkillCandidateProvider() *SkillCandidateProvider {
+	return &SkillCandidateProvider{}
+}
+
+func (p *SkillCandidateProvider) Type() CandidateType {
+	return CandidateTypeSkill
+}
+
+func (p *SkillCandidateProvider) Search(ctx context.Context, root rootfs.RootInfo, agent, query string) ([]CandidateItem, error) {
+	query = strings.TrimSpace(strings.ToLower(query))
+	items := make([]CandidateItem, 0, 16)
+	seen := make(map[string]struct{})
+	for _, dir := range skillScanDirs(root, agent) {
+		discovered, err := discoverSkillCandidates(ctx, dir, query)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range discovered {
+			normalizedName := normalizeCandidateName(item.Name)
+			if normalizedName == "" {
+				continue
+			}
+			if _, ok := seen[normalizedName]; ok {
+				continue
+			}
+			seen[normalizedName] = struct{}{}
+			items = append(items, item)
+		}
+	}
+	sortCandidateItems(items, query)
+	return limitCandidateItems(items), nil
+}
+
+func discoverSkillCandidates(ctx context.Context, dir, query string) ([]CandidateItem, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if isMissingSkillScanDir(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	items := make([]CandidateItem, 0, len(entries))
+	for _, entry := range entries {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		if !isSkillDirectoryEntry(dir, entry) {
+			continue
+		}
+		name := entry.Name()
+		if name == "" || strings.HasPrefix(name, ".") {
+			continue
+		}
+		skillDir := filepath.Join(dir, name)
+		skillPath := filepath.Join(skillDir, "SKILL.md")
+		if skillFileExists(skillPath) {
+			if matchesCandidateName(name, query) {
+				items = append(items, CandidateItem{
+					Type:        CandidateTypeSkill,
+					Name:        name,
+					Description: readSkillDescription(skillPath),
+				})
+			}
+			continue
+		}
+		namespacedItems, err := discoverNamespacedSkillCandidates(ctx, name, skillDir, query)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, namespacedItems...)
+	}
+	return items, nil
+}
+
+func discoverNamespacedSkillCandidates(ctx context.Context, namespace, dir, query string) ([]CandidateItem, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if isMissingSkillScanDir(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	items := make([]CandidateItem, 0, len(entries))
+	for _, entry := range entries {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		if !isSkillDirectoryEntry(dir, entry) {
+			continue
+		}
+		childName := entry.Name()
+		if childName == "" || strings.HasPrefix(childName, ".") {
+			continue
+		}
+		candidateName := namespace + ":" + childName
+		if !matchesCandidateName(candidateName, query) && !matchesCandidateName(childName, query) && !matchesCandidateName(namespace, query) {
+			continue
+		}
+		skillPath := filepath.Join(dir, childName, "SKILL.md")
+		if !skillFileExists(skillPath) {
+			continue
+		}
+		items = append(items, CandidateItem{
+			Type:        CandidateTypeSkill,
+			Name:        candidateName,
+			Description: readSkillDescription(skillPath),
+		})
+	}
+	return items, nil
+}
+
+func isMissingSkillScanDir(err error) bool {
+	return os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR)
+}
+
+func skillFileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func isSkillDirectoryEntry(parent string, entry os.DirEntry) bool {
+	if entry.IsDir() {
+		return true
+	}
+	if entry.Type()&fs.ModeSymlink == 0 {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(parent, entry.Name()))
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
+}
+
+type SlashCommandCandidateProvider struct {
+	getStatus func(agentName string) (agent.Status, bool)
+}
+
+func NewSlashCommandCandidateProvider(getStatus func(agentName string) (agent.Status, bool)) *SlashCommandCandidateProvider {
+	return &SlashCommandCandidateProvider{getStatus: getStatus}
+}
+
+func (p *SlashCommandCandidateProvider) Type() CandidateType {
+	return CandidateTypeSlashCommand
+}
+
+func (p *SlashCommandCandidateProvider) Search(ctx context.Context, _ rootfs.RootInfo, agentName, query string) ([]CandidateItem, error) {
+	if p == nil || p.getStatus == nil {
+		return nil, nil
+	}
+	query = strings.TrimSpace(strings.ToLower(query))
+	items := make([]CandidateItem, 0, 1)
+	appendSlash := func(name, description string) {
+		if !matchesCandidateName(name, query) {
+			return
+		}
+		for _, item := range items {
+			if item.Name == name {
+				return
+			}
+		}
+		items = append(items, CandidateItem{
+			Type:        CandidateTypeSlashCommand,
+			Name:        name,
+			Description: description,
+		})
+	}
+	appendSlash("plan", "open Plan mode")
+	if strings.TrimSpace(agentName) == "codex" {
+		appendSlash("status", "show Codex status")
+		appendSlash("login", "sign in to ChatGPT")
+	}
+	status, ok := p.getStatus(strings.TrimSpace(agentName))
+	if !ok || len(status.Commands) == 0 {
+		sortCandidateItems(items, query)
+		return limitCandidateItems(items), nil
+	}
+	for _, command := range status.Commands {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		name := strings.TrimSpace(command.Name)
+		if name == "plan" {
+			continue
+		}
+		if name == "" || !matchesCandidateName(name, query) {
+			continue
+		}
+		items = append(items, CandidateItem{
+			Type:        CandidateTypeSlashCommand,
+			Name:        name,
+			Description: strings.TrimSpace(command.Description),
+		})
+	}
+	sortCandidateItems(items, query)
+	return limitCandidateItems(items), nil
+}
+
+type PromptCandidateProvider struct {
+	store *PromptStore
+}
+
+func NewPromptCandidateProvider(store *PromptStore) *PromptCandidateProvider {
+	return &PromptCandidateProvider{store: store}
+}
+
+func (p *PromptCandidateProvider) Type() CandidateType {
+	return CandidateTypePrompt
+}
+
+func (p *PromptCandidateProvider) Search(ctx context.Context, _ rootfs.RootInfo, _ string, query string) ([]CandidateItem, error) {
+	if p == nil || p.store == nil {
+		return nil, nil
+	}
+	prompts, err := p.store.Search(ctx, query, maxCandidateItems)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]CandidateItem, 0, len(prompts))
+	for _, prompt := range prompts {
+		items = append(items, CandidateItem{
+			Type: CandidateTypePrompt,
+			Name: prompt,
+		})
+	}
+	return items, nil
+}
+
+type CommandCandidateProvider struct {
+	shellProvider func() ShellHistorySpec
+}
+
+func NewCommandCandidateProvider(shellProvider ...func() ShellHistorySpec) *CommandCandidateProvider {
+	provider := &CommandCandidateProvider{}
+	if len(shellProvider) > 0 {
+		provider.shellProvider = shellProvider[0]
+	}
+	return provider
+}
+
+func (p *CommandCandidateProvider) Type() CandidateType {
+	return CandidateTypeCommand
+}
+
+func (p *CommandCandidateProvider) Search(ctx context.Context, root rootfs.RootInfo, _ string, query string) ([]CandidateItem, error) {
+	manager := session.NewManager(root)
+	var shell ShellHistorySpec
+	if p.shellProvider != nil {
+		shell = p.shellProvider()
+	}
+	return SearchCommandCandidates(ctx, manager, root.ID, query, maxCandidateItems, shell)
+}
+
+func validateSearchCandidatesInput(in SearchCandidatesInput) error {
+	switch in.Type {
+	case CandidateTypeFile:
+		return nil
+	case CandidateTypeCommand:
+		return nil
+	case CandidateTypePrompt:
+		return nil
+	case CandidateTypeSkill, CandidateTypeSlashCommand:
+		if strings.TrimSpace(in.Agent) == "" {
+			return errors.New("agent required for skill candidates")
+		}
+		return nil
+	default:
+		return errors.New("invalid candidate type")
+	}
+}
+
+func normalizeCandidateName(name string) string {
+	return strings.TrimSpace(strings.ToLower(name))
+}
+
+func limitCandidateItems(items []CandidateItem) []CandidateItem {
+	if len(items) > maxCandidateItems {
+		return items[:maxCandidateItems]
+	}
+	return items
+}
+
+func shouldIgnoreCandidatePath(relPath string, isDir bool) bool {
+	base := filepath.Base(relPath)
+	if base == ".DS_Store" || base == "Thumbs.db" {
+		return true
+	}
+	parts := strings.Split(filepath.ToSlash(relPath), "/")
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if strings.HasPrefix(part, ".") {
+			return true
+		}
+		switch part {
+		case "node_modules", "dist", "build", "coverage", ".next", ".nuxt", ".turbo", ".cache":
+			return true
+		}
+	}
+	return false
+}
+
+func matchesCandidateName(name, query string) bool {
+	if query == "" {
+		return true
+	}
+	lower := strings.ToLower(name)
+	return strings.HasPrefix(lower, query) || strings.Contains(lower, query)
+}
+
+func sortCandidateItems(items []CandidateItem, query string) {
+	query = strings.ToLower(strings.TrimSpace(query))
+	sort.Slice(items, func(i, j int) bool {
+		left := strings.ToLower(items[i].Name)
+		right := strings.ToLower(items[j].Name)
+		leftPrefix := query != "" && strings.HasPrefix(left, query)
+		rightPrefix := query != "" && strings.HasPrefix(right, query)
+		if leftPrefix != rightPrefix {
+			return leftPrefix
+		}
+		if len(items[i].Name) != len(items[j].Name) {
+			return len(items[i].Name) < len(items[j].Name)
+		}
+		return items[i].Name < items[j].Name
+	})
+}
+
+func skillScanDirs(root rootfs.RootInfo, agent string) []string {
+	homeDir, _ := os.UserHomeDir()
+	rootDir, _ := root.RootDir()
+	switch strings.TrimSpace(strings.ToLower(agent)) {
+	case "codex":
+		dirs := []string{
+			filepath.Join(homeDir, ".codex", "skills"),
+			filepath.Join(homeDir, ".codex", "skills", ".system"),
+			filepath.Join(homeDir, ".agents", "skills"),
+			filepath.Join(rootDir, ".agents", "skills"),
+			filepath.Join(rootDir, ".codex", "skills"),
+		}
+		dirs = append(dirs, codexPluginSkillScanDirs(filepath.Join(homeDir, ".codex", "plugins", "cache"))...)
+		return dirs
+	case "claude":
+		dirs := []string{
+			filepath.Join(homeDir, ".claude", "skills"),
+			filepath.Join(homeDir, ".agents", "skills"),
+			filepath.Join(rootDir, ".claude", "skills"),
+		}
+		marketplacesRoot := filepath.Join(homeDir, ".claude", "plugins", "marketplaces")
+		entries, err := os.ReadDir(marketplacesRoot)
+		if err == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					continue
+				}
+				name := entry.Name()
+				if name == "" || strings.HasPrefix(name, ".") {
+					continue
+				}
+				dirs = append(dirs, filepath.Join(marketplacesRoot, name, "skills"))
+			}
+		}
+		return dirs
+	case "gemini":
+		return []string{
+			filepath.Join(homeDir, ".gemini", "skills"),
+			filepath.Join(homeDir, ".agents", "skills"),
+			filepath.Join(rootDir, ".gemini", "skills"),
+		}
+	default:
+		return []string{
+			filepath.Join(homeDir, ".agents", "skills"),
+		}
+	}
+}
+
+func codexPluginSkillScanDirs(cacheRoot string) []string {
+	marketplaces, err := os.ReadDir(cacheRoot)
+	if err != nil {
+		return nil
+	}
+	dirs := make([]string, 0)
+	for _, marketplace := range marketplaces {
+		if !marketplace.IsDir() {
+			continue
+		}
+		marketplaceName := marketplace.Name()
+		if marketplaceName == "" || strings.HasPrefix(marketplaceName, ".") {
+			continue
+		}
+		marketplaceRoot := filepath.Join(cacheRoot, marketplaceName)
+		plugins, err := os.ReadDir(marketplaceRoot)
+		if err != nil {
+			continue
+		}
+		for _, plugin := range plugins {
+			if !isSkillDirectoryEntry(marketplaceRoot, plugin) {
+				continue
+			}
+			pluginName := plugin.Name()
+			if pluginName == "" || strings.HasPrefix(pluginName, ".") {
+				continue
+			}
+			pluginRoot := filepath.Join(marketplaceRoot, pluginName)
+			version, ok := activeCodexPluginVersion(pluginRoot)
+			if !ok {
+				continue
+			}
+			dirs = append(dirs, filepath.Join(pluginRoot, version, "skills"))
+		}
+	}
+	return dirs
+}
+
+func activeCodexPluginVersion(pluginRoot string) (string, bool) {
+	versions, err := os.ReadDir(pluginRoot)
+	if err != nil {
+		return "", false
+	}
+	active := ""
+	for _, version := range versions {
+		if !isSkillDirectoryEntry(pluginRoot, version) {
+			continue
+		}
+		name := version.Name()
+		if !validCodexPluginVersionSegment(name) {
+			continue
+		}
+		if name == "local" {
+			return name, true
+		}
+		if active == "" || compareCodexPluginVersions(active, name) < 0 {
+			active = name
+		}
+	}
+	return active, active != ""
+}
+
+func validCodexPluginVersionSegment(version string) bool {
+	if version == "" || version == "." || version == ".." {
+		return false
+	}
+	for _, r := range version {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			continue
+		}
+		if r == '.' || r == '+' || r == '_' || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func compareCodexPluginVersions(left, right string) int {
+	if isDottedNumericVersion(left) && isDottedNumericVersion(right) {
+		leftParts := strings.Split(left, ".")
+		rightParts := strings.Split(right, ".")
+		maxParts := len(leftParts)
+		if len(rightParts) > maxParts {
+			maxParts = len(rightParts)
+		}
+		for i := 0; i < maxParts; i++ {
+			leftPart := 0
+			rightPart := 0
+			if i < len(leftParts) {
+				leftPart = atoiVersionPart(leftParts[i])
+			}
+			if i < len(rightParts) {
+				rightPart = atoiVersionPart(rightParts[i])
+			}
+			if leftPart < rightPart {
+				return -1
+			}
+			if leftPart > rightPart {
+				return 1
+			}
+		}
+		return 0
+	}
+	return strings.Compare(left, right)
+}
+
+func isDottedNumericVersion(version string) bool {
+	if version == "" {
+		return false
+	}
+	for _, r := range version {
+		if r >= '0' && r <= '9' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func atoiVersionPart(part string) int {
+	value := 0
+	for _, r := range part {
+		if r < '0' || r > '9' {
+			return value
+		}
+		value = value*10 + int(r-'0')
+	}
+	return value
+}
+
+func readSkillDescription(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	content := string(data)
+	if !strings.HasPrefix(content, "---\n") {
+		return ""
+	}
+	rest := strings.TrimPrefix(content, "---\n")
+	end := strings.Index(rest, "\n---")
+	if end < 0 {
+		return ""
+	}
+	var frontmatter struct {
+		Description string `yaml:"description"`
+	}
+	if err := yaml.Unmarshal([]byte(rest[:end]), &frontmatter); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(frontmatter.Description)
+}

@@ -1,0 +1,937 @@
+import React, { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { LexicalComposer } from "@lexical/react/LexicalComposer";
+import { PlainTextPlugin } from "@lexical/react/LexicalPlainTextPlugin";
+import { ContentEditable } from "@lexical/react/LexicalContentEditable";
+import { HistoryPlugin } from "@lexical/react/LexicalHistoryPlugin";
+import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
+import {
+  $createTextNode,
+  $getNearestNodeFromDOMNode,
+  $getRoot,
+  $getSelection,
+  $isLineBreakNode,
+  $isRangeSelection,
+  $isTextNode,
+  $setCompositionKey,
+  COMMAND_PRIORITY_HIGH,
+  KEY_BACKSPACE_COMMAND,
+  KEY_DELETE_COMMAND,
+  EditorConfig,
+  KEY_ENTER_COMMAND,
+  LexicalEditor,
+  NodeKey,
+  PASTE_COMMAND,
+  SerializedTextNode,
+  Spread,
+  TextNode,
+} from "lexical";
+
+type TokenType = "file" | "skill";
+type CandidateType = TokenType | "slash_command" | "prompt" | "command";
+type ActiveTokenType = "file" | "slash" | "prompt" | "command";
+
+type ActiveToken = {
+  type: ActiveTokenType;
+  query: string;
+};
+
+export type TokenEditorHandle = {
+  focus: () => void;
+  blur: () => void;
+  getHeight: () => number;
+  clear: () => void;
+  setText: (value: string) => void;
+  insertCandidate: (type: CandidateType, value: string) => void;
+};
+
+type TokenEditorProps = {
+  placeholder: string;
+  disabled?: boolean;
+  isDark?: boolean;
+  rightInset?: number;
+  topInset?: number;
+  bottomInset?: number;
+  fillHeight?: boolean;
+  onChange: (payload: { serializedText: string; displayText: string; activeToken: ActiveToken | null }) => void;
+  onFocusChange?: (focused: boolean) => void;
+  onPointerDown?: () => void;
+  onKeyDown?: (event: React.KeyboardEvent<HTMLDivElement>) => void;
+  onPaste?: (event: React.ClipboardEvent<HTMLDivElement>) => void;
+  onEnter?: (event: KeyboardEvent | null) => boolean;
+  enterKeyHint?: React.HTMLAttributes<HTMLElement>["enterKeyHint"];
+  onCompositionStart?: () => void;
+  onCompositionEnd?: () => void;
+};
+
+type SerializedTokenNode = Spread<
+  {
+    type: "token";
+    tokenType: TokenType;
+    tokenValue: string;
+    label: string;
+    version: 1;
+  },
+  SerializedTextNode
+>;
+
+class TokenNode extends TextNode {
+  __tokenType: TokenType;
+  __tokenValue: string;
+  __label: string;
+
+  static getType(): string {
+    return "token";
+  }
+
+  static clone(node: TokenNode): TokenNode {
+    return new TokenNode(node.__tokenType, node.__tokenValue, node.__label, node.__key);
+  }
+
+  static importJSON(serializedNode: SerializedTokenNode): TokenNode {
+    return $createTokenNode(
+      serializedNode.tokenType,
+      serializedNode.tokenValue,
+      serializedNode.label
+    );
+  }
+
+  constructor(tokenType: TokenType, tokenValue: string, label: string, key?: NodeKey) {
+    super(label, key);
+    this.__tokenType = tokenType;
+    this.__tokenValue = tokenValue;
+    this.__label = label;
+  }
+
+  createDOM(config: EditorConfig): HTMLElement {
+    const dom = super.createDOM(config);
+    dom.dataset.curvatureTokenNode = "true";
+    dom.contentEditable = "false";
+    dom.style.display = "inline-flex";
+    dom.style.alignItems = "center";
+    dom.style.padding = "1px 6px";
+    dom.style.margin = "0 1px";
+    dom.style.borderRadius = "8px";
+    dom.style.whiteSpace = "pre";
+    if (this.__tokenType === "file") {
+      dom.style.background = "var(--token-file-bg)";
+      dom.style.color = "var(--token-file-text)";
+    } else {
+      dom.style.background = "var(--token-skill-bg)";
+      dom.style.color = "var(--token-skill-text)";
+    }
+    return dom;
+  }
+
+  updateDOM(prevNode: TokenNode, dom: HTMLElement, config: EditorConfig): boolean {
+    const updated = super.updateDOM(prevNode as unknown as this, dom, config);
+    if (prevNode.__tokenType !== this.__tokenType) {
+      if (this.__tokenType === "file") {
+        dom.style.background = "var(--token-file-bg)";
+        dom.style.color = "var(--token-file-text)";
+      } else {
+        dom.style.background = "var(--token-skill-bg)";
+        dom.style.color = "var(--token-skill-text)";
+      }
+    }
+    return updated;
+  }
+
+  exportJSON(): SerializedTokenNode {
+    return {
+      ...super.exportJSON(),
+      type: "token",
+      tokenType: this.__tokenType,
+      tokenValue: this.__tokenValue,
+      label: this.__label,
+      version: 1,
+    };
+  }
+
+  getTokenType(): TokenType {
+    return this.__tokenType;
+  }
+
+  getTokenValue(): string {
+    return this.__tokenValue;
+  }
+
+  getLabel(): string {
+    return this.__label;
+  }
+
+  isTextEntity(): true {
+    return true;
+  }
+
+  canInsertTextBefore(): boolean {
+    return false;
+  }
+
+  canInsertTextAfter(): boolean {
+    return false;
+  }
+}
+
+function $createTokenNode(type: TokenType, value: string, label: string): TokenNode {
+  return new TokenNode(type, value, label);
+}
+
+function $isTokenNode(node: unknown): node is TokenNode {
+  return node instanceof TokenNode;
+}
+
+function createLabel(type: TokenType, value: string): string {
+  if (type === "file") {
+    const parts = value.replace(/\\/g, "/").split("/");
+    return parts[parts.length - 1] || value;
+  }
+  return value;
+}
+
+function serializeEditor(): string {
+  const parts: string[] = [];
+  const visit = (node: any) => {
+    if ($isTokenNode(node)) {
+      parts.push(
+        node.getTokenType() === "file"
+          ? `[file: ${node.getTokenValue()}]`
+          : `[use skill: ${node.getTokenValue()}]`
+      );
+      return;
+    }
+    if ($isLineBreakNode(node)) {
+      parts.push("\n");
+      return;
+    }
+    if ($isTextNode(node)) {
+      parts.push(node.getTextContent());
+      return;
+    }
+    if (typeof node.getChildren === "function") {
+      for (const child of node.getChildren()) {
+        visit(child);
+      }
+    }
+  };
+  visit($getRoot());
+  return parts.join("");
+}
+
+function $insertSerializedTextAtSelection(text: string): boolean {
+  if (text === "") {
+    return false;
+  }
+  const pattern = /\[(read file|file|use skill):\s*([^\]]+)\]/g;
+  let lastIndex = 0;
+  let inserted = false;
+  let match: RegExpExecArray | null;
+
+  const insertToken = (type: TokenType, value: string): boolean => {
+    let selection = $getSelection();
+    if (!$isRangeSelection(selection)) {
+      $getRoot().selectEnd();
+      selection = $getSelection();
+    }
+    if (!$isRangeSelection(selection)) {
+      return false;
+    }
+    selection.insertNodes([$createTokenNode(type, value, createLabel(type, value))]);
+    return true;
+  };
+
+  while ((match = pattern.exec(text)) !== null) {
+    const prefix = text.slice(lastIndex, match.index);
+    if (prefix) {
+      inserted = $insertPlainTextAtSelection(prefix) || inserted;
+    }
+    const tokenType: TokenType = match[1] === "use skill" ? "skill" : "file";
+    const tokenValue = match[2].trim();
+    if (tokenValue) {
+      inserted = insertToken(tokenType, tokenValue) || inserted;
+    }
+    lastIndex = pattern.lastIndex;
+  }
+
+  const suffix = text.slice(lastIndex);
+  if (suffix) {
+    inserted = $insertPlainTextAtSelection(suffix) || inserted;
+  }
+  return inserted;
+}
+
+function serializedTextEndsWithToken(text: string): boolean {
+  return /\[(?:read file|file|use skill):\s*[^\]]+\]\s*$/.test(text);
+}
+
+function $selectAfterTokenNode(node: TokenNode): void {
+  const next = node.getNextSibling();
+  if ($isTextNode(next) && !$isTokenNode(next)) {
+    next.select(next.getTextContentSize(), next.getTextContentSize());
+    return;
+  }
+  const anchor = $createTextNode(" ");
+  node.insertAfter(anchor);
+  anchor.select(1, 1);
+}
+
+function $selectEditorEndWithTokenAnchor(): void {
+  const root = $getRoot();
+  const lastChild = root.getLastChild();
+  if ($isTokenNode(lastChild)) {
+    $selectAfterTokenNode(lastChild);
+    return;
+  }
+  root.selectEnd();
+}
+
+function getDisplayText(): string {
+  return $getRoot().getTextContent();
+}
+
+function getActiveTokenFromSelection(): ActiveToken | null {
+  const selection = $getSelection();
+  if (!$isRangeSelection(selection) || !selection.isCollapsed()) {
+    return null;
+  }
+  const anchorNode = selection.anchor.getNode();
+  if (!$isTextNode(anchorNode) || $isTokenNode(anchorNode)) {
+    return null;
+  }
+  const text = anchorNode.getTextContent();
+  const offset = selection.anchor.offset;
+  return parseActiveToken(text, offset);
+}
+
+function parseActiveToken(displayText: string, cursorPos: number): ActiveToken | null {
+  const cursor = Math.max(0, Math.min(cursorPos, displayText.length));
+  let start = cursor - 1;
+  while (start >= 0) {
+    const ch = displayText[start];
+    if (ch === "@" || ch === "/" || ch === "#") {
+      const prev = start > 0 ? displayText[start - 1] : "";
+      const isBoundary =
+        prev === "" ||
+        /\s/.test(prev) ||
+        prev === "(" ||
+        prev === "[" ||
+        prev === "{" ||
+        prev === '"' ||
+        prev === "'";
+      if (!isBoundary) {
+        return null;
+      }
+      let end = cursor;
+      for (; end < displayText.length; end++) {
+        const next = displayText[end];
+        if (/\s/.test(next) || next === "[" || next === "]" || next === "\n") {
+          break;
+        }
+      }
+      return {
+        type: ch === "@" ? "file" : ch === "/" ? "slash" : "prompt",
+        query: displayText.slice(start + 1, end),
+      };
+    }
+    if (/\s/.test(ch) || ch === "[" || ch === "]") {
+      return null;
+    }
+    start--;
+  }
+  return null;
+}
+
+function expectedActiveTokenType(candidateType: CandidateType): ActiveTokenType {
+  if (candidateType === "command") {
+    return "command";
+  }
+  if (candidateType === "file") {
+    return "file";
+  }
+  if (candidateType === "prompt") {
+    return "prompt";
+  }
+  return "slash";
+}
+
+function triggerChar(tokenType: ActiveTokenType): "@" | "/" | "#" {
+  if (tokenType === "file") {
+    return "@";
+  }
+  if (tokenType === "prompt") {
+    return "#";
+  }
+  return "/";
+}
+
+function getPasteDataTransfer(event: ClipboardEvent | InputEvent | KeyboardEvent): DataTransfer | null {
+  if (typeof ClipboardEvent !== "undefined" && event instanceof ClipboardEvent) {
+    return event.clipboardData;
+  }
+  if (typeof InputEvent !== "undefined" && event instanceof InputEvent) {
+    return event.dataTransfer;
+  }
+  return null;
+}
+
+function getPlainTextFromPasteEvent(event: ClipboardEvent | InputEvent | KeyboardEvent): string {
+  const dataTransfer = getPasteDataTransfer(event);
+  return dataTransfer?.getData("text/plain") || dataTransfer?.getData("text/uri-list") || "";
+}
+
+function pasteEventHasFiles(event: ClipboardEvent | InputEvent | KeyboardEvent): boolean {
+  const dataTransfer = getPasteDataTransfer(event);
+  return Array.from(dataTransfer?.items || []).some((item) => item.kind === "file");
+}
+
+function isKeyboardPasteInput(event: InputEvent): boolean {
+  const data = event.data || "";
+  return event.inputType === "insertFromPaste"
+    || event.inputType === "insertFromPasteAsQuotation"
+    || !!event.dataTransfer
+    || data.includes("\n")
+    || data.includes("\r");
+}
+
+async function readClipboardTextFallback(): Promise<string> {
+  try {
+    const mod = await import("@capacitor/clipboard");
+    const result = await mod.Clipboard.read();
+    if (result.value) {
+      return result.value;
+    }
+  } catch {
+    // Fall through to the browser clipboard API.
+  }
+  try {
+    return await navigator.clipboard?.readText?.() || "";
+  } catch {
+    return "";
+  }
+}
+
+function $insertPlainTextAtSelection(text: string): boolean {
+  if (text === "") {
+    return false;
+  }
+  let selection = $getSelection();
+  if (!$isRangeSelection(selection)) {
+    $getRoot().selectEnd();
+    selection = $getSelection();
+  }
+  if (!$isRangeSelection(selection)) {
+    return false;
+  }
+  const parts = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (part) {
+      selection.insertText(part);
+    }
+    if (index < parts.length - 1) {
+      selection.insertLineBreak();
+    }
+    selection = $getSelection();
+    if (!$isRangeSelection(selection)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function $replaceWithPlainText(text: string): void {
+  const root = $getRoot();
+  root.clear();
+  root.selectEnd();
+  if (text !== "") {
+    $insertPlainTextAtSelection(text);
+  }
+  $getRoot().selectEnd();
+}
+
+function $replaceWithSerializedText(text: string): void {
+  const root = $getRoot();
+  root.clear();
+  root.selectEnd();
+  if (text !== "") {
+    $insertSerializedTextAtSelection(text);
+    if (serializedTextEndsWithToken(text)) {
+      $insertPlainTextAtSelection(" ");
+    }
+  }
+  $getRoot().selectEnd();
+}
+
+function EditorBridge({
+  onChange,
+  onReady,
+  onEnter,
+  onDeleteToken,
+}: {
+  onChange: TokenEditorProps["onChange"];
+  onReady: (api: { editor: LexicalEditor; root: HTMLDivElement | null }) => void;
+  onEnter?: (event: KeyboardEvent | null) => boolean;
+  onDeleteToken: (forward: boolean) => boolean;
+}) {
+  const [editor] = useLexicalComposerContext();
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [rootElement, setRootElement] = useState<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    return editor.registerRootListener((rootElement) => {
+      rootRef.current = rootElement as HTMLDivElement | null;
+      setRootElement(rootRef.current);
+      onReady({ editor, root: rootRef.current });
+    });
+  }, [editor, onReady]);
+
+  useEffect(() => {
+    if (!rootElement) {
+      return;
+    }
+    const handleTokenPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) {
+        return;
+      }
+      const tokenElement = target.closest<HTMLElement>("[data-curvature-token-node='true']");
+      if (tokenElement && rootElement.contains(tokenElement)) {
+        event.preventDefault();
+        event.stopPropagation();
+        rootElement.focus({ preventScroll: true });
+        editor.update(() => {
+          const node = $getNearestNodeFromDOMNode(tokenElement);
+          if ($isTokenNode(node)) {
+            $selectAfterTokenNode(node);
+          }
+        });
+        return;
+      }
+      if (target !== rootElement) {
+        return;
+      }
+      event.preventDefault();
+      rootElement.focus({ preventScroll: true });
+      editor.update(() => {
+        $selectEditorEndWithTokenAnchor();
+      });
+    };
+    rootElement.addEventListener("pointerdown", handleTokenPointerDown, { capture: true });
+    return () => {
+      rootElement.removeEventListener("pointerdown", handleTokenPointerDown, { capture: true });
+    };
+  }, [editor, rootElement]);
+
+  useEffect(() => {
+    if (!rootElement) {
+      return;
+    }
+    const insertFromNativePaste = (event: ClipboardEvent | InputEvent) => {
+      if (pasteEventHasFiles(event)) {
+        return;
+      }
+      const text = getPlainTextFromPasteEvent(event);
+      const inputText = typeof InputEvent !== "undefined" && event instanceof InputEvent ? event.data || "" : "";
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      const insert = (nextText: string) => {
+        if (nextText === "") {
+          return;
+        }
+        editor.update(() => {
+          $insertPlainTextAtSelection(nextText);
+        });
+        rootElement.focus({ preventScroll: true });
+      };
+      if (text !== "") {
+        insert(text);
+        return;
+      }
+      void readClipboardTextFallback().then((clipboardText) => {
+        insert(clipboardText || inputText);
+      });
+    };
+    const handlePaste = (event: ClipboardEvent) => insertFromNativePaste(event);
+    const handleBeforeInput = (event: InputEvent) => {
+      if (isKeyboardPasteInput(event)) {
+        insertFromNativePaste(event);
+      }
+    };
+    rootElement.addEventListener("paste", handlePaste, { capture: true });
+    rootElement.addEventListener("beforeinput", handleBeforeInput, { capture: true });
+    return () => {
+      rootElement.removeEventListener("paste", handlePaste, { capture: true });
+      rootElement.removeEventListener("beforeinput", handleBeforeInput, { capture: true });
+    };
+  }, [editor, rootElement]);
+
+  useEffect(() => {
+    return editor.registerUpdateListener(({ editorState }) => {
+      editorState.read(() => {
+        onChange({
+          serializedText: serializeEditor(),
+          displayText: getDisplayText(),
+          activeToken: getActiveTokenFromSelection(),
+        });
+      });
+    });
+  }, [editor, onChange]);
+
+  useEffect(() => {
+    return editor.registerCommand(
+      PASTE_COMMAND,
+      (event) => {
+        if (pasteEventHasFiles(event)) {
+          return false;
+        }
+        const text = getPlainTextFromPasteEvent(event);
+        if (text === "") {
+          return false;
+        }
+        event.preventDefault();
+        if ($insertPlainTextAtSelection(text)) {
+          return true;
+        }
+        return false;
+      },
+      COMMAND_PRIORITY_HIGH
+    );
+  }, [editor]);
+
+  useEffect(() => {
+    return editor.registerCommand(
+      KEY_ENTER_COMMAND,
+      (event) => onEnter?.(event) ?? false,
+      COMMAND_PRIORITY_HIGH
+    );
+  }, [editor, onEnter]);
+
+  useEffect(() => {
+    return editor.registerCommand(
+      KEY_BACKSPACE_COMMAND,
+      () => onDeleteToken(false),
+      COMMAND_PRIORITY_HIGH
+    );
+  }, [editor, onDeleteToken]);
+
+  useEffect(() => {
+    return editor.registerCommand(
+      KEY_DELETE_COMMAND,
+      () => onDeleteToken(true),
+      COMMAND_PRIORITY_HIGH
+    );
+  }, [editor, onDeleteToken]);
+
+  return null;
+}
+
+const TokenEditor = forwardRef<TokenEditorHandle, TokenEditorProps>(function TokenEditor(
+  {
+    placeholder,
+    disabled = false,
+    isDark = false,
+    rightInset = 120,
+    topInset = 0,
+    bottomInset = 12,
+    fillHeight = false,
+    onChange,
+    onFocusChange,
+    onPointerDown,
+    onKeyDown,
+    onPaste,
+    onEnter,
+    enterKeyHint,
+    onCompositionStart,
+    onCompositionEnd,
+  },
+  ref
+) {
+  const editorRef = useRef<LexicalEditor | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [isEmpty, setIsEmpty] = useState(true);
+  const [isFocused, setIsFocused] = useState(false);
+  const isSingleLine = bottomInset <= 12;
+
+  const initialConfig = useMemo(
+    () => ({
+      namespace: "curvature-token-editor",
+      theme: {},
+      onError(error: Error) {
+        throw error;
+      },
+      nodes: [TokenNode],
+    }),
+    []
+  );
+
+  useImperativeHandle(ref, () => ({
+    focus() {
+      rootRef.current?.focus({ preventScroll: true });
+    },
+    blur() {
+      rootRef.current?.blur();
+    },
+    getHeight() {
+      return rootRef.current?.scrollHeight || 44;
+    },
+    clear() {
+      editorRef.current?.update(() => {
+        $setCompositionKey(null);
+        $replaceWithPlainText("");
+      });
+    },
+    setText(value: string) {
+      editorRef.current?.update(() => {
+        $replaceWithSerializedText(value);
+      });
+      rootRef.current?.focus({ preventScroll: true });
+    },
+    insertCandidate(type: CandidateType, value: string) {
+      const editor = editorRef.current;
+      if (!editor) return;
+      if (type === "command") {
+        editor.update(() => {
+          $replaceWithPlainText(value);
+        });
+        rootRef.current?.focus({ preventScroll: true });
+        return;
+      }
+      editor.update(() => {
+        const selection = $getSelection();
+        if (!$isRangeSelection(selection) || !selection.isCollapsed()) {
+          return;
+        }
+        const anchorNode = selection.anchor.getNode();
+        if (!$isTextNode(anchorNode) || $isTokenNode(anchorNode)) {
+          return;
+        }
+        const text = anchorNode.getTextContent();
+        const offset = selection.anchor.offset;
+        const token = parseActiveToken(text, offset);
+        const expectedType = expectedActiveTokenType(type);
+        if (!token || token.type !== expectedType) {
+          return;
+        }
+        let start = offset - 1;
+        while (start >= 0 && text[start] !== triggerChar(token.type)) {
+          start--;
+        }
+        if (start < 0) {
+          return;
+        }
+        let end = offset;
+        while (end < text.length) {
+          const ch = text[end];
+          if (/\s/.test(ch) || ch === "[" || ch === "]" || ch === "\n") {
+            break;
+          }
+          end++;
+        }
+        const prefix = text.slice(0, start);
+        const suffix = text.slice(end);
+        const replacementNodes = [];
+        if (prefix) replacementNodes.push($createTextNode(prefix));
+        if (type === "slash_command") {
+          replacementNodes.push($createTextNode(`/${value}`));
+        } else if (type === "prompt") {
+          replacementNodes.push($createTextNode(value));
+        } else {
+          replacementNodes.push($createTokenNode(type, value, createLabel(type, value)));
+        }
+        const tailNode = $createTextNode(" ");
+        replacementNodes.push(tailNode);
+        if (suffix) replacementNodes.push($createTextNode(suffix));
+        let current = replacementNodes[0];
+        anchorNode.replace(current);
+        for (let i = 1; i < replacementNodes.length; i++) {
+          current.insertAfter(replacementNodes[i]);
+          current = replacementNodes[i];
+        }
+        tailNode.select(1, 1);
+      });
+      rootRef.current?.focus({ preventScroll: true });
+    },
+  }));
+
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) {
+      return;
+    }
+    if (enterKeyHint) {
+      root.setAttribute("enterkeyhint", enterKeyHint);
+      return;
+    }
+    root.removeAttribute("enterkeyhint");
+  }, [enterKeyHint]);
+
+  const handleChange = (payload: { serializedText: string; displayText: string; activeToken: ActiveToken | null }) => {
+    setIsEmpty(payload.displayText.length === 0);
+    onChange(payload);
+  };
+
+  const handleDeleteToken = (forward: boolean) => {
+    const editor = editorRef.current;
+    if (!editor) {
+      return false;
+    }
+    let handled = false;
+    editor.update(() => {
+      const moveSelectionToTextEdge = (node: TextNode | null, atStart: boolean) => {
+        if (!node) {
+          $getRoot().selectEnd();
+          return;
+        }
+        if (atStart) {
+          node.select(0, 0);
+          return;
+        }
+        const size = node.getTextContentSize();
+        node.select(size, size);
+      };
+
+      const selection = $getSelection();
+      if (!$isRangeSelection(selection)) {
+        return;
+      }
+      if (!selection.isCollapsed()) {
+        selection.removeText();
+        handled = true;
+        return;
+      }
+      const anchorNode = selection.anchor.getNode();
+      const anchorOffset = selection.anchor.offset;
+      if ($isTokenNode(anchorNode)) {
+        const target = forward ? anchorNode.getNextSibling() : anchorNode.getPreviousSibling();
+        anchorNode.remove();
+        moveSelectionToTextEdge($isTextNode(target) ? target : null, forward);
+        handled = true;
+        return;
+      }
+      const textNode = $isTextNode(anchorNode) ? anchorNode : null;
+      if (!textNode || $isTokenNode(textNode)) {
+        return;
+      }
+      const sibling = forward
+        ? anchorOffset === textNode.getTextContentSize()
+          ? textNode.getNextSibling()
+          : null
+        : anchorOffset === 0
+        ? textNode.getPreviousSibling()
+        : null;
+      if (!$isTokenNode(sibling)) {
+        return;
+      }
+      const target = forward ? sibling.getNextSibling() : sibling.getPreviousSibling();
+      sibling.remove();
+      if ($isTextNode(target)) {
+        moveSelectionToTextEdge(target, forward);
+      } else {
+        textNode.select(anchorOffset, anchorOffset);
+      }
+      handled = true;
+    });
+    return handled;
+  };
+
+  return (
+    <div
+      onMouseDown={onPointerDown}
+      onTouchStart={onPointerDown}
+      style={{
+        position: "relative",
+        width: "100%",
+        height: fillHeight ? "100%" : undefined,
+        minHeight: "44px",
+        ["--token-file-bg" as any]: isDark ? "rgba(59,130,246,0.16)" : "rgba(59,130,246,0.10)",
+        ["--token-file-text" as any]: isDark ? "#93c5fd" : "#1d4ed8",
+        ["--token-skill-bg" as any]: isDark ? "rgba(139,92,246,0.18)" : "rgba(139,92,246,0.10)",
+        ["--token-skill-text" as any]: isDark ? "#c4b5fd" : "#7c3aed",
+      }}
+    >
+      <LexicalComposer initialConfig={initialConfig}>
+        <PlainTextPlugin
+          contentEditable={
+            <ContentEditable
+              className="token-editor-input"
+              aria-placeholder={placeholder}
+              placeholder={<span></span>}
+              spellCheck={false}
+              onFocus={() => {
+                setIsFocused(true);
+                onFocusChange?.(true);
+              }}
+              onBlur={() => {
+                setIsFocused(false);
+                onFocusChange?.(false);
+              }}
+              onKeyDown={onKeyDown}
+              onPaste={onPaste}
+              enterKeyHint={enterKeyHint}
+              onCompositionStart={onCompositionStart}
+              onCompositionEnd={onCompositionEnd}
+              style={{
+                width: "100%",
+                minHeight: fillHeight ? "100%" : isSingleLine ? "44px" : "20px",
+                height: fillHeight ? "100%" : isSingleLine ? "44px" : "auto",
+                maxHeight: fillHeight ? "none" : "240px",
+                overflowY: "auto",
+                padding: isSingleLine
+                  ? `${12 + topInset}px ${rightInset}px 12px 14px`
+                  : `${8 + topInset}px ${rightInset}px ${bottomInset}px 14px`,
+                outline: "none",
+                fontSize: "16px",
+                lineHeight: "20px",
+                boxSizing: "border-box",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+                color: "var(--text-primary)",
+                position: "relative",
+                zIndex: 2,
+                pointerEvents: disabled ? "none" : "auto",
+              }}
+            />
+          }
+          placeholder={
+            isEmpty && !isFocused ? (
+              <div
+                style={{
+                  position: "absolute",
+                  left: "14px",
+                  right: `${rightInset}px`,
+                  top: topInset > 0 ? `${topInset + 12}px` : "50%",
+                  transform: topInset > 0 ? "none" : "translateY(-50%)",
+                  color: "var(--text-secondary)",
+                  fontSize: "16px",
+                  pointerEvents: "none",
+                  zIndex: 1,
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                }}
+              >
+                {placeholder}
+              </div>
+            ) : null
+          }
+          ErrorBoundary={({ children, onError: _onError }) => children}
+        />
+        <HistoryPlugin />
+        <EditorBridge
+          onChange={handleChange}
+          onReady={({ editor, root }) => {
+            editorRef.current = editor;
+            rootRef.current = root;
+            if (root && enterKeyHint) {
+              root.setAttribute("enterkeyhint", enterKeyHint);
+            }
+          }}
+          onEnter={onEnter}
+          onDeleteToken={handleDeleteToken}
+        />
+      </LexicalComposer>
+    </div>
+  );
+});
+
+export default TokenEditor;

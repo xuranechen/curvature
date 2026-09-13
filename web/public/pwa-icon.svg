@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="128" fill="#0f172a"/>
+  <rect x="40" y="40" width="432" height="432" rx="112" fill="url(#glow)" opacity="0.95"/>
+  <g fill="none" stroke="#f8fafc" stroke-linecap="round" stroke-linejoin="round">
+    <path stroke-width="14" d="M206.485 72h99.03l71.841 76.476l6.69 121.067l-52.99 83.835l-14.563 42.3v73.534L256 492l-60.493-22.788v-73.534l-14.563-42.3l-52.99-83.835l6.69-121.067Zm0 0v88.994m-71.841-12.518l71.841 12.518m-78.531 108.549l78.531-108.549M305.515 72l-99.03 88.994M305.515 72l29.812 143.982m42.029-67.506l-42.029 67.506m48.719 53.561l-48.719-53.561m-4.281 137.393l4.281-137.393m-128.561-54.976l128.561 54.976"/>
+    <path stroke-width="14" d="m127.954 269.543l116.583 19.552l85.939 64.28m4.281-137.393l-90.22 73.194m-38.052-128.18l38.052 128.18m-63.691 64.199l63.691-64.199"/>
+    <path stroke-width="14" d="m244.537 289.095l-49.165 106.583l135.104-42.303M195.372 395.678h120.986"/>
+  </g>
+  <defs>
+    <linearGradient id="glow" x1="86" x2="426" y1="64" y2="448" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1e293b"/>
+      <stop offset="1" stop-color="#0f172a"/>
+    </linearGradient>
+  </defs>
+</svg>

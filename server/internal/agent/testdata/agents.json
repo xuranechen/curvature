@@ -1,0 +1,39 @@
+{
+  "relayBaseURL": "https://relay.example.com",
+  "shells": [
+    {"command": "zsh", "args": ["-ic"], "longShellArgs": [], "os": ["darwin", "linux"]},
+    {"command": "bash", "args": ["-ic"], "longShellArgs": [], "os": ["darwin", "linux"]},
+    {"command": "sh", "args": ["-lc"], "longShellArgs": [], "os": ["darwin", "linux"]},
+    {"command": "pwsh", "args": ["-NoLogo", "-NoProfile", "-Command"], "longShellArgs": ["-NoLogo", "-NoProfile"], "commandPrefix": "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::InputEncoding = [Console]::OutputEncoding; $OutputEncoding = [Console]::OutputEncoding;", "os": "windows"}
+  ],
+  "agents": [
+    {
+      "name": "gemini",
+      "command": "gemini",
+      "protocol": "acp",
+      "args": ["--experimental-acp"]
+    },
+    {
+      "name": "codex",
+      "command": "codex",
+      "protocol": "codex-sdk"
+    },
+    {
+      "name": "claude",
+      "command": "claude",
+      "protocol": "claude-sdk"
+    },
+    {
+      "name": "omp",
+      "command": "omp",
+      "protocol": "acp",
+      "args": ["acp"]
+    },
+    {
+      "name": "CodeBuddy",
+      "command": "codebuddy",
+      "protocol": "acp",
+      "args": ["--acp"]
+    }
+  ]
+}

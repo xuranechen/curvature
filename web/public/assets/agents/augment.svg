@@ -1,0 +1,15 @@
+<svg width="256" height="257" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" fill="none">
+  <!-- 背景：添加圆角 rx="40" -->
+  <rect width="256" height="256" rx="40" fill="#000000"/>
+  
+  <g fill="#F5F5F5">
+    <rect x="112" y="48" width="10" height="34" rx="4"/>
+    <rect x="134" y="48" width="10" height="34" rx="4"/>
+    <circle cx="101" cy="129" r="12"/>
+    <circle cx="155" cy="129" r="12"/>
+  </g>
+  <g stroke="#F5F5F5" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M109 72H81C73.268 72 67 78.268 67 86V115C67 122.18 61.18 128 54 128C61.18 128 67 133.82 67 141V170C67 177.732 73.268 184 81 184H109"/>
+    <path d="M147 72H175C182.732 72 189 78.268 189 86V115C189 122.18 194.82 128 202 128C194.82 128 189 133.82 189 141V170C189 177.732 182.732 184 175 184H147"/>
+  </g>
+</svg>
