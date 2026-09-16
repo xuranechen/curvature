@@ -1,0 +1,119 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to release, e.g. v1.2.3"
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: "1.25"
+  NODE_VERSION: "20"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version tag
+        id: version
+        run: |
+          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          TAG="${TAG#v}"
+          if [[ ! "${TAG}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "error: invalid tag '${TAG}'" >&2
+            exit 1
+          fi
+          echo "tag=v${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "${{ env.NODE_VERSION }}"
+
+      - name: Cache web dependencies
+        uses: actions/cache@v4
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-web-${{ hashFiles('web/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-web-
+
+      - name: Build web assets
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Verify build-all tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zip
+          command -v awk sed tar zip xargs gh
+
+      - name: Build all platforms
+        id: build
+        env:
+          CURVATURE_RELEASE_PUBLIC_KEY: ${{ secrets.CURVATURE_RELEASE_PUBLIC_KEY }}
+        run: |
+          bash scripts/build-all.sh "v${{ steps.version.outputs.tag }}"
+          ls -la dist/
+
+      - name: Sign release manifest
+        id: sign
+        env:
+          CURVATURE_RELEASE_PUBLIC_KEY: ${{ secrets.CURVATURE_RELEASE_PUBLIC_KEY }}
+          CURVATURE_RELEASE_PRIVATE_KEY: ${{ secrets.CURVATURE_RELEASE_PRIVATE_KEY }}
+        run: |
+          REPO="${GITHUB_REPOSITORY}"
+          if [[ -n "${CURVATURE_RELEASE_PRIVATE_KEY}" ]]; then
+            go run scripts/sign-release-manifest.go \
+              -version "v${{ steps.version.outputs.tag }}" \
+              -dist dist \
+              -repo "${REPO}"
+          else
+            echo "CURVATURE_RELEASE_PRIVATE_KEY not set; skipping signed manifest."
+          fi
+          if [[ -n "${CURVATURE_RELEASE_PUBLIC_KEY}" && -f "dist/curvature_v${{ steps.version.outputs.tag }}_manifest.json" ]]; then
+            go run scripts/sign-release-manifest.go -verify \
+              -version "v${{ steps.version.outputs.tag }}" \
+              -dist dist \
+              -repo "${REPO}" \
+              -public-key "${CURVATURE_RELEASE_PUBLIC_KEY}"
+          fi
+
+      - name: Derive release notes
+        id: notes
+        run: |
+          sed -n '1,1p' release-notes.md
+          awk 'NR > 1 && /^# Curvature[[:space:]]+/ { exit } { print }' release-notes.md > dist/release-notes.md
+          head -n 5 dist/release-notes.md
+
+      - name: Create GitHub release
+        run: |
+          gh release create "v${{ steps.version.outputs.tag }}" \
+            --title "v${{ steps.version.outputs.tag }}" \
+            --notes-file dist/release-notes.md \
+            dist/curvature_*.tar.gz dist/curvature_*.zip dist/*_manifest.json
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -1,4 +1,4 @@
-.PHONY: help dev dev-backend dev-web build-web build install uninstall build-all build-relay dev-relay dist-clean publish-release-notes verify-release release tag
+.PHONY: help dev dev-backend dev-web build-web build install uninstall build-all build-relay dev-relay dist-clean package publish-release-notes verify-release release tag
 
 GO ?= go
 NPM ?= npm
@@ -19,6 +19,7 @@ help:
 		"  make install      # install binary and built static assets into $(PREFIX)" \
 		"  make uninstall    # remove installed binary and static assets from $(PREFIX)" \
 		"  make build-all    # cross-compile for all platforms into dist/" \
+		"  make package      # build web assets and package a standalone bundle for the current platform" \
 		"  make dist-clean   # remove dist/ directory" \
 		"  make start        # run curvature on $(ADDR) with built static assets" \
 		"  make start-server # backend entrypoint serving built static assets" \
@@ -32,7 +33,7 @@ dev:
 	$(GO) run ./cli/cmd -addr $(ADDR) $(ROOT)
 
 dev-backend:
-	$(GO) run ./server/cmd/curvature-server -addr $(ADDR)
+	$(GO) run ./backend/cmd/curvature-server -addr $(ADDR)
 
 dev-web:
 	cd $(WEB_DIR) && $(NPM) run dev
@@ -43,11 +44,17 @@ build-web:
 build: build-web
 	$(GO) build -ldflags "-X main.version=$(VERSION)" -o curvature ./cli/cmd
 
+# Package a standalone bundle for the current OS/ARCH: the standalone binary
+# loads frontend assets from a "web" directory next to it at runtime, so this
+# always builds the web assets and bundles them into the package.
+package: build-web
+	@bash scripts/package.sh "$(VERSION)"
+
 build-relay:
-	$(GO) build -ldflags "-X main.version=$(VERSION)" -o curvature-relay ./relay-server
+	$(GO) build -ldflags "-X main.version=$(VERSION)" -o curvature-relay ./relay
 
 dev-relay:
-	$(GO) run ./relay-server -addr :8080 -base http://localhost:8080
+	$(GO) run ./relay -addr :8080 -base http://localhost:8080
 
 install: build
 	install -d "$(PREFIX)/bin"
@@ -66,7 +73,7 @@ start:
 	$(GO) run ./cli/cmd -addr $(ADDR) $(ROOT)
 
 start-server:
-	$(GO) run ./server/cmd/curvature-server -addr $(ADDR)
+	$(GO) run ./backend/cmd/curvature-server -addr $(ADDR)
 
 test:
 	$(GO) test ./...
@@ -74,6 +81,8 @@ test:
 # ── Cross-platform distribution ──────────────────────────────────────────
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 DIST_DIR ?= dist
+# GitHub repository used for releases, e.g. a9gent/curvature. Override with: make release REPO=you/curvature
+REPO ?= a9gent/curvature
 RELEASE_NOTES_FILE ?= release-notes.md
 RELEASE_NOTES_LATEST_FILE ?= $(DIST_DIR)/release-notes-$(TAG).md
 RELEASE_UPLOAD_JOBS ?= 4
@@ -122,7 +131,7 @@ publish-release-notes:
 verify-release:
 	@test -n "$(TAG)" || (echo "Usage: make verify-release TAG=v1.2.3" >&2; exit 1)
 	@test -n "$(CURVATURE_RELEASE_PUBLIC_KEY)" || (echo "Error: CURVATURE_RELEASE_PUBLIC_KEY is required to verify release manifests." >&2; exit 1)
-	@$(GO) run scripts/sign-release-manifest.go -verify -version "$(TAG)" -dist "$(DIST_DIR)" -repo "a9gent/curvature" -public-key "$(CURVATURE_RELEASE_PUBLIC_KEY)"
+	@$(GO) run scripts/sign-release-manifest.go -verify -version "$(TAG)" -dist "$(DIST_DIR)" -repo "$(REPO)" -public-key "$(CURVATURE_RELEASE_PUBLIC_KEY)"
 
 # Usage: make release TAG=v1.2.3
 # Builds desktop/server platforms and creates a GitHub release.
@@ -141,7 +150,7 @@ release:
 	mkdir -p "$(DIST_DIR)"
 	@awk 'NR > 1 && /^# Curvature[[:space:]]+/ { exit } { print }' "$(RELEASE_NOTES_FILE)" > "$(RELEASE_NOTES_LATEST_FILE)"
 	CURVATURE_RELEASE_PUBLIC_KEY="$(CURVATURE_RELEASE_PUBLIC_KEY)" $(MAKE) build-all VERSION="$(TAG)"
-	@$(GO) run scripts/sign-release-manifest.go -version "$(TAG)" -dist "$(DIST_DIR)" -repo "a9gent/curvature"
+	@$(GO) run scripts/sign-release-manifest.go -version "$(TAG)" -dist "$(DIST_DIR)" -repo "$(REPO)"
 	$(MAKE) verify-release TAG="$(TAG)" CURVATURE_RELEASE_PUBLIC_KEY="$(CURVATURE_RELEASE_PUBLIC_KEY)"
 	@echo "Creating draft GitHub release $(TAG)"
 	gh release create $(TAG) \

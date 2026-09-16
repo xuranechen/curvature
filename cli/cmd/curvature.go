@@ -23,7 +23,7 @@ import (
 	"syscall"
 	"time"
 
-	"curvature/server/app"
+	"curvature/backend/app"
 )
 
 var version = "dev"

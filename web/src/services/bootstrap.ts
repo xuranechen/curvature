@@ -4,7 +4,6 @@ import { e2eeService, type E2EEState } from "./e2ee";
 export type RelayStatusPayload = {
   relay_bound?: boolean;
   no_relayer?: boolean;
-  token_station_bound?: boolean;
   pending_code?: string;
   node_name?: string;
   node_id?: string;
@@ -104,6 +103,22 @@ class BootstrapService {
 
   async configureRelayBaseURL(relayBaseURL: string): Promise<RelayStatusPayload | null> {
     const status = await postRelayConfig(relayBaseURL);
+    if (status) {
+      this.applyRelayStatus(status);
+    }
+    return status;
+  }
+
+  async setRelayAccessPassword(accessPassword: string): Promise<RelayStatusPayload | null> {
+    const status = await putRelayAccessPassword(accessPassword);
+    if (status) {
+      this.applyRelayStatus(status);
+    }
+    return status;
+  }
+
+  async unbindRelayNode(): Promise<RelayStatusPayload | null> {
+    const status = await deleteRelayBind();
     if (status) {
       this.applyRelayStatus(status);
     }
@@ -229,6 +244,36 @@ async function postRelayConfig(relayBaseURL: string): Promise<RelayStatusPayload
     : await fetch(target, init);
   if (!response.ok) {
     throw new Error(`relay_config_failed_${response.status}`);
+  }
+  return e2eeService.parseProtectedJSONResponse<RelayStatusPayload>(response);
+}
+
+async function putRelayAccessPassword(accessPassword: string): Promise<RelayStatusPayload | null> {
+  const target = appPath("/api/relay/access-password");
+  const init: RequestInit = {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ access_password: String(accessPassword || "").trim() }),
+  };
+  const response = e2eeService.isRequired()
+    ? await e2eeService.protectedFetch(target, init)
+    : await fetch(target, init);
+  if (!response.ok) {
+    throw new Error(`relay_access_password_failed_${response.status}`);
+  }
+  return e2eeService.parseProtectedJSONResponse<RelayStatusPayload>(response);
+}
+
+async function deleteRelayBind(): Promise<RelayStatusPayload | null> {
+  const target = appPath("/api/relay/bind");
+  const init: RequestInit = {
+    method: "DELETE",
+  };
+  const response = e2eeService.isRequired()
+    ? await e2eeService.protectedFetch(target, init)
+    : await fetch(target, init);
+  if (!response.ok) {
+    throw new Error(`relay_unbind_failed_${response.status}`);
   }
   return e2eeService.parseProtectedJSONResponse<RelayStatusPayload>(response);
 }

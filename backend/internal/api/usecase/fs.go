@@ -1,0 +1,998 @@
+package usecase
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	stdmime "mime"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	"curvature/backend/internal/apperr"
+	"curvature/backend/internal/fs"
+	"curvature/backend/internal/gitview"
+	"curvature/backend/internal/session"
+)
+
+type ListTreeInput struct {
+	RootID string
+	Dir    string
+}
+
+type ListTreeOutput struct {
+	Entries []fs.Entry
+}
+
+type OpenFileRawInput struct {
+	RootID string
+	Path   string
+}
+
+type OpenFileRawOutput struct {
+	File    *os.File
+	Info    os.FileInfo
+	RelPath string
+}
+
+type GetFileInfoInput struct {
+	RootID string
+	Path   string
+}
+
+type GetFileInfoOutput struct {
+	Path  string
+	Name  string
+	Size  int64
+	MTime time.Time
+}
+
+func (s *Service) ListTree(_ context.Context, in ListTreeInput) (ListTreeOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return ListTreeOutput{}, err
+	}
+	root, err := s.Registry.GetRoot(in.RootID)
+	if err != nil {
+		return ListTreeOutput{}, err
+	}
+	dir := in.Dir
+	if dir == "" || dir == "." {
+		dir = "."
+	} else {
+		dir, err = root.NormalizePath(dir)
+		if err != nil {
+			return ListTreeOutput{}, err
+		}
+	}
+	if err := root.ValidateRelativePath(dir); err != nil {
+		return ListTreeOutput{}, err
+	}
+	s.ensureFileWatcher(in.RootID, dir)
+	entries, err := root.ListEntries(dir)
+	if err != nil {
+		return ListTreeOutput{}, err
+	}
+	return ListTreeOutput{Entries: entries}, nil
+}
+
+func parentDir(path string) string {
+	clean := strings.Trim(filepath.ToSlash(path), "/")
+	if clean == "" || clean == "." {
+		return "."
+	}
+	idx := strings.LastIndex(clean, "/")
+	if idx <= 0 {
+		return "."
+	}
+	return clean[:idx]
+}
+
+func (s *Service) OpenFileRaw(_ context.Context, in OpenFileRawInput) (OpenFileRawOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return OpenFileRawOutput{}, err
+	}
+	root, err := s.Registry.GetRoot(in.RootID)
+	if err != nil {
+		return OpenFileRawOutput{}, err
+	}
+	if in.Path == "" {
+		return OpenFileRawOutput{}, errors.New("path required")
+	}
+	path, err := root.NormalizePath(in.Path)
+	if err != nil {
+		return OpenFileRawOutput{}, err
+	}
+	file, info, relPath, err := root.OpenFile(path)
+	if err != nil {
+		return OpenFileRawOutput{}, err
+	}
+	return OpenFileRawOutput{File: file, Info: info, RelPath: relPath}, nil
+}
+
+func (s *Service) GetFileInfo(_ context.Context, in GetFileInfoInput) (GetFileInfoOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return GetFileInfoOutput{}, err
+	}
+	root, err := s.Registry.GetRoot(in.RootID)
+	if err != nil {
+		return GetFileInfoOutput{}, err
+	}
+	if in.Path == "" {
+		return GetFileInfoOutput{}, errors.New("path required")
+	}
+	path, err := root.NormalizePath(in.Path)
+	if err != nil {
+		return GetFileInfoOutput{}, err
+	}
+	info, relPath, err := root.StatFile(path)
+	if err != nil {
+		return GetFileInfoOutput{}, err
+	}
+	return GetFileInfoOutput{
+		Path:  relPath,
+		Name:  filepath.Base(relPath),
+		Size:  info.Size(),
+		MTime: info.ModTime().UTC(),
+	}, nil
+}
+
+type UploadFile struct {
+	Name        string
+	ContentType string
+	Reader      io.Reader
+}
+
+type SaveUploadedFilesInput struct {
+	RootID string
+	Dir    string
+	Files  []UploadFile
+}
+
+type UploadedFile struct {
+	Path      string `json:"path"`
+	AgentPath string `json:"agent_path,omitempty"`
+	Name      string `json:"name"`
+	Mime      string `json:"mime"`
+	Size      int64  `json:"size"`
+}
+
+type SaveUploadedFilesOutput struct {
+	Files []UploadedFile
+}
+
+func (s *Service) SaveUploadedFiles(_ context.Context, in SaveUploadedFilesInput) (SaveUploadedFilesOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return SaveUploadedFilesOutput{}, err
+	}
+	root, err := s.Registry.GetRoot(in.RootID)
+	if err != nil {
+		return SaveUploadedFilesOutput{}, err
+	}
+	if len(in.Files) == 0 {
+		return SaveUploadedFilesOutput{}, errors.New("files required")
+	}
+
+	destDir, destAbs, err := resolveUploadDir(root, in.Dir)
+	if err != nil {
+		return SaveUploadedFilesOutput{}, err
+	}
+	if err := os.MkdirAll(destAbs, 0o755); err != nil {
+		return SaveUploadedFilesOutput{}, apperr.Wrap("mkdir", destAbs, err)
+	}
+
+	saved := make([]UploadedFile, 0, len(in.Files))
+	for _, file := range in.Files {
+		result, err := saveUploadFile(destDir, destAbs, file)
+		if err != nil {
+			return SaveUploadedFilesOutput{}, err
+		}
+		if root.EffectiveMetaLocation() == fs.MetaLocationHome && strings.HasPrefix(result.Path, ".curvature/") {
+			if agentPath, resolveErr := root.ResolvePath(result.Path); resolveErr == nil {
+				result.AgentPath = agentPath
+			}
+		}
+		saved = append(saved, result)
+	}
+	return SaveUploadedFilesOutput{Files: saved}, nil
+}
+
+type ReadFileInput struct {
+	RootID   string
+	Path     string
+	MaxBytes int64
+	Cursor   int64
+	ReadMode string
+}
+
+type ReadFileOutput struct {
+	File fs.ReadResult
+}
+
+type GitStatusInput struct {
+	RootID   string
+	RootPath string
+}
+
+type GitStatusOutput struct {
+	Status gitview.StatusResult
+}
+
+type GitDiffInput struct {
+	RootID   string
+	RepoPath string
+	Path     string
+}
+
+type GitDiffOutput struct {
+	Diff gitview.DiffResult
+}
+
+type GitHistoryInput struct {
+	RootID       string
+	Limit        int
+	BeforeCommit string
+	AfterCommit  string
+}
+
+type GitHistoryOutput struct {
+	History gitview.HistoryResult
+}
+
+type GitCommitFilesInput struct {
+	RootID string
+	Commit string
+}
+
+type GitCommitFilesOutput struct {
+	Files gitview.CommitFilesResult
+}
+
+type GitCommitDiffInput struct {
+	RootID string
+	Commit string
+	Path   string
+}
+
+type GitCommitDiffOutput struct {
+	Diff gitview.DiffResult
+}
+
+type GitRelatedFileDiffInput struct {
+	RootID   string
+	RepoPath string
+	RepoKind string
+	Head     string
+	Path     string
+}
+
+type GitRelatedFileDiffOutput struct {
+	Diff gitview.RelatedFileDiffResult
+}
+
+func (s *Service) ReadFile(ctx context.Context, in ReadFileInput) (ReadFileOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return ReadFileOutput{}, err
+	}
+	root, err := s.Registry.GetRoot(in.RootID)
+	if err != nil {
+		return ReadFileOutput{}, err
+	}
+	if in.Path == "" {
+		return ReadFileOutput{}, errors.New("path required")
+	}
+	path, err := root.NormalizePath(in.Path)
+	if err != nil {
+		return ReadFileOutput{}, err
+	}
+	s.ensureFileWatcher(in.RootID, parentDir(path))
+	result, err := root.ReadFile(path, in.MaxBytes, in.Cursor, in.ReadMode)
+	if err != nil {
+		return ReadFileOutput{}, err
+	}
+	meta, err := root.GetFileMeta(path)
+	if err != nil {
+		return ReadFileOutput{}, err
+	}
+	meta = fillFileMetaSessionInfo(ctx, s, in.RootID, meta)
+	result.Root = root.ID
+	result.FileMeta = meta
+	return ReadFileOutput{File: result}, nil
+}
+
+func (s *Service) GetGitStatus(ctx context.Context, in GitStatusInput) (GitStatusOutput, error) {
+	if strings.TrimSpace(in.RootPath) != "" {
+		rootPath := filepath.Clean(strings.TrimSpace(in.RootPath))
+		if !filepath.IsAbs(rootPath) {
+			return GitStatusOutput{}, errors.New("path must be absolute")
+		}
+		status, err := gitview.InspectStatus(ctx, rootPath)
+		if err != nil {
+			return GitStatusOutput{}, err
+		}
+		return GitStatusOutput{Status: status}, nil
+	}
+	if err := s.ensureRegistry(); err != nil {
+		return GitStatusOutput{}, err
+	}
+	root, err := s.Registry.GetRoot(in.RootID)
+	if err != nil {
+		return GitStatusOutput{}, err
+	}
+	status, err := gitview.InspectStatus(ctx, root.RootPath)
+	if err != nil {
+		return GitStatusOutput{}, err
+	}
+	return GitStatusOutput{Status: status}, nil
+}
+
+func (s *Service) GetGitDiff(ctx context.Context, in GitDiffInput) (GitDiffOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return GitDiffOutput{}, err
+	}
+	root, err := s.Registry.GetRoot(in.RootID)
+	if err != nil {
+		return GitDiffOutput{}, err
+	}
+	if strings.TrimSpace(in.Path) == "" {
+		return GitDiffOutput{}, errors.New("path required")
+	}
+	path := strings.TrimSpace(in.Path)
+	repoPath := strings.TrimSpace(in.RepoPath)
+	rootPath := root.RootPath
+	if repoPath != "" {
+		if !filepath.IsAbs(repoPath) {
+			return GitDiffOutput{}, errors.New("repo path must be absolute")
+		}
+		rootPath = filepath.Clean(repoPath)
+	} else {
+		var err error
+		path, err = root.NormalizePath(path)
+		if err != nil {
+			return GitDiffOutput{}, err
+		}
+	}
+	diff, err := gitview.ReadDiff(ctx, rootPath, path)
+	if err != nil {
+		return GitDiffOutput{}, err
+	}
+	var meta []fs.FileMetaEntry
+	if repoPath == "" || sameManagedDirPath(repoPath, root.RootPath) {
+		if value, err := root.GetFileMeta(path); err == nil {
+			meta = value
+		}
+	}
+	diff.FileMeta = fillFileMetaSessionInfo(ctx, s, in.RootID, meta)
+	return GitDiffOutput{Diff: diff}, nil
+}
+
+func (s *Service) GetGitHistory(ctx context.Context, in GitHistoryInput) (GitHistoryOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return GitHistoryOutput{}, err
+	}
+	root, err := s.Registry.GetRoot(in.RootID)
+	if err != nil {
+		return GitHistoryOutput{}, err
+	}
+	history, err := gitview.ListHistory(ctx, root.RootPath, in.Limit, in.BeforeCommit, in.AfterCommit)
+	if err != nil {
+		return GitHistoryOutput{}, err
+	}
+	return GitHistoryOutput{History: history}, nil
+}
+
+func (s *Service) GetGitCommitFiles(ctx context.Context, in GitCommitFilesInput) (GitCommitFilesOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return GitCommitFilesOutput{}, err
+	}
+	root, err := s.Registry.GetRoot(in.RootID)
+	if err != nil {
+		return GitCommitFilesOutput{}, err
+	}
+	if strings.TrimSpace(in.Commit) == "" {
+		return GitCommitFilesOutput{}, errors.New("commit required")
+	}
+	files, err := gitview.ListCommitFiles(ctx, root.RootPath, in.Commit)
+	if err != nil {
+		return GitCommitFilesOutput{}, err
+	}
+	return GitCommitFilesOutput{Files: files}, nil
+}
+
+func (s *Service) GetGitCommitDiff(ctx context.Context, in GitCommitDiffInput) (GitCommitDiffOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return GitCommitDiffOutput{}, err
+	}
+	root, err := s.Registry.GetRoot(in.RootID)
+	if err != nil {
+		return GitCommitDiffOutput{}, err
+	}
+	if strings.TrimSpace(in.Commit) == "" {
+		return GitCommitDiffOutput{}, errors.New("commit required")
+	}
+	if strings.TrimSpace(in.Path) == "" {
+		return GitCommitDiffOutput{}, errors.New("path required")
+	}
+	path, err := root.NormalizePath(in.Path)
+	if err != nil {
+		return GitCommitDiffOutput{}, err
+	}
+	diff, err := gitview.ReadCommitDiff(ctx, root.RootPath, in.Commit, path)
+	if err != nil {
+		return GitCommitDiffOutput{}, err
+	}
+	meta, err := root.GetFileMeta(path)
+	if err != nil {
+		meta = nil
+	}
+	diff.FileMeta = fillFileMetaSessionInfo(ctx, s, in.RootID, meta)
+	return GitCommitDiffOutput{Diff: diff}, nil
+}
+
+func (s *Service) GetGitRelatedFileDiff(ctx context.Context, in GitRelatedFileDiffInput) (GitRelatedFileDiffOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return GitRelatedFileDiffOutput{}, err
+	}
+	root, err := s.Registry.GetRoot(in.RootID)
+	if err != nil {
+		return GitRelatedFileDiffOutput{}, err
+	}
+	if strings.TrimSpace(in.Path) == "" {
+		return GitRelatedFileDiffOutput{}, errors.New("path required")
+	}
+	rootPath, repoPath, path, head, err := resolveGitRelatedFileDiffTarget(ctx, root, in)
+	if err != nil {
+		return GitRelatedFileDiffOutput{}, err
+	}
+	diff, err := gitview.ReadRelatedFileDiff(ctx, rootPath, head, path)
+	if err != nil {
+		return GitRelatedFileDiffOutput{}, err
+	}
+	var meta []fs.FileMetaEntry
+	if repoPath == "" || sameManagedDirPath(repoPath, root.RootPath) {
+		if value, err := root.GetFileMeta(path); err == nil {
+			meta = value
+		}
+	}
+	diff.FileMeta = fillFileMetaSessionInfo(ctx, s, in.RootID, meta)
+	return GitRelatedFileDiffOutput{Diff: diff}, nil
+}
+
+func resolveGitRelatedFileDiffTarget(ctx context.Context, root fs.RootInfo, in GitRelatedFileDiffInput) (string, string, string, string, error) {
+	path := strings.TrimSpace(in.Path)
+	repoPath := strings.TrimSpace(in.RepoPath)
+	rootPath := root.RootPath
+	head := strings.TrimSpace(in.Head)
+	var normalizedRootRelPath string
+	if repoPath != "" {
+		if !filepath.IsAbs(repoPath) {
+			return "", "", "", "", errors.New("repo path must be absolute")
+		}
+		rootPath = filepath.Clean(repoPath)
+		if value, err := root.NormalizePath(path); err == nil {
+			normalizedRootRelPath = value
+		}
+	} else {
+		value, err := root.NormalizePath(path)
+		if err != nil {
+			return "", "", "", "", err
+		}
+		path = value
+		normalizedRootRelPath = value
+	}
+	if normalizedRootRelPath != "" {
+		if fallbackRepoPath, fallbackRelPath, fallbackHead, ok := resolveTaskWorktreeRelatedFile(ctx, root.RootPath, normalizedRootRelPath); ok {
+			rootPath = fallbackRepoPath
+			repoPath = fallbackRepoPath
+			path = fallbackRelPath
+			if head == "" {
+				head = fallbackHead
+			}
+		}
+	}
+	return rootPath, repoPath, path, head, nil
+}
+
+func resolveTaskWorktreeRelatedFile(ctx context.Context, rootPath, relPath string) (string, string, string, bool) {
+	relPath = filepath.ToSlash(strings.TrimSpace(relPath))
+	if relPath == "" {
+		return "", "", "", false
+	}
+	if !strings.HasPrefix(relPath, ".worktree/task-") {
+		return "", "", "", false
+	}
+	absPath := filepath.Clean(filepath.Join(rootPath, filepath.FromSlash(relPath)))
+	if resolvedAbsPath, err := filepath.EvalSymlinks(absPath); err == nil {
+		absPath = filepath.Clean(resolvedAbsPath)
+	}
+	repo, err := gitview.ResolveRepositoryForPath(ctx, absPath)
+	if err != nil || strings.TrimSpace(repo.Path) == "" {
+		return "", "", "", false
+	}
+	repoPath := filepath.Clean(repo.Path)
+	rootClean := filepath.Clean(rootPath)
+	if resolvedRootPath, err := filepath.EvalSymlinks(rootClean); err == nil {
+		rootClean = filepath.Clean(resolvedRootPath)
+	}
+	if sameManagedDirPath(repoPath, rootClean) {
+		return "", "", "", false
+	}
+	fileRel, err := filepath.Rel(repoPath, absPath)
+	if err != nil || fileRel == "." || filepath.IsAbs(fileRel) || strings.HasPrefix(fileRel, ".."+string(filepath.Separator)) || fileRel == ".." {
+		return "", "", "", false
+	}
+	return repoPath, filepath.ToSlash(fileRel), strings.TrimSpace(repo.Head), true
+}
+
+func resolveUploadDir(root fs.RootInfo, dir string) (string, string, error) {
+	destDir := strings.TrimSpace(dir)
+	if destDir == "" {
+		destDir = defaultUploadDir()
+	} else {
+		var err error
+		destDir, err = root.NormalizePath(destDir)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	if err := root.ValidateRelativePath(destDir); err != nil {
+		return "", "", err
+	}
+	destAbs, err := root.ResolvePath(destDir)
+	if err != nil {
+		return "", "", err
+	}
+	return destDir, destAbs, nil
+}
+
+func defaultUploadDir() string {
+	return filepath.ToSlash(filepath.Join(".curvature", "upload", time.Now().Format("2006-01-02")))
+}
+
+func saveUploadFile(destDir, destAbs string, file UploadFile) (UploadedFile, error) {
+	if file.Reader == nil {
+		return UploadedFile{}, errors.New("file reader required")
+	}
+	name := sanitizeUploadName(file.Name)
+	if name == "" {
+		return UploadedFile{}, errors.New("file name required")
+	}
+
+	for index := 0; ; index++ {
+		candidateName := disambiguateUploadName(name, index)
+		relPath := joinUploadPath(destDir, candidateName)
+		absPath := filepath.Join(destAbs, candidateName)
+
+		handle, err := os.OpenFile(absPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err != nil {
+			if os.IsExist(err) {
+				continue
+			}
+			return UploadedFile{}, apperr.Wrap("create", absPath, err)
+		}
+
+		size, copyErr := io.Copy(handle, file.Reader)
+		closeErr := handle.Close()
+		if copyErr != nil {
+			_ = os.Remove(absPath)
+			return UploadedFile{}, apperr.Wrap("write", absPath, copyErr)
+		}
+		if closeErr != nil {
+			_ = os.Remove(absPath)
+			return UploadedFile{}, apperr.Wrap("write", absPath, closeErr)
+		}
+
+		return UploadedFile{
+			Path: relPath,
+			Name: candidateName,
+			Mime: uploadMimeType(candidateName, file.ContentType),
+			Size: size,
+		}, nil
+	}
+}
+
+func sanitizeUploadName(name string) string {
+	clean := strings.TrimSpace(name)
+	if clean == "" {
+		return ""
+	}
+	clean = filepath.Base(clean)
+	if clean == "." || clean == string(filepath.Separator) {
+		return ""
+	}
+	return clean
+}
+
+func disambiguateUploadName(name string, index int) string {
+	if index <= 0 {
+		return name
+	}
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	return fmt.Sprintf("%s (%d)%s", base, index, ext)
+}
+
+func joinUploadPath(dir, name string) string {
+	if dir == "." || dir == "" {
+		return name
+	}
+	return filepath.ToSlash(filepath.Join(dir, name))
+}
+
+func uploadMimeType(name, contentType string) string {
+	if contentType != "" {
+		if mediaType, _, err := stdmime.ParseMediaType(contentType); err == nil && mediaType != "" {
+			return mediaType
+		}
+	}
+	if mimeType := stdmime.TypeByExtension(strings.ToLower(filepath.Ext(name))); mimeType != "" {
+		return mimeType
+	}
+	return "application/octet-stream"
+}
+
+func fillFileMetaSessionInfo(ctx context.Context, s *Service, rootID string, meta []fs.FileMetaEntry) []fs.FileMetaEntry {
+	if len(meta) == 0 {
+		return meta
+	}
+	manager, err := s.Registry.GetSessionManager(rootID)
+	if err != nil || manager == nil {
+		return meta
+	}
+	for i := range meta {
+		if meta[i].SourceSession == "" {
+			continue
+		}
+		if meta[i].SessionName != "" && meta[i].Agent != "" {
+			continue
+		}
+		sess, err := manager.Get(ctx, meta[i].SourceSession, 0)
+		if err != nil || sess == nil {
+			continue
+		}
+		if meta[i].SessionName == "" {
+			meta[i].SessionName = sess.Name
+		}
+		if meta[i].Agent == "" {
+			meta[i].Agent = session.InferAgentFromSession(sess)
+		}
+	}
+	return meta
+}
+
+type GetFileMetaInput struct {
+	RootID string
+	Path   string
+}
+
+type GetFileMetaOutput struct {
+	Meta []fs.FileMetaEntry
+}
+
+func (s *Service) GetFileMeta(_ context.Context, in GetFileMetaInput) (GetFileMetaOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return GetFileMetaOutput{}, err
+	}
+	root, err := s.Registry.GetRoot(in.RootID)
+	if err != nil {
+		return GetFileMetaOutput{}, err
+	}
+	if in.Path == "" {
+		return GetFileMetaOutput{}, errors.New("path required")
+	}
+	path, err := root.NormalizePath(in.Path)
+	if err != nil {
+		return GetFileMetaOutput{}, err
+	}
+	meta, err := root.GetFileMeta(path)
+	if err != nil {
+		return GetFileMetaOutput{}, err
+	}
+	return GetFileMetaOutput{Meta: meta}, nil
+}
+
+type ListManagedDirsOutput struct {
+	Dirs []fs.RootInfo
+}
+
+func (s *Service) ListManagedDirs(_ context.Context) (ListManagedDirsOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return ListManagedDirsOutput{}, err
+	}
+	return ListManagedDirsOutput{Dirs: s.Registry.ListRoots()}, nil
+}
+
+type AddManagedDirInput struct {
+	Path   string
+	Create bool
+}
+
+type AddManagedDirOutput struct {
+	Dir fs.RootInfo
+}
+
+type rootMetaLocationUpserter interface {
+	UpsertRootWithMetaLocation(path, metaLocation string) (fs.RootInfo, error)
+}
+
+func preferredNewProjectMetaLocation(registry Registry) string {
+	if prefs := registry.GetPreferences(); prefs != nil {
+		return prefs.NewProjectMetaLocation()
+	}
+	return fs.MetaLocationProject
+}
+
+func upsertRootWithMetaLocation(registry Registry, path, location string) (fs.RootInfo, error) {
+	if upserter, ok := registry.(rootMetaLocationUpserter); ok {
+		return upserter.UpsertRootWithMetaLocation(path, location)
+	}
+	return registry.UpsertRoot(path)
+}
+
+func (s *Service) AddManagedDir(_ context.Context, in AddManagedDirInput) (AddManagedDirOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return AddManagedDirOutput{}, err
+	}
+	if in.Path == "" {
+		return AddManagedDirOutput{}, errors.New("path required")
+	}
+	abs, err := resolveManagedDirPath(s.Registry, in.Path, in.Create)
+	if err != nil {
+		return AddManagedDirOutput{}, err
+	}
+	if err := ensureManagedDirNameAvailable(s.Registry, abs); err != nil {
+		return AddManagedDirOutput{}, err
+	}
+	name := filepath.Base(abs)
+	location, err := fs.MetaLocationForNewRoot(abs, preferredNewProjectMetaLocation(s.Registry))
+	if err != nil {
+		return AddManagedDirOutput{}, err
+	}
+	pending := fs.NewRootInfo(name, name, abs)
+	pending.MetaLocation = location
+	if _, err := pending.EnsureMetaDir(); err != nil {
+		return AddManagedDirOutput{}, err
+	}
+	dir, err := upsertRootWithMetaLocation(s.Registry, abs, location)
+	if err != nil {
+		return AddManagedDirOutput{}, err
+	}
+	return AddManagedDirOutput{Dir: dir}, nil
+}
+
+func ensureManagedDirNameAvailable(registry Registry, path string) error {
+	name := filepath.Base(filepath.Clean(path))
+	for _, existing := range registry.ListRoots() {
+		if existing.ID != name {
+			continue
+		}
+		if sameManagedDirPath(existing.RootPath, path) {
+			return nil
+		}
+		return fmt.Errorf("%w:\n\t%q is already managed at %s;\n\trename the directory before adding %s", fs.ErrRootNameConflict, name, existing.RootPath, path)
+	}
+	return nil
+}
+
+func sameManagedDirPath(a, b string) bool {
+	left := cleanManagedDirPath(a)
+	right := cleanManagedDirPath(b)
+	if runtime.GOOS == "windows" {
+		left = strings.ToLower(left)
+		right = strings.ToLower(right)
+	}
+	return left == right
+}
+
+func cleanManagedDirPath(path string) string {
+	cleaned := filepath.Clean(strings.TrimSpace(path))
+	if abs, err := filepath.Abs(cleaned); err == nil {
+		return abs
+	}
+	return cleaned
+}
+
+func resolveManagedDirPath(registry Registry, raw string, create bool) (string, error) {
+	if create {
+		return createManagedDir(registry, raw)
+	}
+	if !filepath.IsAbs(raw) {
+		return "", errors.New("path must be absolute")
+	}
+	abs := filepath.Clean(raw)
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", apperr.Wrap("stat", abs, err)
+	}
+	if !info.IsDir() {
+		return "", errors.New("path must be a directory")
+	}
+	return abs, nil
+}
+
+func createManagedDir(registry Registry, name string) (string, error) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "", errors.New("path required")
+	}
+	if filepath.IsAbs(trimmed) {
+		abs := filepath.Clean(trimmed)
+		for _, existing := range registry.ListRoots() {
+			existingPath := filepath.Clean(existing.RootPath)
+			if existingPath == abs {
+				return "", errors.New("root already exists")
+			}
+		}
+		if err := os.MkdirAll(abs, 0o755); err != nil {
+			return "", apperr.Wrap("mkdir", abs, err)
+		}
+		return abs, nil
+	}
+	if trimmed == "." || trimmed == ".." {
+		return "", errors.New("invalid root name")
+	}
+	if strings.Contains(trimmed, "/") || strings.Contains(trimmed, "\\") {
+		return "", errors.New("root name must not contain path separators")
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	baseDir := filepath.Join(homeDir, "curvature")
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		return "", apperr.Wrap("mkdir", baseDir, err)
+	}
+
+	rootPath := filepath.Join(baseDir, trimmed)
+	cleanRootPath := filepath.Clean(rootPath)
+	for _, existing := range registry.ListRoots() {
+		existingPath := filepath.Clean(existing.RootPath)
+		if existing.ID == trimmed && existingPath != cleanRootPath {
+			return "", errors.New("root name already exists")
+		}
+		if existingPath == cleanRootPath {
+			return "", errors.New("root already exists")
+		}
+	}
+
+	if info, err := os.Stat(rootPath); err == nil {
+		if info.IsDir() {
+			return cleanRootPath, nil
+		}
+		return "", errors.New("root path already exists and is not a directory")
+	} else if !os.IsNotExist(err) {
+		return "", apperr.Wrap("stat", rootPath, err)
+	}
+
+	if err := os.Mkdir(rootPath, 0o755); err != nil {
+		return "", apperr.Wrap("mkdir", rootPath, err)
+	}
+	return cleanRootPath, nil
+}
+
+type RemoveManagedDirInput struct {
+	Path string
+}
+
+type RemoveManagedDirOutput struct {
+	Dir fs.RootInfo
+}
+
+func (s *Service) RemoveManagedDir(_ context.Context, in RemoveManagedDirInput) (RemoveManagedDirOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return RemoveManagedDirOutput{}, err
+	}
+	if in.Path == "" {
+		return RemoveManagedDirOutput{}, errors.New("path required")
+	}
+	if !filepath.IsAbs(in.Path) {
+		return RemoveManagedDirOutput{}, errors.New("path must be absolute")
+	}
+	dir, err := s.Registry.RemoveRoot(filepath.Clean(in.Path))
+	if err != nil {
+		return RemoveManagedDirOutput{}, err
+	}
+	return RemoveManagedDirOutput{Dir: dir}, nil
+}
+
+type RenameManagedDirInput struct {
+	RootID string
+	Name   string
+}
+
+type RenameManagedDirOutput struct {
+	OldRootID string
+	Dir       fs.RootInfo
+}
+
+type rootResourceReleaser interface {
+	ReleaseRootResources(rootID string)
+}
+
+func (s *Service) RenameManagedDir(_ context.Context, in RenameManagedDirInput) (RenameManagedDirOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return RenameManagedDirOutput{}, err
+	}
+	rootID := strings.TrimSpace(in.RootID)
+	nextName := strings.TrimSpace(in.Name)
+	if rootID == "" {
+		return RenameManagedDirOutput{}, errors.New("root id required")
+	}
+	if nextName == "" {
+		return RenameManagedDirOutput{}, errors.New("root name required")
+	}
+	if nextName == "." || nextName == ".." {
+		return RenameManagedDirOutput{}, errors.New("invalid root name")
+	}
+	if strings.Contains(nextName, "/") || strings.Contains(nextName, "\\") {
+		return RenameManagedDirOutput{}, errors.New("root name must not contain path separators")
+	}
+
+	root, err := s.Registry.GetRoot(rootID)
+	if err != nil {
+		return RenameManagedDirOutput{}, err
+	}
+	oldPath := filepath.Clean(root.RootPath)
+	if info, err := os.Stat(oldPath); err != nil || !info.IsDir() {
+		if err != nil {
+			return RenameManagedDirOutput{}, apperr.Wrap("stat", oldPath, err)
+		}
+		return RenameManagedDirOutput{}, errors.New("root path must be a directory")
+	}
+	newPath := filepath.Join(filepath.Dir(oldPath), nextName)
+	if sameManagedDirPath(oldPath, newPath) {
+		return RenameManagedDirOutput{OldRootID: rootID, Dir: root}, nil
+	}
+	for _, existing := range s.Registry.ListRoots() {
+		if existing.ID == rootID {
+			continue
+		}
+		if existing.ID == nextName {
+			return RenameManagedDirOutput{}, fmt.Errorf("%w: %q is already managed at %s", fs.ErrRootNameConflict, nextName, existing.RootPath)
+		}
+		if sameManagedDirPath(existing.RootPath, newPath) {
+			return RenameManagedDirOutput{}, errors.New("root path already exists")
+		}
+	}
+	if _, err := os.Stat(newPath); err == nil {
+		return RenameManagedDirOutput{}, errors.New("root path already exists")
+	} else if !os.IsNotExist(err) {
+		return RenameManagedDirOutput{}, apperr.Wrap("stat", newPath, err)
+	}
+
+	if releaser, ok := s.Registry.(rootResourceReleaser); ok {
+		releaser.ReleaseRootResources(rootID)
+	}
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return RenameManagedDirOutput{}, apperr.Wrap("rename", oldPath, err)
+	}
+	dir, err := s.Registry.RenameRoot(rootID, nextName, newPath)
+	if err != nil {
+		if rollbackErr := os.Rename(newPath, oldPath); rollbackErr != nil {
+			return RenameManagedDirOutput{}, fmt.Errorf("registry rename failed: %w; rollback failed: %v", err, apperr.Wrap("rename", newPath, rollbackErr))
+		}
+		return RenameManagedDirOutput{}, err
+	}
+	return RenameManagedDirOutput{OldRootID: rootID, Dir: dir}, nil
+}
+
+func (s *Service) ensureFileWatcher(rootID, dir string) {
+	if strings.TrimSpace(rootID) == "" {
+		return
+	}
+	manager, err := s.Registry.GetSessionManager(rootID)
+	if err != nil || manager == nil {
+		return
+	}
+	watcher, err := s.Registry.GetFileWatcher(rootID, manager)
+	if err != nil || watcher == nil {
+		return
+	}
+	if strings.TrimSpace(dir) == "" {
+		dir = "."
+	}
+	_ = watcher.WatchDir(dir)
+}

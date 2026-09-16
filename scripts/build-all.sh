@@ -23,7 +23,7 @@ echo
 
 LDFLAGS="-s -w -X main.version=${VERSION}"
 if [[ -n "${CURVATURE_RELEASE_PUBLIC_KEY:-}" ]]; then
-  LDFLAGS="${LDFLAGS} -X curvature/server/internal/update.releaseManifestPublicKey=${CURVATURE_RELEASE_PUBLIC_KEY}"
+  LDFLAGS="${LDFLAGS} -X curvature/backend/internal/update.releaseManifestPublicKey=${CURVATURE_RELEASE_PUBLIC_KEY}"
 fi
 
 built_dirs=()

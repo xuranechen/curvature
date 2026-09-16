@@ -328,16 +328,16 @@ Curvature 的 Relay、Paseo 的 Relay 和 HAPI 的 Relay 是产品远程能力�
 
 - `../curvature/README.zh.md`：功能、访问模式、安装和 CLI 参数
 - `../curvature/agents.json`：18 个 Agent、协议类型、安装与配置备份定义
-- `../curvature/server/internal/api/agent_config.go` 与 `../curvature/web/src/services/agentConfig.ts`：单 Agent 配置备份、API Provider 和切换实现
+- `../curvature/backend/internal/api/agent_config.go` 与 `../curvature/web/src/services/agentConfig.ts`：单 Agent 配置备份、API Provider 和切换实现
 - `../curvature/go.mod`：Codex SDK、Claude Agent SDK、ACP SDK、PTY、E2EE/Relay 相关依赖
-- `../curvature/server/internal/session/manager.go`：任务、相关文件和 Worktree 持久化
-- `../curvature/server/internal/kanban/`：任务模板、队列、阶段和任务存储
-- `../curvature/server/internal/gitview/`：Git Status、Diff、Commit、历史与 Worktree 操作
-- `../curvature/server/internal/commandexec/`：命令与长期 Shell
-- `../curvature/server/internal/relay/services.go`：本地服务 Relay
+- `../curvature/backend/internal/session/manager.go`：任务、相关文件和 Worktree 持久化
+- `../curvature/backend/internal/kanban/`：任务模板、队列、阶段和任务存储
+- `../curvature/backend/internal/gitview/`：Git Status、Diff、Commit、历史与 Worktree 操作
+- `../curvature/backend/internal/commandexec/`：命令与长期 Shell
+- `../curvature/backend/internal/relay/services.go`：本地服务 Relay
 - `../curvature/web/src/services/session.ts`：外部会话导入、批量导入与 Session Fork
 - `../curvature/web/src/services/upload.ts` 与 `download.ts`：项目文件上传、下载及移动壳桥接
-- `../curvature/scripts/build-all.sh` 与 `../curvature/server/app/server.go`：发布结构和外置 Web 静态资源
+- `../curvature/scripts/build-all.sh` 与 `../curvature/backend/app/server.go`：发布结构和外置 Web 静态资源
 
 ### HAPI
 

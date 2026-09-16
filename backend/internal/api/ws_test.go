@@ -1,0 +1,404 @@
+package api
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"curvature/backend/internal/agent"
+	agenttypes "curvature/backend/internal/agent/types"
+	"curvature/backend/internal/e2ee"
+	"curvature/backend/internal/session"
+)
+
+func TestParseClientContext(t *testing.T) {
+	payload := map[string]any{
+		"context": map[string]any{
+			"current_root": "ignored-by-payload",
+			"selection": map[string]any{
+				"file_path":  "docs/readme.md",
+				"start_line": 1,
+				"end_line":   3,
+				"text":       "abc",
+			},
+		},
+	}
+
+	got := parseClientContext(payload, "curvature")
+	if got.CurrentRoot != "ignored-by-payload" {
+		t.Fatalf("unexpected current root: %q", got.CurrentRoot)
+	}
+	if got.Selection == nil || got.Selection.Text != "abc" {
+		t.Fatalf("unexpected selection: %#v", got.Selection)
+	}
+
+	got = parseClientContext(map[string]any{}, "fallback-root")
+	if got.CurrentRoot != "fallback-root" {
+		t.Fatalf("expected fallback root, got %q", got.CurrentRoot)
+	}
+}
+
+func TestAppendReplyEventPrefixesTruncatedSummary(t *testing.T) {
+	hub := NewStreamHub(nil)
+
+	hub.AppendReplyEvent("sess-1", StreamEvent{
+		Type: "message_chunk",
+		Data: agenttypes.MessageChunk{Content: strings.Repeat("前", 601) + "后"},
+	})
+
+	snapshot := hub.PendingSessionSnapshot("sess-1")
+	if !strings.HasPrefix(snapshot.Summary, "...") {
+		t.Fatalf("summary should start with ellipsis when truncated, got %q", snapshot.Summary)
+	}
+	if !strings.HasSuffix(snapshot.Summary, "后") {
+		t.Fatalf("summary should keep the end of the content, got %q", snapshot.Summary)
+	}
+}
+
+func TestAppendReplyEventResetsSummaryAfterAuxiliaryEvent(t *testing.T) {
+	hub := NewStreamHub(nil)
+
+	hub.AppendReplyEvent("sess-1", StreamEvent{
+		Type: string(agenttypes.EventTypeMessageChunk),
+		Data: agenttypes.MessageChunk{Content: "before aux"},
+	})
+	hub.AppendReplyEvent("sess-1", StreamEvent{
+		Type: string(agenttypes.EventTypePlanUpdate),
+		Data: agenttypes.PlanUpdate{Content: "- inspect"},
+	})
+	hub.AppendReplyEvent("sess-1", StreamEvent{
+		Type: string(agenttypes.EventTypeMessageChunk),
+		Data: agenttypes.MessageChunk{Content: "after aux"},
+	})
+
+	snapshot := hub.PendingSessionSnapshot("sess-1")
+	if snapshot.Summary != "after aux" {
+		t.Fatalf("summary = %q, want aux boundary to discard previous content", snapshot.Summary)
+	}
+}
+
+func TestAppendReplyEventBuildsCompositeCursor(t *testing.T) {
+	hub := NewStreamHub(nil)
+	hub.SetPendingUserAt("root", "sess-1", "title", "codex", "", "", "", "", false, "prompt", time.Now(), 8)
+
+	first := hub.AppendReplyEvent("sess-1", StreamEvent{
+		Type: string(agenttypes.EventTypeMessageChunk),
+		Data: agenttypes.MessageChunk{Content: "first"},
+	})
+	second := hub.AppendReplyEvent("sess-1", StreamEvent{
+		Type: string(agenttypes.EventTypeMessageChunk),
+		Data: agenttypes.MessageChunk{Content: "second"},
+	})
+
+	if first.EventCursor != "8:1" || second.EventCursor != "8:2" {
+		t.Fatalf("event cursors = %q, %q; want 8:1, 8:2", first.EventCursor, second.EventCursor)
+	}
+}
+
+func TestReplayPendingStartsAfterCompositeCursor(t *testing.T) {
+	hub := NewStreamHub(nil)
+	hub.SetPendingUserAt("root", "sess-1", "title", "codex", "", "", "", "", false, "prompt", time.Now(), 8)
+	hub.AppendReplyEvent("sess-1", StreamEvent{Type: string(agenttypes.EventTypeMessageChunk), Data: agenttypes.MessageChunk{Content: "first"}})
+	hub.AppendReplyEvent("sess-1", StreamEvent{Type: string(agenttypes.EventTypeMessageChunk), Data: agenttypes.MessageChunk{Content: "second"}})
+	hub.AppendReplyEvent("sess-1", StreamEvent{Type: string(agenttypes.EventTypeMessageChunk), Data: agenttypes.MessageChunk{Content: "third"}})
+	hub.replayStates[pendingClientKey("client", "sess-1")] = &ClientReplayState{
+		Status:       ClientStreamStatusReplay,
+		LastEventSeq: 2,
+	}
+
+	step := hub.collectReplayStep("client", "sess-1")
+	if len(step.events) != 1 || step.events[0].EventCursor != "8:3" {
+		t.Fatalf("replayed events = %#v; want only cursor 8:3", step.events)
+	}
+}
+
+func TestCoalescedToolStreamAdvancesCursor(t *testing.T) {
+	hub := NewStreamHub(nil)
+	hub.SetPendingUserAt("root", "sess-1", "title", "", "", "", "", "", false, "command", time.Now(), 4)
+	toolUpdate := func(text string) StreamEvent {
+		return StreamEvent{
+			Type: string(agenttypes.EventTypeToolUpdate),
+			Data: agenttypes.ToolCall{
+				CallID:  "call-1",
+				Status:  "running",
+				Meta:    map[string]any{"source": "userShell", "phase": "stream"},
+				Content: []agenttypes.ToolCallContentItem{{Type: "text", Text: text}},
+			},
+		}
+	}
+	hub.AppendReplyEvent("sess-1", toolUpdate("hello "))
+	hub.AppendReplyEvent("sess-1", toolUpdate("world"))
+	hub.replayStates[pendingClientKey("client", "sess-1")] = &ClientReplayState{
+		Status:       ClientStreamStatusReplay,
+		LastEventSeq: 1,
+	}
+
+	step := hub.collectReplayStep("client", "sess-1")
+	if len(step.events) != 1 || step.events[0].EventCursor != "4:2" {
+		t.Fatalf("replayed events = %#v; want coalesced cursor 4:2", step.events)
+	}
+	tool, ok := step.events[0].Data.(agenttypes.ToolCall)
+	if !ok || len(tool.Content) != 1 || tool.Content[0].Text != "hello world" {
+		t.Fatalf("coalesced tool = %#v; want complete output", step.events[0].Data)
+	}
+}
+
+func TestSessionMessageContextHasNoDeadlineWithoutAppContext(t *testing.T) {
+	handler := &WSHandler{}
+
+	ctx, cancel := handler.sessionMessageContext()
+	defer cancel()
+
+	if _, ok := ctx.Deadline(); ok {
+		t.Fatal("session message context unexpectedly has a deadline")
+	}
+}
+
+func TestSessionMessageContextUsesAgentPoolLifecycle(t *testing.T) {
+	pool := agent.NewPool(agent.Config{})
+	defer pool.CloseAll()
+
+	handler := &WSHandler{AppContext: &AppContext{Agents: pool}}
+	ctx, cancel := handler.sessionMessageContext()
+	defer cancel()
+
+	if _, ok := ctx.Deadline(); ok {
+		t.Fatal("session message context unexpectedly has a deadline")
+	}
+	pool.CloseAll()
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("expected session message context to be canceled when agent pool closes")
+	}
+}
+
+func TestSessionRuntimeRootPathUsesRelatedWorktree(t *testing.T) {
+	current := &session.Session{
+		Source: "worktree",
+		RelatedWorktree: &session.RelatedWorktree{
+			Path: "  /tmp/project-worktree  ",
+		},
+	}
+	if got := sessionRuntimeRootPath(current); got != "/tmp/project-worktree" {
+		t.Fatalf("sessionRuntimeRootPath() = %q, want %q", got, "/tmp/project-worktree")
+	}
+	if got := sessionRuntimeRootPath(&session.Session{}); got != "" {
+		t.Fatalf("sessionRuntimeRootPath() without worktree = %q, want empty", got)
+	}
+	relatedOnly := &session.Session{
+		RelatedWorktree: &session.RelatedWorktree{Path: "/tmp/observed-worktree"},
+	}
+	if got := sessionRuntimeRootPath(relatedOnly); got != "" {
+		t.Fatalf("sessionRuntimeRootPath() for incidental relation = %q, want empty", got)
+	}
+}
+
+func TestTurnUpdateTrackerWaitIdleWaitsForSettleWindow(t *testing.T) {
+	tracker := newTurnUpdateTracker()
+	tracker.Begin()
+	done := make(chan bool, 1)
+	go func() {
+		done <- tracker.WaitIdle(context.Background(), 30*time.Millisecond, 500*time.Millisecond)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("WaitIdle returned while update was in-flight")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	tracker.End()
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("WaitIdle returned false after update finished")
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("WaitIdle did not return after settle window")
+	}
+}
+
+func TestTurnUpdateTrackerWaitIdleTimesOutWhenUpdateNeverEnds(t *testing.T) {
+	tracker := newTurnUpdateTracker()
+	tracker.Begin()
+
+	if tracker.WaitIdle(context.Background(), 10*time.Millisecond, 30*time.Millisecond) {
+		t.Fatal("expected WaitIdle to time out while update remains in-flight")
+	}
+}
+
+func TestStreamHubFrozenQueueBlocksAutomaticPopUntilUnfrozen(t *testing.T) {
+	hub := NewStreamHub(nil)
+	rootID := "root"
+	sessionKey := "session"
+
+	hub.EnqueueSessionMessage(rootID, sessionKey, "Session", QueuedUserMessage{
+		ID: "first",
+		PendingUserMessage: PendingUserMessage{
+			Content:   "first message",
+			Timestamp: time.Now().UTC(),
+		},
+	})
+	hub.EnqueueSessionMessage(rootID, sessionKey, "Session", QueuedUserMessage{
+		ID: "second",
+		PendingUserMessage: PendingUserMessage{
+			Content:   "second message",
+			Timestamp: time.Now().UTC(),
+		},
+	})
+
+	frozenQueue, frozen := hub.FreezeQueuedSessionMessages(sessionKey)
+	if !frozen {
+		t.Fatal("expected queue freeze to succeed")
+	}
+	if len(frozenQueue) != 2 {
+		t.Fatalf("expected frozen queue snapshot to contain 2 items, got %d", len(frozenQueue))
+	}
+	if _, queue, ok := hub.PopQueuedSessionMessage(sessionKey, ""); ok {
+		t.Fatal("expected frozen queue to block automatic pop")
+	} else if len(queue) != 2 {
+		t.Fatalf("expected frozen queue to remain intact, got %d items", len(queue))
+	}
+
+	queue, ok := hub.PromoteQueuedSessionMessage(sessionKey, "second")
+	if !ok {
+		t.Fatal("expected promote to succeed")
+	}
+	if len(queue) != 2 || queue[0].ID != "second" {
+		t.Fatalf("expected promoted item at queue head, got %#v", queue)
+	}
+
+	item, queue, ok := hub.PopQueuedSessionMessage(sessionKey, "")
+	if !ok {
+		t.Fatal("expected promoted queue to be unfrozen")
+	}
+	if item.ID != "second" {
+		t.Fatalf("expected promoted item to pop first, got %q", item.ID)
+	}
+	if len(queue) != 1 || queue[0].ID != "first" {
+		t.Fatalf("expected remaining queue to contain first item, got %#v", queue)
+	}
+}
+
+func TestStreamHubUnfreezeQueueAllowsAutomaticPop(t *testing.T) {
+	hub := NewStreamHub(nil)
+	sessionKey := "session"
+	hub.EnqueueSessionMessage("root", sessionKey, "Session", QueuedUserMessage{
+		ID: "first",
+		PendingUserMessage: PendingUserMessage{
+			Content:   "first message",
+			Timestamp: time.Now().UTC(),
+		},
+	})
+	_, frozen := hub.FreezeQueuedSessionMessages(sessionKey)
+	if !frozen {
+		t.Fatal("expected queue freeze to succeed")
+	}
+
+	unfrozenQueue, changed := hub.UnfreezeQueuedSessionMessages(sessionKey)
+	if !changed {
+		t.Fatal("expected queue unfreeze to report changed")
+	}
+	if len(unfrozenQueue) != 1 {
+		t.Fatalf("expected unfreeze queue snapshot to contain 1 item, got %d", len(unfrozenQueue))
+	}
+	item, queue, ok := hub.PopQueuedSessionMessage(sessionKey, "")
+	if !ok {
+		t.Fatal("expected automatic pop after unfreeze")
+	}
+	if item.ID != "first" {
+		t.Fatalf("expected first item, got %q", item.ID)
+	}
+	if len(queue) != 0 {
+		t.Fatalf("expected empty queue, got %#v", queue)
+	}
+}
+
+func TestStreamHubSetPendingUserAtUsesProvidedTimestamp(t *testing.T) {
+	hub := NewStreamHub(nil)
+	want := time.Date(2026, 7, 29, 10, 0, 0, int(456*time.Millisecond), time.UTC)
+
+	pending := hub.SetPendingUserAt("root", "session", "Session", "codex", "gpt-test", "", "", "", false, "hello", want)
+
+	if pending == nil {
+		t.Fatal("SetPendingUserAt returned nil")
+	}
+	if !pending.Timestamp.Equal(want) {
+		t.Fatalf("pending timestamp = %s, want %s", pending.Timestamp.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
+	exchange := hub.GetPendingUserExchange("session")
+	if exchange == nil {
+		t.Fatal("pending exchange is nil")
+	}
+	if !exchange.Timestamp.Equal(want) {
+		t.Fatalf("exchange timestamp = %s, want %s", exchange.Timestamp.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
+}
+
+func TestReserveClientRequestKeepsOriginalTimestamp(t *testing.T) {
+	handler := &WSHandler{}
+
+	firstTimestamp, firstReserved := handler.reserveClientRequest("request-1")
+	time.Sleep(time.Millisecond)
+	secondTimestamp, secondReserved := handler.reserveClientRequest("request-1")
+
+	if !firstReserved {
+		t.Fatal("first request was not reserved")
+	}
+	if secondReserved {
+		t.Fatal("duplicate request was reserved again")
+	}
+	if !secondTimestamp.Equal(firstTimestamp) {
+		t.Fatalf("duplicate timestamp = %s, want %s", secondTimestamp.Format(time.RFC3339Nano), firstTimestamp.Format(time.RFC3339Nano))
+	}
+}
+
+func TestRequireWSProofAcceptsValidProof(t *testing.T) {
+	clientID := "web-test"
+	key := []byte("0123456789abcdef0123456789abcdef")
+	manager := e2ee.NewManager(e2ee.Config{
+		Enabled:       true,
+		NodeID:        "node",
+		PairingSecret: "secret",
+	})
+	if _, err := manager.OpenSessionForClient(clientID, e2ee.DerivedKey{Transport: key}); err != nil {
+		t.Fatalf("OpenSessionForClient: %v", err)
+	}
+	handler := &WSHandler{AppContext: &AppContext{E2EE: manager}}
+	ts := time.Now().UTC().Format(time.RFC3339)
+	proofPath := "/ws?client_id=" + url.QueryEscape(clientID)
+	proof := e2ee.BuildRequestProof(key, http.MethodGet, proofPath, ts, clientID)
+	req := httptest.NewRequest(http.MethodGet, proofPath+"&"+wsTSQuery+"="+url.QueryEscape(ts)+"&"+wsProofQuery+"="+url.QueryEscape(proof), nil)
+
+	if err := handler.requireWSProof(req, clientID); err != nil {
+		t.Fatalf("requireWSProof() error = %v", err)
+	}
+}
+
+func TestRequireWSProofRejectsMissingProofWhenE2EEEnabled(t *testing.T) {
+	clientID := "web-test"
+	manager := e2ee.NewManager(e2ee.Config{
+		Enabled:       true,
+		NodeID:        "node",
+		PairingSecret: "secret",
+	})
+	handler := &WSHandler{AppContext: &AppContext{E2EE: manager}}
+	req := httptest.NewRequest(http.MethodGet, "/ws?client_id="+url.QueryEscape(clientID), nil)
+
+	if err := handler.requireWSProof(req, clientID); err == nil {
+		t.Fatal("expected missing proof to be rejected")
+	}
+}
+
+func TestWSProofPathExcludesProofQueryParams(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/ws?client_id=web-test&e2ee_ts=now&e2ee_proof=proof", nil)
+
+	if got, want := wsProofPath(req), "/ws?client_id=web-test"; got != want {
+		t.Fatalf("wsProofPath() = %q, want %q", got, want)
+	}
+}

@@ -33,11 +33,6 @@ import {
   type BootstrapState,
   type RelayStatusPayload,
 } from "./services/bootstrap";
-import {
-  fetchTokenStationInfo,
-  startTokenStationBinding,
-  type TokenStationInfo,
-} from "./services/tokenStation";
 import { syncAgentAPIProviders } from "./services/agentConfig";
 import { syncNativeReplyPollerE2EE } from "./services/replyPoller";
 import {
@@ -1300,85 +1295,6 @@ function loadStringBooleanRecord(key: string): Record<string, Record<string, boo
   }
 }
 
-const NEW_API_QUOTA_PER_UNIT = 500000;
-
-function formatTokenStationBalance(info: TokenStationInfo | null): string {
-  const data = info?.data;
-  if (!info?.success || !data) {
-    return "--";
-  }
-  const text = data.balance_text || data.quota_display_text || "";
-  const formattedText = formatBalanceText(text);
-  if (formattedText) {
-    return formattedText;
-  }
-  const raw = typeof data.balance === "number" ? data.balance : data.quota;
-  if (typeof raw === "number" && Number.isFinite(raw)) {
-    return (raw / NEW_API_QUOTA_PER_UNIT).toFixed(2);
-  }
-  return text || "--";
-}
-
-function parseTokenStationBalance(info: TokenStationInfo | null): number {
-  const data = info?.data;
-  if (!info?.success || !data) {
-    return 0;
-  }
-  const text = data.balance_text || data.quota_display_text || "";
-  const parsed = parseFirstNumber(text);
-  if (parsed !== null) {
-    return parsed;
-  }
-  const raw = typeof data.balance === "number" ? data.balance : data.quota;
-  return typeof raw === "number" && Number.isFinite(raw)
-    ? raw / NEW_API_QUOTA_PER_UNIT
-    : 0;
-}
-
-function formatBalanceText(text: string): string {
-  const value = String(text || "").trim();
-  if (!value) {
-    return "";
-  }
-  const match = value.match(/(-?\d+(?:\.\d+)?)/);
-  if (!match || match.index === undefined) {
-    return "";
-  }
-  const parsed = Number(match[1]);
-  if (!Number.isFinite(parsed)) {
-    return "";
-  }
-  return `${value.slice(0, match.index)}${parsed.toFixed(2)}${value.slice(match.index + match[1].length)}`;
-}
-
-function parseFirstNumber(text: string): number | null {
-  const match = String(text || "").match(/-?\d+(?:\.\d+)?/);
-  if (!match) {
-    return null;
-  }
-  const parsed = Number(match[0]);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function tokenStationWalletURL(baseURL: string): string {
-  const fallback = "http://localhost:3000";
-  const trimmed = String(baseURL || "").trim().replace(/\/+$/, "");
-  const target = `${trimmed || fallback}/wallet`;
-  try {
-    return new URL(target).toString();
-  } catch {
-    return `${fallback}/wallet`;
-  }
-}
-
-function normalizeTokenStationAPIKey(value: string): string {
-  const apiKey = String(value || "").trim();
-  if (!apiKey) {
-    return "";
-  }
-  return apiKey.toLowerCase().startsWith("sk-") ? apiKey : `sk-${apiKey}`;
-}
-
 function hasExplicitFileContext(message: string): boolean {
   return FILE_TOKEN_PATTERN.test(message);
 }
@@ -2424,15 +2340,13 @@ export function App({ onGoHome }: AppProps) {
   const [relayBaseInput, setRelayBaseInput] = useState("");
   const [relayConfigBusy, setRelayConfigBusy] = useState(false);
   const [relayConfigError, setRelayConfigError] = useState("");
-  const [tokenStationInfo, setTokenStationInfo] =
-    useState<TokenStationInfo | null>(null);
-  const [tokenStationLoading, setTokenStationLoading] = useState(false);
-  const [tokenStationBusy, setTokenStationBusy] = useState(false);
-  const [tokenStationApplyBusy, setTokenStationApplyBusy] = useState(false);
-  const [tokenStationErrorOpen, setTokenStationErrorOpen] = useState(false);
+  const [relayUnbindBusy, setRelayUnbindBusy] = useState(false);
+  const [relayUnbindError, setRelayUnbindError] = useState("");
+  const [relayPasswordInput, setRelayPasswordInput] = useState("");
+  const [relayPasswordBusy, setRelayPasswordBusy] = useState(false);
+  const [relayPasswordError, setRelayPasswordError] = useState("");
   const [agentConfigSwitchRequest, setAgentConfigSwitchRequest] =
     useState<AgentConfigSwitchRequest | null>(null);
-  const tokenStationRefreshRef = useRef<(() => void) | null>(null);
   const [bootstrapState, setBootstrapState] = useState<BootstrapState>(() =>
     bootstrapService.snapshot(),
   );
@@ -9417,7 +9331,6 @@ export function App({ onGoHome }: AppProps) {
             event.data?.contextWindow,
             event.data?.tokenUsage,
           );
-          tokenStationRefreshRef.current?.();
           setCodexRateLimitsRefreshToken((value) => value + 1);
           break;
         case "error":
@@ -13808,128 +13721,38 @@ export function App({ onGoHome }: AppProps) {
     }
   }, [relayBaseInput, t]);
 
-  const refreshTokenStationInfo = useCallback(async () => {
-    setTokenStationLoading(true);
-    setTokenStationErrorOpen(false);
+  const handleRelayPasswordSave = useCallback(async () => {
+    setRelayPasswordBusy(true);
+    setRelayPasswordError("");
     try {
-      const info = await fetchTokenStationInfo();
-      setTokenStationInfo(info);
+      await bootstrapService.setRelayAccessPassword(relayPasswordInput);
+      setRelayPasswordInput("");
     } catch (error) {
-      setTokenStationInfo({
-        success: false,
-        message: error instanceof Error ? error.message : "token_station_failed",
-      });
+      setRelayPasswordError(
+        error instanceof Error ? error.message : t("relay.passwordFailed"),
+      );
     } finally {
-      setTokenStationLoading(false);
+      setRelayPasswordBusy(false);
     }
+  }, [relayPasswordInput, t]);
+
+  const reloadPage = useCallback(() => {
+    window.location.reload();
   }, []);
 
-  useEffect(() => {
-    tokenStationRefreshRef.current = () => {
-      void refreshTokenStationInfo();
-    };
-    return () => {
-      tokenStationRefreshRef.current = null;
-    };
-  }, [refreshTokenStationInfo]);
-
-  useEffect(() => {
-    if (!bootstrapService.canUseProtectedAPI()) {
-      return;
-    }
-    void refreshTokenStationInfo();
-  }, [refreshTokenStationInfo, bootstrapState.phase]);
-
-  useEffect(() => {
-    if (!bootstrapService.canUseProtectedAPI() || !selectedSession?.updated_at) {
-      return;
-    }
-    void refreshTokenStationInfo();
-  }, [refreshTokenStationInfo, selectedSession?.updated_at]);
-
-  const handleTokenStationAction = useCallback(async () => {
-    setTokenStationErrorOpen(false);
-    const topupURL = String(tokenStationInfo?.data?.topup_url || "http://localhost:3000");
-    const walletURL = tokenStationWalletURL(topupURL);
-    if (relayStatus?.relay_bound || relayStatus?.token_station_bound) {
-      window.open(walletURL, "_blank", "noopener,noreferrer");
-      return;
-    }
-    const pendingPopup = openPendingPopup();
-    setTokenStationBusy(true);
+  const handleRelayUnbind = useCallback(async () => {
+    setRelayUnbindBusy(true);
+    setRelayUnbindError("");
     try {
-      const status = await startTokenStationBinding();
-      if (status.bound) {
-        window.open(tokenStationWalletURL(String(status.topup_url || topupURL)), "_blank", "noopener,noreferrer");
-        pendingPopup?.close();
-        return;
-      }
-      const pendingCode = String(status.pending_code || "");
-      const relayBaseURL = String(status.relay_base_url || relayStatus?.relay_base_url || "");
-      if (!pendingCode || !relayBaseURL) {
-        pendingPopup?.close();
-        return;
-      }
-      const target = new URL("/bind", relayBaseURL);
-      target.searchParams.set("code", pendingCode);
-      target.searchParams.set("purpose", "token_station");
-      navigatePopup(pendingPopup, target.toString());
-    } finally {
-      setTokenStationBusy(false);
-    }
-  }, [relayStatus, tokenStationInfo]);
-
-  const handleTokenStationApply = useCallback(async () => {
-    setTokenStationErrorOpen(false);
-    setTokenStationApplyBusy(true);
-    try {
-      const info = await fetchTokenStationInfo("apply");
-      setTokenStationInfo(info);
-      if (!info.success) {
-        setTokenStationInfo({
-          ...info,
-          message: info.message || t("tokenStation.loadFailed"),
-        });
-        setTokenStationErrorOpen(true);
-        return;
-      }
-      const topupURL = String(info.data?.topup_url || tokenStationInfo?.data?.topup_url || "").trim();
-      const byName = new Map<string, { name: string; baseUrl: string; apiKey: string }>();
-      for (const item of info.data?.api_keys || []) {
-        const name = String(item?.name || "").trim();
-        const apiKey = normalizeTokenStationAPIKey(String(item?.api_key || ""));
-        if (!name || !apiKey || !topupURL) {
-          continue;
-        }
-        if (!byName.has(name)) {
-          byName.set(name, { name, baseUrl: topupURL, apiKey });
-        }
-      }
-      const providers = Array.from(byName.values());
-      if (providers.length === 0) {
-        setTokenStationInfo({
-          ...info,
-          success: false,
-          message: t("tokenStation.noAPIKey"),
-        });
-        setTokenStationErrorOpen(true);
-        return;
-      }
-      const result = await syncAgentAPIProviders(providers);
-      setAgentConfigSwitchRequest({
-        nonce: Date.now(),
-        providerIDs: (result.providers || []).map((provider) => provider.id),
-      });
+      await bootstrapService.unbindRelayNode();
+      reloadPage();
     } catch (error) {
-      setTokenStationInfo({
-        success: false,
-        message: error instanceof Error ? error.message : t("tokenStation.applyFailed"),
-      });
-      setTokenStationErrorOpen(true);
-    } finally {
-      setTokenStationApplyBusy(false);
+      setRelayUnbindError(
+        error instanceof Error ? error.message : t("relay.unbindFailed"),
+      );
+      setRelayUnbindBusy(false);
     }
-  }, [tokenStationInfo, t]);
+  }, [reloadPage, t]);
 
   const relayActionLabel = useMemo(() => {
     if (isRelayNodePage()) {
@@ -14212,166 +14035,6 @@ export function App({ onGoHome }: AppProps) {
         }
       />
     );
-  const tokenStationBalanceText = tokenStationLoading
-    ? t("tokenStation.reading")
-    : formatTokenStationBalance(tokenStationInfo);
-  const canApplyTokenStationConfig =
-    tokenStationInfo?.success === true && parseTokenStationBalance(tokenStationInfo) > 0;
-  const tokenStationCard = (
-      <section
-        aria-label={t("tokenStation.title")}
-        style={{
-          position: "relative",
-          width: "100%",
-          height: 36,
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-          border: "1px solid var(--panel-border)",
-          background: "var(--panel-bg)",
-          backdropFilter: "blur(14px)",
-          boxShadow: "var(--panel-shadow)",
-          borderRadius: 8,
-          boxSizing: "border-box",
-          padding: "0 5px 0 8px",
-          color: "var(--text-primary)",
-        }}
-      >
-        {tokenStationInfo?.success === false && tokenStationErrorOpen ? (
-          <div
-            role="status"
-            style={{
-              position: "absolute",
-              left: 0,
-              bottom: 42,
-              width: "100%",
-              border:
-                "1px solid color-mix(in srgb, var(--curvature-launcher-error-text) 24%, transparent)",
-              background: "var(--curvature-launcher-error-bg)",
-              color: "var(--curvature-launcher-error-text)",
-              borderRadius: 8,
-              boxShadow: "var(--panel-shadow)",
-              padding: "7px 9px",
-              fontSize: 11,
-              lineHeight: "15px",
-              wordBreak: "break-word",
-            }}
-          >
-            {tokenStationInfo.message || t("tokenStation.unbound")}
-          </div>
-        ) : null}
-        <div
-          style={{
-            width: "100%",
-            height: 28,
-            display: "flex",
-            alignItems: "center",
-            gap: 5,
-            minWidth: 0,
-          }}
-        >
-          <svg
-            aria-hidden="true"
-            width="1em"
-            height="1em"
-            viewBox="0 0 24 24"
-            style={{
-              flex: "0 0 auto",
-              width: 21,
-              height: 21,
-              color: "#f97316",
-            }}
-          >
-            <path d="M0 0h24v24H0z" fill="none" />
-            <path
-              fill="currentColor"
-              d="M3 21a1 1 0 0 1 0-2V6a3 3 0 0 1 3-3h6a3 3 0 0 1 3 3v4a3 3 0 0 1 3 3v3a.5.5 0 1 0 1 0v-6a2 2 0 0 1-2-2v-.585l-.707-.708a1 1 0 0 1-.083-1.32l.083-.094a1 1 0 0 1 1.414 0l3.003 3.002l.095.112l.028.04l.044.073l.052.11l.031.09l.02.076l.012.078L21 9v7a2.5 2.5 0 1 1-5 0v-3a1 1 0 0 0-1-1v7a1 1 0 0 1 0 2zm9-16H6a1 1 0 0 0-1 1v4h8V6a1 1 0 0 0-1-1"
-            />
-          </svg>
-          <span
-            title={
-              tokenStationInfo?.success
-                ? tokenStationBalanceText
-                : tokenStationInfo?.message || t("tokenStation.unbound")
-            }
-            style={{
-              minWidth: "max-content",
-              flex: "1 0 auto",
-              overflow: "visible",
-              whiteSpace: "nowrap",
-              fontSize: tokenStationBalanceText.length > 9 ? 11 : 12,
-              fontWeight: 700,
-              lineHeight: "18px",
-              fontVariantNumeric: "tabular-nums",
-            }}
-          >
-            {tokenStationBalanceText}
-          </span>
-          {canApplyTokenStationConfig ? (
-            <button
-              type="button"
-              onClick={() => void handleTokenStationApply()}
-              disabled={tokenStationApplyBusy}
-              style={{
-                flex: "0 0 auto",
-                height: 23,
-                border: "1px solid var(--accent-color)",
-                borderRadius: 6,
-                background: "transparent",
-                color: "var(--accent-color)",
-                fontSize: 11,
-                fontWeight: 650,
-                cursor: tokenStationApplyBusy ? "default" : "pointer",
-                opacity: tokenStationApplyBusy ? 0.65 : 1,
-                padding: "0 4px",
-                whiteSpace: "nowrap",
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 4,
-              }}
-            >
-              {tokenStationApplyBusy ? (
-                <svg
-                  aria-hidden="true"
-                  width="12"
-                  height="12"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="3"
-                  strokeLinecap="round"
-                  style={{ animation: "curvature-update-spin 0.9s linear infinite" }}
-                >
-                  <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-                </svg>
-              ) : null}
-              <span style={{ fontSize: isTablet ? 10 : 11 }}>{t("tokenStation.apply")}</span>
-            </button>
-          ) : null}
-          <button
-            type="button"
-            onClick={() => void handleTokenStationAction()}
-            disabled={tokenStationBusy}
-            style={{
-              flex: "0 0 auto",
-              height: 23,
-              border: "none",
-              borderRadius: 6,
-              background: "var(--accent-color)",
-              color: "#fff",
-              fontSize: 11,
-              fontWeight: 650,
-              cursor: tokenStationBusy ? "default" : "pointer",
-              opacity: tokenStationBusy ? 0.65 : 1,
-              padding: "0 5px",
-              whiteSpace: "nowrap",
-            }}
-          >
-            {tokenStationBusy ? t("tokenStation.processing") : t("tokenStation.topUp")}
-          </button>
-        </div>
-      </section>
-  );
 
   return (
     <>
@@ -14459,7 +14122,6 @@ export function App({ onGoHome }: AppProps) {
             onUpdateAction={() => {
               void handleStartUpdate();
             }}
-            footerTopContent={tokenStationCard}
             showEnterKeySendOption={isMobile}
             enterKeySends={mobileEnterKeySends}
             onEnterKeySendsChange={setMobileEnterKeySends}
@@ -14780,6 +14442,92 @@ export function App({ onGoHome }: AppProps) {
                     : t("relay.statusUnbound")}
               </div>
             </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+              <label
+                htmlFor="relay-access-password-input"
+                style={{ fontSize: "13px", fontWeight: 600, color: "#334155" }}
+              >
+                {t("relay.passwordLabel")}
+              </label>
+              <input
+                id="relay-access-password-input"
+                type="password"
+                value={relayPasswordInput}
+                onChange={(event) => {
+                  setRelayPasswordInput(event.target.value);
+                  if (relayPasswordError) {
+                    setRelayPasswordError("");
+                  }
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !relayPasswordBusy) {
+                    void handleRelayPasswordSave();
+                  }
+                }}
+                placeholder={t("relay.passwordPlaceholder")}
+                disabled={relayPasswordBusy}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: "10px",
+                  border: "1px solid var(--border-color)",
+                  fontSize: "14px",
+                  color: "#0f172a",
+                  outline: "none",
+                }}
+              />
+              <div style={{ fontSize: "12px", color: "#64748b", lineHeight: 1.5 }}>
+                {t("relay.passwordHint")}
+              </div>
+              {relayPasswordError ? (
+                <div style={{ fontSize: "12px", color: "#dc2626" }}>
+                  {relayPasswordError}
+                </div>
+              ) : null}
+            </div>
+
+            {relayStatus?.relay_bound ? (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "12px",
+                  paddingTop: "8px",
+                }}
+              >
+                <div style={{ fontSize: "12px", color: "#64748b", lineHeight: 1.5 }}>
+                  {t("relay.unbindHint")}
+                </div>
+                <button
+                  type="button"
+                  disabled={relayUnbindBusy}
+                  onClick={() => {
+                    if (window.confirm(t("relay.unbindConfirm"))) {
+                      void handleRelayUnbind();
+                    }
+                  }}
+                  style={{
+                    padding: "8px 14px",
+                    borderRadius: "10px",
+                    border: "1px solid rgba(220, 38, 38, 0.35)",
+                    background: "transparent",
+                    color: "#dc2626",
+                    fontSize: "13px",
+                    fontWeight: 600,
+                    whiteSpace: "nowrap",
+                    cursor: relayUnbindBusy ? "not-allowed" : "pointer",
+                  }}
+                >
+                  {relayUnbindBusy ? t("relay.unbinding") : t("relay.unbind")}
+                </button>
+              </div>
+            ) : null}
+            {relayUnbindError ? (
+              <div style={{ fontSize: "12px", color: "#dc2626" }}>
+                {relayUnbindError}
+              </div>
+            ) : null}
 
             {relayConfigError ? (
               <div style={{ fontSize: "13px", color: "#dc2626" }}>{relayConfigError}</div>

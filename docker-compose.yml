@@ -1,0 +1,21 @@
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: curvature-relay:latest
+    container_name: curvature-relay
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - relay-data:/data
+    command:
+      - "-addr=:8080"
+      # Public reachable base URL of this relay (must include scheme).
+      # Set it via a .env file or shell env, e.g. BASE_URL=https://relay.example.com
+      - "-base=${BASE_URL}"
+      - "-data=/data"
+
+volumes:
+  relay-data:

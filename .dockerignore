@@ -1,0 +1,14 @@
+.git
+.gitignore
+.curvature
+node_modules
+web/node_modules
+web/dist
+dist
+design
+*.exe
+*.log
+relay-test-data
+client-test*.log
+client-test*-*
+cmd.exe
