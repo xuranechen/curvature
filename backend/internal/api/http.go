@@ -361,6 +361,7 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Post("/api/relay/bind/start", h.protectedEndpoint(h.handleRelayBindStart))
 	r.Post("/api/relay/config", h.protectedEndpoint(h.handleRelayConfigSet))
 	r.Put("/api/relay/access-password", h.protectedEndpoint(h.handleRelayAccessPasswordSet))
+	r.Put("/api/relay/node-name", h.protectedEndpoint(h.handleRelayNodeNameSet))
 	r.Delete("/api/relay/bind", h.protectedEndpoint(h.handleRelayUnbind))
 	r.Get("/api/relay/services", h.protectedEndpoint(h.handleRelayServicesList))
 	r.Post("/api/relay/services", h.protectedEndpoint(h.handleRelayServiceSave))
@@ -2540,6 +2541,26 @@ func (h *HTTPHandler) handleRelayAccessPasswordSet(w http.ResponseWriter, r *htt
 		return
 	}
 	if err := manager.SetAccessPassword(r.Context(), strings.TrimSpace(req.AccessPassword)); err != nil {
+		respondError(w, http.StatusInternalServerError, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, h.relayStatusWithE2EE(manager.Status()))
+}
+
+func (h *HTTPHandler) handleRelayNodeNameSet(w http.ResponseWriter, r *http.Request) {
+	manager := h.AppContext.GetRelayManager()
+	if manager == nil {
+		respondError(w, http.StatusServiceUnavailable, errServiceUnavailable("relay manager not configured"))
+		return
+	}
+	var req struct {
+		NodeName string `json:"node_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := manager.RenameNode(r.Context(), strings.TrimSpace(req.NodeName)); err != nil {
 		respondError(w, http.StatusInternalServerError, err)
 		return
 	}

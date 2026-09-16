@@ -97,6 +97,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		}
 		s.handleAccessPassword(w, r)
+	case path == "/api/device/node-name":
+		if r.Method != http.MethodPut {
+			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		}
+		s.handleNodeName(w, r)
 	case path == "/ws":
 		s.hub.handleDeviceWS(s.store, w, r)
 	case path == "/bind":
@@ -215,6 +220,48 @@ func (s *Server) handleAccessPassword(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleNodeName renames the calling device's node. It authenticates via the
+// same Bearer device token used for the device WebSocket. The name is echoed to
+// the node list, the bind/auth pages and the device WebSocket handshake header.
+func (s *Server) handleNodeName(w http.ResponseWriter, r *http.Request) {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	token := strings.TrimPrefix(auth, "Bearer ")
+	if token == "" || token == auth {
+		writeJSONError(w, http.StatusUnauthorized, "device_token_required")
+		return
+	}
+	dev := s.store.getDeviceByToken(token)
+	if dev == nil {
+		writeJSONError(w, http.StatusUnauthorized, "device_token_invalid")
+		return
+	}
+	var req struct {
+		NodeName string `json:"node_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_json")
+		return
+	}
+	name := strings.TrimSpace(req.NodeName)
+	if name == "" {
+		writeJSONError(w, http.StatusBadRequest, "node_name_required")
+		return
+	}
+	if runes := []rune(name); len(runes) > 64 {
+		name = string(runes[:64])
+	}
+	dev.NodeName = name
+	if err := s.store.saveDevice(dev); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "save_failed")
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"node_id":   dev.NodeID,
+		"node_name": dev.NodeName,
+		"node_url":  s.binds.nodeURL(dev.NodeID),
+	})
+}
+
 func (s *Server) handleBindStatus(w http.ResponseWriter, r *http.Request) {
 	result, err := s.binds.status(r.URL.Query().Get("code"))
 	if err != nil {
@@ -223,8 +270,6 @@ func (s *Server) handleBindStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	respondJSON(w, http.StatusOK, result)
 }
-
-func (s *Server) handleBindConfirm(w http.ResponseWriter, r *http.Request) {
 	result, err := s.binds.confirm(r.URL.Query().Get("code"))
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
