@@ -117,6 +117,14 @@ class BootstrapService {
     return status;
   }
 
+  async renameRelayNode(nodeName: string): Promise<RelayStatusPayload | null> {
+    const status = await putRelayNodeName(nodeName);
+    if (status) {
+      this.applyRelayStatus(status);
+    }
+    return status;
+  }
+
   async unbindRelayNode(): Promise<RelayStatusPayload | null> {
     const status = await deleteRelayBind();
     if (status) {
@@ -260,6 +268,22 @@ async function putRelayAccessPassword(accessPassword: string): Promise<RelayStat
     : await fetch(target, init);
   if (!response.ok) {
     throw new Error(`relay_access_password_failed_${response.status}`);
+  }
+  return e2eeService.parseProtectedJSONResponse<RelayStatusPayload>(response);
+}
+
+async function putRelayNodeName(nodeName: string): Promise<RelayStatusPayload | null> {
+  const target = appPath("/api/relay/node-name");
+  const init: RequestInit = {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_name: String(nodeName || "").trim() }),
+  };
+  const response = e2eeService.isRequired()
+    ? await e2eeService.protectedFetch(target, init)
+    : await fetch(target, init);
+  if (!response.ok) {
+    throw new Error(`relay_node_name_failed_${response.status}`);
   }
   return e2eeService.parseProtectedJSONResponse<RelayStatusPayload>(response);
 }

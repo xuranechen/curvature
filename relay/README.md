@@ -19,6 +19,8 @@
 - `GET /n/{node_id}/...` 公网访问入口（HTTP + WebSocket 全支持）
 - `PUT/DELETE /api/device/nodes/{node_id}/services/{slug}` 本地服务暴露
 - 子域名入口 `{slug}-{node_id}-relay.你的域名` 访问暴露的本地服务
+- `PUT/DELETE /api/device/access-password` 节点访问密码（设备侧设置）
+- `PUT /api/device/node-name` 节点重命名（设备侧设置，同步到节点列表/验证页）
 - `GET /api/auth/me`、`GET /login` 前端兼容端点（前端在 relay 模式下 WS 断开会探测 `/api/auth/me`，返回 200 避免误判未登录跳转）
 - `GET /nodes` 设备列表页
 
@@ -100,8 +102,8 @@ curvature -addr 0.0.0.0:7331
 
 ## 安全说明
 
-- 设备连接 `/ws` 使用 Bearer token 鉴权（绑定时生成，随机 32 字节）
-- 节点 URL `/n/{node_id}/` 是随机的不可猜测能力地址（node_id 为 32 位十六进制）
+- 设备连接 `/ws` 使用 Bearer token 鉴权（绑定时生成，随机 32 字节）；若该节点设置了访问密码，设备 WebSocket 握手时还需携带同一密码，防设备 token 泄露后直接接管节点
+- 节点 URL `/n/{node_id}/` 是随机的不可猜测能力地址（node_id 为 32 位十六进制）；设置访问密码后，访问节点前需先输入密码
 - 暴露的本地服务通过 `{slug}-{node_id}-relay.你的域名` 访问，同样依赖随机 node_id
 - 如需更强保护，配合 Curvature 的 `-e2ee`（端到端加密 + 配对码），未配对前端无法读取节点内容
 - 建议在 Caddy 层加访问日志和限流

@@ -2345,6 +2345,9 @@ export function App({ onGoHome }: AppProps) {
   const [relayPasswordInput, setRelayPasswordInput] = useState("");
   const [relayPasswordBusy, setRelayPasswordBusy] = useState(false);
   const [relayPasswordError, setRelayPasswordError] = useState("");
+  const [relayNodeNameInput, setRelayNodeNameInput] = useState("");
+  const [relayNodeNameBusy, setRelayNodeNameBusy] = useState(false);
+  const [relayNodeNameError, setRelayNodeNameError] = useState("");
   const [agentConfigSwitchRequest, setAgentConfigSwitchRequest] =
     useState<AgentConfigSwitchRequest | null>(null);
   const [bootstrapState, setBootstrapState] = useState<BootstrapState>(() =>
@@ -13702,7 +13705,9 @@ export function App({ onGoHome }: AppProps) {
 
   const handleOpenRelaySettings = useCallback(() => {
     setRelayBaseInput(String(relayStatus?.relay_base_url || ""));
+    setRelayNodeNameInput(String(relayStatus?.node_name || ""));
     setRelayConfigError("");
+    setRelayNodeNameError("");
     setRelaySettingsOpen(true);
   }, [relayStatus]);
 
@@ -13736,6 +13741,21 @@ export function App({ onGoHome }: AppProps) {
     }
   }, [relayPasswordInput, t]);
 
+  const handleRelayNodeNameSave = useCallback(async () => {
+    setRelayNodeNameBusy(true);
+    setRelayNodeNameError("");
+    try {
+      await bootstrapService.renameRelayNode(relayNodeNameInput);
+      setRelayNodeNameError("");
+    } catch (error) {
+      setRelayNodeNameError(
+        error instanceof Error ? error.message : t("relay.nodeNameFailed"),
+      );
+    } finally {
+      setRelayNodeNameBusy(false);
+    }
+  }, [relayNodeNameInput, t]);
+
   const reloadPage = useCallback(() => {
     window.location.reload();
   }, []);
@@ -13768,6 +13788,9 @@ export function App({ onGoHome }: AppProps) {
     !currentRootId ||
     (!relayStatus?.relay_bound &&
       !relayStatus?.relay_base_url);
+  // When the page is already reached through the relay, the remote visitor must
+  // not manage the host's relay settings (base URL / password / unbind).
+  const relaySettingsVisible = !isRelayNodePage();
   const showUpdateButton = shouldShowUpdateButton(updateState);
   const updateBusy =
     updateSubmitting ||
@@ -14113,7 +14136,7 @@ export function App({ onGoHome }: AppProps) {
             relayNodeId={relayStatus?.node_id || ""}
             relayBaseURL={relayStatus?.relay_base_url || ""}
             relayNoRelayer={relayStatus?.no_relayer === true}
-            onOpenRelaySettings={handleOpenRelaySettings}
+            onOpenRelaySettings={relaySettingsVisible ? handleOpenRelaySettings : undefined}
             updateActionLabel={showUpdateButton ? updateLabel : null}
             updateActionDisabled={updateBusy}
             updateActionHelp={showUpdateButton ? updateHelp : ""}
@@ -14482,6 +14505,74 @@ export function App({ onGoHome }: AppProps) {
               {relayPasswordError ? (
                 <div style={{ fontSize: "12px", color: "#dc2626" }}>
                   {relayPasswordError}
+                </div>
+              ) : null}
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+              <label
+                htmlFor="relay-node-name-input"
+                style={{ fontSize: "13px", fontWeight: 600, color: "#334155" }}
+              >
+                {t("relay.nodeNameLabel")}
+              </label>
+              <div style={{ display: "flex", gap: "8px" }}>
+                <input
+                  id="relay-node-name-input"
+                  type="text"
+                  value={relayNodeNameInput}
+                  onChange={(event) => {
+                    setRelayNodeNameInput(event.target.value);
+                    if (relayNodeNameError) {
+                      setRelayNodeNameError("");
+                    }
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !relayNodeNameBusy) {
+                      void handleRelayNodeNameSave();
+                    }
+                  }}
+                  placeholder={t("relay.nodeNamePlaceholder")}
+                  disabled={relayNodeNameBusy}
+                  style={{
+                    flex: 1,
+                    padding: "10px 12px",
+                    borderRadius: "10px",
+                    border: "1px solid var(--border-color)",
+                    fontSize: "14px",
+                    color: "#0f172a",
+                    outline: "none",
+                  }}
+                />
+                <button
+                  type="button"
+                  disabled={relayNodeNameBusy}
+                  onClick={() => {
+                    void handleRelayNodeNameSave();
+                  }}
+                  style={{
+                    padding: "10px 16px",
+                    borderRadius: "10px",
+                    border: "1px solid var(--border-color)",
+                    background: relayNodeNameBusy
+                      ? "rgba(148, 163, 184, 0.25)"
+                      : "transparent",
+                    color: "#334155",
+                    fontSize: "13px",
+                    fontWeight: 600,
+                    whiteSpace: "nowrap",
+                    cursor: relayNodeNameBusy ? "not-allowed" : "pointer",
+                  }}
+                >
+                  {relayNodeNameBusy ? t("relay.saving") : t("relay.saveName")}
+                </button>
+              </div>
+              <div style={{ fontSize: "12px", color: "#64748b", lineHeight: 1.5 }}>
+                {t("relay.nodeNameHint")}
+              </div>
+              {relayNodeNameError ? (
+                <div style={{ fontSize: "12px", color: "#dc2626" }}>
+                  {relayNodeNameError}
                 </div>
               ) : null}
             </div>

@@ -42,6 +42,11 @@ func (h *Hub) get(nodeID string) *yamux.Session {
 	return h.sessions[nodeID]
 }
 
+// nodeAccessPasswordHeader carries the node's access password (if any) on the
+// device WebSocket handshake. Devices must know the access password they set,
+// so a stolen device token alone cannot register a relay session.
+const nodeAccessPasswordHeader = "X-Curvature-Node-Password"
+
 // handleDeviceWS accepts the device WebSocket and runs the yamux server session.
 func (h *Hub) handleDeviceWS(store *Store, w http.ResponseWriter, r *http.Request) {
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
@@ -54,6 +59,13 @@ func (h *Hub) handleDeviceWS(store *Store, w http.ResponseWriter, r *http.Reques
 	if dev == nil {
 		w.WriteHeader(401)
 		return
+	}
+	if dev.AccessPassword != "" {
+		entered := strings.TrimSpace(r.Header.Get(nodeAccessPasswordHeader))
+		if !passwordMatch(dev.AccessPassword, entered) {
+			writeJSONError(w, http.StatusForbidden, "access_password_invalid")
+			return
+		}
 	}
 
 	up := websocket.Upgrader{

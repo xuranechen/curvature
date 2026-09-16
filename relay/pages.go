@@ -44,6 +44,100 @@ func writeHTML(w http.ResponseWriter, body string) {
 	_, _ = w.Write([]byte(body))
 }
 
+// pageStyles mirrors the Curvature web app's launcher look (web/src/components/Login.tsx
+// + web/src/index.css tokens) so the self-hosted relay pages match the main page.
+func pageStyles() string {
+	return `<style>
+  :root {
+    color-scheme: light dark;
+    --bg: radial-gradient(circle at top left, rgba(91, 125, 184, 0.08), transparent 24%), radial-gradient(circle at right 20%, rgba(148, 163, 184, 0.20), transparent 26%), linear-gradient(180deg, #f8fafc 0%, #edf2f7 100%);
+    --card-bg: rgba(255, 255, 255, 0.82);
+    --card-bg-strong: rgba(255, 255, 255, 0.94);
+    --chip-bg: rgba(148, 163, 184, 0.18);
+    --border: rgba(148, 163, 184, 0.2);
+    --border-strong: rgba(100, 116, 139, 0.34);
+    --fg: #172033;
+    --muted: #5f6f86;
+    --accent: #5b7db8;
+    --accent-strong: #4a6ca4;
+    --surface-input: rgba(255, 255, 255, 0.74);
+    --shadow: 0 16px 44px rgba(15, 23, 42, 0.08);
+    --shadow-card: 0 8px 30px rgba(15, 23, 42, 0.06);
+    --danger: #dc2626;
+    --ok: #15803d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: radial-gradient(circle at top left, rgba(91, 125, 184, 0.12), transparent 24%), radial-gradient(circle at right 20%, rgba(139, 159, 188, 0.10), transparent 26%), linear-gradient(180deg, #0f172a 0%, #020617 100%);
+      --card-bg: rgba(30, 41, 59, 0.82);
+      --card-bg-strong: rgba(30, 41, 59, 0.94);
+      --chip-bg: rgba(148, 163, 184, 0.16);
+      --border: rgba(255, 255, 255, 0.08);
+      --border-strong: rgba(255, 255, 255, 0.16);
+      --fg: #F8FAFC;
+      --muted: #94A3B8;
+      --accent: #7d9fd0;
+      --accent-strong: #93b2dd;
+      --surface-input: rgba(15, 23, 42, 0.6);
+      --shadow: 0 16px 44px rgba(0, 0, 0, 0.4);
+      --shadow-card: 0 8px 30px rgba(0, 0, 0, 0.35);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, sans-serif; min-height: 100vh; background: var(--bg); color: var(--fg); -webkit-font-smoothing: antialiased; }
+  .center { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 28px 20px 48px; }
+  .card { width: 400px; max-width: 100%; background: var(--card-bg); border: 1px solid var(--border); border-radius: 22px; padding: 30px 26px; box-shadow: var(--shadow); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); text-align: center; }
+  .logo { width: 46px; height: 46px; margin: 0 auto 14px; display: flex; align-items: center; justify-content: center; background: var(--accent); border-radius: 14px; color: #fff8f2; font-weight: 700; font-size: 18px; box-shadow: 0 6px 18px color-mix(in srgb, var(--accent) 42%, transparent); }
+  h1 { font-size: 18px; margin: 0 0 6px; letter-spacing: 0.2px; }
+  p { color: var(--muted); font-size: 14px; line-height: 1.7; margin: 8px 0; }
+  .node { margin: 0 0 20px; word-break: break-all; }
+  input { width: 100%; padding: 12px 14px; border: 1px solid var(--border-strong); border-radius: 12px; font-size: 15px; background: var(--surface-input); color: var(--fg); outline: none; font: inherit; }
+  input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: 0; background: var(--accent); color: #fff8f2; font-size: 15px; padding: 12px 26px; border-radius: 12px; cursor: pointer; font-weight: 600; text-decoration: none; transition: background 0.15s ease, transform 0.12s ease; }
+  .btn:hover { background: var(--accent-strong); }
+  .btn:disabled { opacity: 0.55; cursor: default; }
+  .btn.block { width: 100%; margin-top: 12px; }
+  .ok { color: var(--ok); font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
+  .err { color: var(--danger); }
+  .link { display: inline-flex; align-items: center; gap: 8px; margin-top: 16px; color: var(--accent); text-decoration: none; font-weight: 600; }
+  .code { font-family: ui-monospace, SFMono-Regular, monospace; background: var(--chip-bg); color: var(--fg); border-radius: 12px; padding: 12px 14px; font-size: 13px; word-break: break-all; margin: 14px 0; }
+  .foot { color: var(--muted); font-size: 12px; margin-top: 36px; text-align: center; }
+  .foot code { background: var(--chip-bg); padding: 2px 8px; border-radius: 6px; font-size: 11px; }
+  .head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo.sm { width: 42px; height: 42px; margin: 0; border-radius: 12px; font-size: 16px; }
+  .subtitle { color: var(--muted); font-size: 12px; margin: 0; }
+  .count { font-size: 12px; font-weight: 600; color: var(--muted); background: var(--chip-bg); padding: 5px 12px; border-radius: 999px; white-space: nowrap; }
+  .toolbar { display: flex; align-items: center; gap: 14px; margin-top: 16px; margin-bottom: 4px; }
+  .toolbar label { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--muted); cursor: pointer; user-select: none; }
+  .toolbar input[type=checkbox] { width: auto; accent-color: var(--accent); }
+  .card.row { width: 100%; border-radius: 18px; padding: 16px 18px; margin-top: 10px; box-shadow: var(--shadow-card); display: flex; align-items: center; justify-content: space-between; gap: 14px; text-align: left; transition: transform 0.12s ease, box-shadow 0.12s ease; border: 1px solid var(--border); }
+  .card.row:hover { transform: translateY(-1px); box-shadow: var(--shadow); }
+  .card.row.offline { opacity: 0.72; }
+  .card.row.offline:hover { opacity: 1; }
+  .card-main { min-width: 0; }
+  .name-row { display: flex; align-items: center; gap: 8px; }
+  .name { font-weight: 650; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; flex-shrink: 0; }
+  .badge.on { color: var(--ok); background: color-mix(in srgb, #16a34a 14%, transparent); }
+  .badge.off { color: var(--muted); background: color-mix(in srgb, currentColor 10%, transparent); }
+  .meta { color: var(--muted); font-size: 12px; font-family: ui-monospace, SFMono-Regular, monospace; margin-top: 4px; word-break: break-all; }
+  .meta .bound { font-family: system-ui, sans-serif; opacity: 0.85; }
+  .lock { color: var(--accent); font-size: 13px; cursor: default; }
+  .actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+  .icon-btn { width: 34px; height: 34px; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 10px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 15px; transition: background 0.12s ease, color 0.12s ease; }
+  .icon-btn:hover { background: var(--chip-bg); color: var(--fg); }
+  .icon-btn.danger:hover { color: var(--danger); background: color-mix(in srgb, #dc2626 10%, transparent); }
+  .open { border: 0; background: var(--accent); color: #fff8f2; padding: 9px 18px; border-radius: 11px; cursor: pointer; font-size: 14px; text-decoration: none; font-weight: 600; white-space: nowrap; transition: background 0.15s ease; }
+  .open:hover { background: var(--accent-strong); }
+  .empty { color: var(--muted); text-align: center; margin-top: 72px; line-height: 1.8; }
+  .empty .hint { font-size: 13px; opacity: 0.8; }
+  #toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%) translateY(16px); background: var(--fg); color: var(--card-bg); font-size: 13px; padding: 9px 18px; border-radius: 10px; opacity: 0; pointer-events: none; transition: opacity 0.18s ease, transform 0.18s ease; }
+  #toast.show { opacity: 1; transform: translateX(-50%); }
+</style>`
+}
+
 func nodeAuthPageHTML(nodeName, authURL string, hasError bool) string {
 	errHTML := ""
 	if hasError {
@@ -55,33 +149,21 @@ func nodeAuthPageHTML(nodeName, authURL string, hasError bool) string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Curvature Relay - 节点访问验证</title>
-<style>
-  :root { color-scheme: light dark; }
-  * { box-sizing: border-box; }
-  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; display: flex; min-height: 100vh; align-items: center; justify-content: center; background: radial-gradient(1200px 600px at 50% -10%, color-mix(in srgb, #2563eb 12%, transparent), transparent), #f5f6f8; padding: 16px; }
-  .card { background: var(--card-bg, #fff); border-radius: 16px; padding: 36px; width: 400px; max-width: 100%; box-shadow: 0 12px 40px rgba(0,0,0,.10); text-align: center; }
-  .logo { width: 44px; height: 44px; margin: 0 auto 16px; display: flex; align-items: center; justify-content: center; background: #2563eb; border-radius: 12px; color: #fff; font-weight: 700; font-size: 18px; }
-  h1 { font-size: 18px; margin: 0 0 6px; }
-  .node { color: var(--muted, #888); font-size: 13px; margin: 0 0 20px; word-break: break-all; }
-  input { width: 100%; padding: 11px 14px; border: 1px solid var(--border, #e2e5ea); border-radius: 10px; font-size: 15px; background: var(--input-bg, #fff); color: inherit; outline: none; }
-  input:focus { border-color: #2563eb; box-shadow: 0 0 0 3px color-mix(in srgb, #2563eb 18%, transparent); }
-  .btn { width: 100%; border: 0; background: #2563eb; color: #fff; font-size: 15px; padding: 12px; border-radius: 10px; cursor: pointer; margin-top: 12px; font-weight: 600; }
-  .btn:hover { background: #1d4ed8; }
-  .err { color: #dc2626; font-size: 13px; margin: 12px 0 0; }
-  .foot { color: var(--muted, #888); font-size: 12px; margin-top: 14px; }
-</style>
+` + pageStyles() + `
 </head>
 <body>
-<div class="card">
-  <div class="logo">C</div>
-  <h1>节点访问验证</h1>
-  <p class="node">` + html.EscapeString(nodeName) + `</p>
-  <form method="post" action="` + authURL + `">
-    <input type="password" name="password" placeholder="请输入访问密码" required autofocus autocomplete="current-password">
-    <button class="btn" type="submit">进入节点</button>
-  </form>
-  ` + errHTML + `
-  <p class="foot">curvature relay</p>
+<div class="center">
+  <div class="card">
+    <div class="logo">C</div>
+    <h1>节点访问验证</h1>
+    <p class="node">` + html.EscapeString(nodeName) + `</p>
+    <form method="post" action="` + authURL + `">
+      <input type="password" name="password" placeholder="请输入访问密码" required autofocus autocomplete="current-password">
+      <button class="btn block" type="submit">进入节点</button>
+    </form>
+    ` + errHTML + `
+    <p class="foot" style="margin-top:14px">curvature relay</p>
+  </div>
 </div>
 </body>
 </html>`
@@ -94,22 +176,16 @@ func loginPageHTML(base string) string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Curvature Relay</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; display: flex; min-height: 100vh; align-items: center; justify-content: center; background: radial-gradient(1200px 600px at 50% -10%, color-mix(in srgb, #2563eb 12%, transparent), transparent), #f5f6f8; }
-  .card { background: var(--card-bg, #fff); border-radius: 16px; padding: 36px; width: 380px; max-width: 92vw; box-shadow: 0 12px 40px rgba(0,0,0,.10); text-align: center; }
-  .logo { width: 44px; height: 44px; margin: 0 auto 16px; display: flex; align-items: center; justify-content: center; background: #2563eb; border-radius: 12px; color: #fff; font-weight: 700; font-size: 18px; }
-  h1 { font-size: 19px; margin: 0 0 10px; }
-  p { color: #666; font-size: 14px; line-height: 1.7; margin: 8px 0 20px; }
-  .btn { display: inline-flex; align-items: center; gap: 8px; background: #2563eb; color: #fff; font-size: 15px; padding: 11px 28px; border-radius: 10px; cursor: pointer; text-decoration: none; border: 0; font-weight: 600; }
-</style>
+` + pageStyles() + `
 </head>
 <body>
-<div class="card">
-  <div class="logo">C</div>
-  <h1>Curvature Relay</h1>
-  <p>此实例为自建 relay，无需登录。若页面跳转到这里，请返回节点列表重新进入。</p>
-  <a class="btn" href="/nodes">返回节点列表</a>
+<div class="center">
+  <div class="card">
+    <div class="logo">C</div>
+    <h1>Curvature Relay</h1>
+    <p>此实例为自建 relay，无需登录。若页面跳转到这里，请返回节点列表重新进入。</p>
+    <a class="btn" href="/nodes">返回节点列表</a>
+  </div>
 </div>
 </body>
 </html>`
@@ -122,29 +198,18 @@ func bindPageHTML(code, root string) string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Curvature Relay - 绑定设备</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; display: flex; min-height: 100vh; align-items: center; justify-content: center; background: radial-gradient(1200px 600px at 50% -10%, color-mix(in srgb, #2563eb 12%, transparent), transparent), #f5f6f8; padding: 16px; }
-  .card { background: var(--card-bg, #fff); border-radius: 16px; padding: 36px; width: 400px; max-width: 100%; box-shadow: 0 12px 40px rgba(0,0,0,.10); text-align: center; }
-  .logo { width: 44px; height: 44px; margin: 0 auto 16px; display: flex; align-items: center; justify-content: center; background: #2563eb; border-radius: 12px; color: #fff; font-weight: 700; font-size: 18px; }
-  h1 { font-size: 19px; margin: 0 0 8px; }
-  p { color: #666; font-size: 14px; line-height: 1.7; margin: 8px 0; }
-  .code { font-family: ui-monospace, SFMono-Regular, monospace; background: var(--code-bg, #f3f4f6); color: var(--code-fg, #111); border-radius: 10px; padding: 12px 14px; font-size: 13px; word-break: break-all; margin: 14px 0; }
-  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: 0; background: #2563eb; color: #fff; font-size: 15px; padding: 11px 26px; border-radius: 10px; cursor: pointer; margin-top: 10px; font-weight: 600; }
-  .btn:disabled { opacity: .55; cursor: default; }
-  .ok { color: #16a34a; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
-  .link { display: inline-flex; align-items: center; gap: 8px; margin-top: 16px; color: #2563eb; text-decoration: none; font-weight: 600; }
-  .err { color: #dc2626; }
-</style>
+` + pageStyles() + `
 </head>
 <body>
-<div class="card" id="card">
-  <div class="logo">C</div>
-  <h1>绑定 Curvature 设备</h1>
-  <p id="status">正在查询绑定状态...</p>
-  <div class="code" id="code" style="display:none"></div>
-  <button class="btn" id="confirmBtn" style="display:none">确认绑定</button>
-  <a class="link" id="openLink" style="display:none">打开节点</a>
+<div class="center">
+  <div class="card" id="card">
+    <div class="logo">C</div>
+    <h1 style="font-size:19px">绑定 Curvature 设备</h1>
+    <p id="status">正在查询绑定状态...</p>
+    <div class="code" id="code" style="display:none"></div>
+    <button class="btn block" id="confirmBtn" style="display:none">确认绑定</button>
+    <a class="link" id="openLink" style="display:none">打开节点</a>
+  </div>
 </div>
 <script>
 const params = new URLSearchParams(location.search);
@@ -155,28 +220,38 @@ const statusEl = document.getElementById("status");
 const codeEl = document.getElementById("code");
 const confirmBtn = document.getElementById("confirmBtn");
 const openLink = document.getElementById("openLink");
+let pollTimer = null;
+
+function setConfirmBtn(visible) {
+  confirmBtn.style.display = visible ? "inline-block" : "none";
+}
 
 function renderState(state) {
   const st = state.status;
   if (st === "confirmed") {
     statusEl.textContent = "绑定成功";
     statusEl.className = "ok";
+    setConfirmBtn(false);
+    codeEl.style.display = "none";
     openLink.style.display = "inline-flex";
     let url = state.node_url;
     if (root) url += "?root=" + encodeURIComponent(root);
     openLink.href = url;
     openLink.textContent = "打开节点";
+    clearInterval(pollTimer);
   } else if (st === "pending") {
     statusEl.textContent = state.node_name ? "确认绑定设备 " + state.node_name + "？" : "确认绑定这台设备？";
     codeEl.style.display = "block";
     codeEl.textContent = bindCode;
-    confirmBtn.style.display = "inline-block";
+    setConfirmBtn(true);
   } else if (st === "expired") {
     statusEl.textContent = "绑定码已过期，请回到本地 Curvature 页面重新绑定";
     statusEl.className = "err";
+    setConfirmBtn(false);
   } else {
     statusEl.textContent = "绑定状态：" + st;
     statusEl.className = "err";
+    setConfirmBtn(false);
   }
 }
 
@@ -192,6 +267,7 @@ async function load() {
 }
 
 confirmBtn.addEventListener("click", async () => {
+  if (confirmBtn.textContent === "确认中...") return;
   confirmBtn.disabled = true;
   confirmBtn.textContent = "确认中...";
   try {
@@ -201,15 +277,19 @@ confirmBtn.addEventListener("click", async () => {
     if (state.status !== "confirmed") {
       statusEl.textContent = state.error || "绑定失败";
       statusEl.className = "err";
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = "确认绑定";
     }
   } catch (e) {
     statusEl.textContent = "确认失败";
     statusEl.className = "err";
+    confirmBtn.disabled = false;
+    confirmBtn.textContent = "确认绑定";
   }
 });
 
+pollTimer = setInterval(load, 3000);
 load();
-setInterval(load, 3000);
 </script>
 </body>
 </html>`
@@ -223,51 +303,13 @@ func nodesPageHTML(base string) string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Curvature Relay - 节点列表</title>
-<style>
-  :root { color-scheme: light dark; }
-  * { box-sizing: border-box; }
-  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; background: radial-gradient(1200px 500px at 50% -10%, color-mix(in srgb, #2563eb 10%, transparent), transparent), var(--page-bg, #f5f6f8); color: var(--fg, #111); min-height: 100vh; padding: 28px 20px 48px; }
-  .wrap { max-width: 720px; margin: 0 auto; }
-  .head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
-  .brand { display: flex; align-items: center; gap: 12px; }
-  .logo { width: 38px; height: 38px; display: flex; align-items: center; justify-content: center; background: #2563eb; border-radius: 10px; color: #fff; font-weight: 700; font-size: 16px; flex-shrink: 0; }
-  h1 { font-size: 19px; margin: 0; }
-  .subtitle { color: var(--muted, #888); font-size: 12px; margin: 0; }
-  .count { font-size: 12px; font-weight: 600; color: var(--muted, #888); background: var(--chip-bg, #eef0f3); padding: 5px 12px; border-radius: 999px; white-space: nowrap; }
-  .toolbar { display: flex; align-items: center; gap: 14px; margin-top: 16px; margin-bottom: 4px; }
-  .toolbar label { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--muted, #888); cursor: pointer; user-select: none; }
-  .toolbar input[type=checkbox] { accent-color: #2563eb; }
-  .card { background: var(--card-bg, #fff); border-radius: 14px; padding: 16px 18px; margin-top: 10px; box-shadow: 0 3px 14px rgba(0,0,0,.05); display: flex; align-items: center; justify-content: space-between; gap: 14px; transition: transform .12s ease, box-shadow .12s ease; }
-  .card:hover { transform: translateY(-1px); box-shadow: 0 6px 22px rgba(0,0,0,.09); }
-  .card.offline { opacity: .72; }
-  .card.offline:hover { opacity: 1; }
-  .card-main { min-width: 0; }
-  .name-row { display: flex; align-items: center; gap: 8px; }
-  .name { font-weight: 650; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; flex-shrink: 0; }
-  .badge.on { color: #15803d; background: color-mix(in srgb, #16a34a 14%, transparent); }
-  .badge.off { color: var(--muted, #888); background: color-mix(in srgb, currentColor 10%, transparent); }
-  .meta { color: var(--muted, #888); font-size: 12px; font-family: ui-monospace, SFMono-Regular, monospace; margin-top: 4px; word-break: break-all; }
-  .meta .bound { font-family: system-ui, sans-serif; opacity: .85; }
-  .actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
-  .icon-btn { width: 34px; height: 34px; border: 1px solid var(--border, #e2e5ea); background: transparent; color: var(--muted, #888); border-radius: 9px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 15px; transition: background .12s ease, color .12s ease; }
-  .icon-btn:hover { background: var(--chip-bg, #eef0f3); color: var(--fg, #111); }
-  .icon-btn.danger:hover { color: #dc2626; background: color-mix(in srgb, #dc2626 10%, transparent); }
-  .open { border: 0; background: #2563eb; color: #fff; padding: 9px 18px; border-radius: 9px; cursor: pointer; font-size: 14px; text-decoration: none; font-weight: 600; white-space: nowrap; }
-  .open:hover { background: #1d4ed8; }
-  .empty { color: var(--muted, #888); text-align: center; margin-top: 72px; line-height: 1.8; }
-  .empty .hint { font-size: 13px; opacity: .8; }
-  .foot { color: var(--muted, #888); font-size: 12px; margin-top: 36px; text-align: center; }
-  .foot code { background: var(--chip-bg, #eef0f3); padding: 2px 8px; border-radius: 6px; font-size: 11px; }
-  #toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%) translateY(16px); background: var(--fg, #111); color: var(--card-bg, #fff); font-size: 13px; padding: 9px 18px; border-radius: 10px; opacity: 0; pointer-events: none; transition: opacity .18s ease, transform .18s ease; }
-  #toast.show { opacity: 1; transform: translateX(-50%); }
-</style>
+` + pageStyles() + `
 </head>
 <body>
 <div class="wrap">
   <div class="head">
     <div class="brand">
-      <div class="logo">C</div>
+      <div class="logo sm">C</div>
       <div>
         <h1>Curvature 节点</h1>
         <p class="subtitle">已连接到这台 relay 的设备</p>
@@ -287,8 +329,6 @@ let allItems = [];
 
 async function load() {
   const listEl = document.getElementById("list");
-  const countEl = document.getElementById("count");
-  const toolbarEl = document.getElementById("toolbar");
   try {
     const res = await fetch("/api/devices");
     allItems = await res.json();
@@ -320,9 +360,9 @@ function render() {
     const boundText = bound && !isNaN(bound)
       ? ' · 绑定于 ' + bound.toLocaleString()
       : '';
-    const pwIcon = d.has_password ? '<span title="已设置访问密码" style="color:#2563eb;font-size:13px;cursor:default">🔒</span>' : '';
+    const pwIcon = d.has_password ? '<span class="lock" title="已设置访问密码">🔒</span>' : '';
     const offClass = d.online ? '' : ' offline';
-    return '<div class="card' + offClass + '">' +
+    return '<div class="card row' + offClass + '">' +
       '<div class="card-main">' +
         '<div class="name-row"><div class="name">' + escapeHtml(d.node_name) + '</div>' + badge + pwIcon + '</div>' +
         '<div class="meta">' + escapeHtml(d.node_id) + '<span class="bound">' + escapeHtml(boundText) + '</span></div>' +

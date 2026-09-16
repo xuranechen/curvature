@@ -467,6 +467,41 @@ func (m *Manager) SetAccessPassword(ctx context.Context, password string) error 
 	return nil
 }
 
+// RenameNode changes the display name of this device's node on the relay and
+// persists it locally so status and future bind polls use the new name.
+func (m *Manager) RenameNode(ctx context.Context, nodeName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	nodeName = strings.TrimSpace(nodeName)
+	if nodeName == "" {
+		return errors.New("node name required")
+	}
+	if runes := []rune(nodeName); len(runes) > 64 {
+		nodeName = string(runes[:64])
+	}
+	creds, err := m.service.store.Load()
+	if err != nil {
+		return err
+	}
+	if creds.Relay.DeviceToken == "" || creds.Relay.Endpoint == "" {
+		return errors.New("relay not bound")
+	}
+	base := endpointBaseURL(creds.Relay.Endpoint)
+	if base == "" {
+		return errors.New("invalid relay endpoint")
+	}
+	if err := m.service.SetNodeName(ctx, base, creds.Relay.DeviceToken, nodeName); err != nil {
+		return err
+	}
+	creds.Relay.NodeName = nodeName
+	if err := m.service.store.Save(creds); err != nil {
+		return err
+	}
+	m.nodeName = nodeName
+	return nil
+}
+
 // UnbindNode removes the node from the relay and clears local relay
 // credentials so the device no longer connects to that relay.
 func (m *Manager) UnbindNode(ctx context.Context) error {

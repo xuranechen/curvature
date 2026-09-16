@@ -30,6 +30,7 @@ const (
 
 const relayDeviceIDHeader = "X-Curvature-Device-ID"
 const relayNodeNameHeader = "X-Curvature-Relay-Node-Name"
+const relayNodePasswordHeader = "X-Curvature-Node-Password"
 
 type Service struct {
 	localAddr string
@@ -271,6 +272,46 @@ func (s *Service) SetAccessPassword(ctx context.Context, baseURL, deviceToken, p
 	return nil
 }
 
+// SetNodeName renames this device's node on the relay. The relay echoes the
+// name back on the /nodes page, bind/auth pages and the WebSocket handshake.
+func (s *Service) SetNodeName(ctx context.Context, baseURL, deviceToken, nodeName string) error {
+	reqURL, err := buildNodeNameURL(baseURL)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(map[string]any{"node_name": strings.TrimSpace(nodeName)})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, reqURL, strings.NewReader(string(payload)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(deviceToken))
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("relay set node name failed: %s %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+func buildNodeNameURL(baseURL string) (string, error) {
+	base, err := parseRelayBase(baseURL)
+	if err != nil {
+		return "", err
+	}
+	base.Path = strings.TrimSuffix(base.Path, "/") + "/api/device/node-name"
+	base.RawQuery = ""
+	base.Fragment = ""
+	return base.String(), nil
+}
+
 // UnbindNode asks the relay to forget a node. It is meant to be called from
 // the local Curvature server after the user confirms unbinding, so the relay
 // may be fading out of the picture entirely.
@@ -372,6 +413,9 @@ func buildBindPollURL(baseURL, pendingCode string, nameAndPurpose ...string) (st
 func (s *Service) runSession(ctx context.Context, creds RelayCredentials) error {
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+creds.DeviceToken)
+	if pw := strings.TrimSpace(creds.AccessPassword); pw != "" {
+		headers.Set(relayNodePasswordHeader, pw)
+	}
 	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, creds.Endpoint, headers)
 	if err != nil {
 		if resp != nil {
