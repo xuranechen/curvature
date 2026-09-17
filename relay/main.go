@@ -270,6 +270,8 @@ func (s *Server) handleBindStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	respondJSON(w, http.StatusOK, result)
 }
+
+func (s *Server) handleBindConfirm(w http.ResponseWriter, r *http.Request) {
 	result, err := s.binds.confirm(r.URL.Query().Get("code"))
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
