@@ -14578,6 +14578,72 @@ export function App({ onGoHome }: AppProps) {
             </div>
 
             {relayStatus?.relay_bound ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                <label
+                  htmlFor="relay-node-name-input"
+                  style={{ fontSize: "13px", fontWeight: 600, color: "#334155" }}
+                >
+                  {t("relay.nodeNameLabel")}
+                </label>
+                <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                  <input
+                    id="relay-node-name-input"
+                    type="text"
+                    value={relayNodeNameInput}
+                    onChange={(event) => {
+                      setRelayNodeNameInput(event.target.value);
+                      if (relayNodeNameError) {
+                        setRelayNodeNameError("");
+                      }
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && !relayNodeNameBusy) {
+                        void handleRelayNodeNameSave();
+                      }
+                    }}
+                    placeholder={t("relay.nodeNamePlaceholder")}
+                    disabled={relayNodeNameBusy}
+                    style={{
+                      flex: 1,
+                      padding: "10px 12px",
+                      borderRadius: "10px",
+                      border: "1px solid var(--border-color)",
+                      fontSize: "14px",
+                      color: "#0f172a",
+                      outline: "none",
+                    }}
+                  />
+                  <button
+                    type="button"
+                    disabled={relayNodeNameBusy}
+                    onClick={() => void handleRelayNodeNameSave()}
+                    style={{
+                      padding: "10px 14px",
+                      borderRadius: "10px",
+                      border: "none",
+                      background: relayNodeNameBusy ? "rgba(148, 163, 184, 0.4)" : "var(--accent-color)",
+                      color: "#fff",
+                      fontSize: "13px",
+                      fontWeight: 600,
+                      cursor: relayNodeNameBusy ? "not-allowed" : "pointer",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {relayNodeNameBusy ? t("relay.saving") : t("relay.save")}
+                  </button>
+                </div>
+                <div style={{ fontSize: "12px", color: "#64748b", lineHeight: 1.5 }}>
+                  {t("relay.nodeNameHint")}
+                </div>
+                {relayNodeNameError ? (
+                  <div style={{ fontSize: "12px", color: "#dc2626" }}>
+                    {relayNodeNameError}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            {relayStatus?.relay_bound ? (
               <div
                 style={{
                   display: "flex",

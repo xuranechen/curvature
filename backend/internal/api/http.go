@@ -2560,6 +2560,10 @@ func (h *HTTPHandler) handleRelayNodeNameSet(w http.ResponseWriter, r *http.Requ
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
+	if strings.Contains(req.NodeName, "\n") || strings.Contains(req.NodeName, "\r") {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid node_name"))
+		return
+	}
 	if err := manager.RenameNode(r.Context(), strings.TrimSpace(req.NodeName)); err != nil {
 		respondError(w, http.StatusInternalServerError, err)
 		return

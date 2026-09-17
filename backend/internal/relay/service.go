@@ -337,6 +337,7 @@ func (s *Service) UnbindNode(ctx context.Context, baseURL, deviceToken, nodeID s
 	return nil
 }
 
+
 func buildAccessPasswordURL(baseURL string) (string, error) {
 	base, err := parseRelayBase(baseURL)
 	if err != nil {
