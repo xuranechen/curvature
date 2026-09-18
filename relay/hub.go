@@ -53,12 +53,12 @@ func (h *Hub) handleDeviceWS(store *Store, w http.ResponseWriter, r *http.Reques
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
 	token := strings.TrimPrefix(auth, "Bearer ")
 	if token == "" || token == auth {
-		w.WriteHeader(401)
+		writeJSONError(w, http.StatusUnauthorized, "device_token_invalid")
 		return
 	}
 	dev := store.getDeviceByToken(token)
 	if dev == nil {
-		w.WriteHeader(401)
+		writeJSONError(w, http.StatusUnauthorized, "device_token_invalid")
 		return
 	}
 	if dev.AccessPassword != "" {

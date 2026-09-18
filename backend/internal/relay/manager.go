@@ -203,7 +203,30 @@ func (m *Manager) StartBinding() (Status, error) {
 		return m.statusLocked(), err
 	}
 	if creds.Relay.DeviceToken != "" && creds.Relay.Endpoint != "" {
-		return m.statusLocked(), nil
+		// The relay may have deleted this device (admin /nodes page, data
+		// reset, migration). Probe before trusting the local credentials so a
+		// deleted device falls back to a fresh bind instead of staying
+		// dead-bound.
+		probed, probeErr := m.probeBoundDevice(creds.Relay)
+		if probeErr != nil {
+			// Transient failure: keep the bound state and let the WebSocket
+			// reconnect loop surface any real invalidation.
+			return m.statusLocked(), nil
+		}
+		if probed {
+			return m.statusLocked(), nil
+		}
+		log.Printf("[relay] device no longer registered on relay; entering re-bind flow")
+		if clearErr := m.service.store.Clear(); clearErr != nil {
+			m.lastError = clearErr.Error()
+			return m.statusLocked(), clearErr
+		}
+		if m.cancel != nil {
+			m.cancel()
+			m.cancel = nil
+		}
+		m.pendingCode = ""
+		m.lastError = "device was removed from the relay, re-binding"
 	}
 	if m.ctx == nil {
 		return m.statusLocked(), errors.New("relay manager not started")
@@ -211,6 +234,24 @@ func (m *Manager) StartBinding() (Status, error) {
 	m.ensurePendingLocked()
 	m.startPollingLocked(m.ctx, m.pendingCode)
 	return m.statusLocked(), nil
+}
+
+// probeBoundDevice reports whether the relay still has a valid record for the
+// given credentials. The first return value is false when the device was
+// deleted server-side; the error is non-nil only for transient transport or
+// unexpected relay failures.
+func (m *Manager) probeBoundDevice(creds RelayCredentials) (bool, error) {
+	base := endpointBaseURL(creds.Endpoint)
+	if base == "" || creds.DeviceToken == "" || creds.NodeID == "" {
+		return false, errors.New("incomplete relay credentials")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ok, err := m.service.ProbeDevice(ctx, base, creds.DeviceToken, creds.NodeID)
+	if err != nil {
+		return ok, err
+	}
+	return ok, nil
 }
 
 func (m *Manager) statusLocked() Status {
