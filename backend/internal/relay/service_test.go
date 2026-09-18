@@ -2,6 +2,8 @@ package relay
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/http"
@@ -136,6 +138,80 @@ func TestCredentialsStoreNodeNamePersistsAcrossRelayBaseChanges(t *testing.T) {
 	if got := store.LoadNodeName(); got != "客厅电脑" {
 		t.Fatalf("LoadNodeName() after clearing relay base = %q, want 客厅电脑", got)
 	}
+}
+
+func TestCredentialsStoreAccessPasswordBeforeBinding(t *testing.T) {
+	configRoot := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configRoot)
+	t.Setenv("HOME", configRoot)
+
+	store, err := NewRelayStore()
+	if err != nil {
+		t.Fatalf("NewRelayStore() error = %v", err)
+	}
+	// A password set before binding must be persisted and survive the bind.
+	if err := store.SaveAccessPassword("pre-bind-pw"); err != nil {
+		t.Fatalf("SaveAccessPassword() error = %v", err)
+	}
+	if got := store.LoadAccessPassword(); got != "pre-bind-pw" {
+		t.Fatalf("LoadAccessPassword() = %q, want pre-bind-pw", got)
+	}
+	// Binding must not wipe the pre-bound access password.
+	if err := store.Save(Credentials{
+		Relay: RelayCredentials{
+			DeviceToken: "dev_123",
+			NodeID:      "node_123",
+			Endpoint:    "wss://relay.example.com/ws/connector",
+		},
+	}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got.Relay.AccessPassword != "pre-bind-pw" {
+		t.Fatalf("Load().AccessPassword after bind = %q, want pre-bind-pw", got.Relay.AccessPassword)
+	}
+	// Clearing the password clears both the top-level value and the bound copy.
+	if err := store.SaveAccessPassword(""); err != nil {
+		t.Fatalf("SaveAccessPassword(\"\") error = %v", err)
+	}
+	if got, err := store.Load(); err != nil || got.Relay.AccessPassword != "" {
+		t.Fatalf("Load() after clear = %+v, err=%v; want empty password", got, err)
+	}
+}
+
+func TestRelayAccessPasswordWireValue(t *testing.T) {
+	// Pure ASCII passwords travel as-is for relay compatibility.
+	if got := relayAccessPasswordWireValue("secret123"); got != "secret123" {
+		t.Fatalf("ascii wire value = %q, want secret123", got)
+	}
+	if got := relayAccessPasswordWireValue("  secret123  "); got != "secret123" {
+		t.Fatalf("trimmed ascii wire value = %q, want secret123", got)
+	}
+	// Non-ASCII passwords are sent as the lowercase SHA-256 hex digest so they
+	// survive HTTP header transport untouched.
+	got := relayAccessPasswordWireValue("秘密密码")
+	if got == "" || len(got) != sha256.Size*2 || !isLowerHex(got) {
+		t.Fatalf("non-ascii wire value = %q, want a %d-char lower hex digest", got, sha256.Size*2)
+	}
+	sum := sha256.Sum256([]byte("秘密密码"))
+	if got != hex.EncodeToString(sum[:]) {
+		t.Fatalf("non-ascii wire value = %q, want %q", got, hex.EncodeToString(sum[:]))
+	}
+	if relayAccessPasswordWireValue("") != "" {
+		t.Fatal("empty password wire value should be empty")
+	}
+}
+
+func isLowerHex(s string) bool {
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func TestBuildBindPollURL(t *testing.T) {

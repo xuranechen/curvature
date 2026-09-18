@@ -2343,11 +2343,7 @@ export function App({ onGoHome }: AppProps) {
   const [relayUnbindBusy, setRelayUnbindBusy] = useState(false);
   const [relayUnbindError, setRelayUnbindError] = useState("");
   const [relayPasswordInput, setRelayPasswordInput] = useState("");
-  const [relayPasswordBusy, setRelayPasswordBusy] = useState(false);
-  const [relayPasswordError, setRelayPasswordError] = useState("");
   const [relayNodeNameInput, setRelayNodeNameInput] = useState("");
-  const [relayNodeNameBusy, setRelayNodeNameBusy] = useState(false);
-  const [relayNodeNameError, setRelayNodeNameError] = useState("");
   const [agentConfigSwitchRequest, setAgentConfigSwitchRequest] =
     useState<AgentConfigSwitchRequest | null>(null);
   const [bootstrapState, setBootstrapState] = useState<BootstrapState>(() =>
@@ -13706,81 +13702,46 @@ export function App({ onGoHome }: AppProps) {
   const handleOpenRelaySettings = useCallback(() => {
     setRelayBaseInput(String(relayStatus?.relay_base_url || ""));
     setRelayNodeNameInput(String(relayStatus?.node_name || ""));
+    setRelayPasswordInput("");
     setRelayConfigError("");
-    setRelayNodeNameError("");
     setRelaySettingsOpen(true);
   }, [relayStatus]);
 
-  const handleSaveRelayConfig = useCallback(async () => {
+  // The single modal Save button applies the relay base URL, node name and
+  // access password together. The name and password may also be saved before
+  // the node is bound: they are persisted locally and synced to the relay on
+  // bind or reconnect.
+  const handleSaveRelaySettings = useCallback(async () => {
     setRelayConfigBusy(true);
     setRelayConfigError("");
     try {
       await bootstrapService.configureRelayBaseURL(relayBaseInput);
+      const status = await bootstrapService.setRelayNodeSettings(
+        relayNodeNameInput,
+        relayPasswordInput,
+      );
+      if (relayNodeNameInput.trim()) {
+        // Sync the input with the authoritative name returned by the backend
+        // (it may have trimmed or re-echoed the value), so the field never
+        // shows a stale default after a successful save.
+        const authoritative = String(status?.node_name || "").trim();
+        if (authoritative) {
+          setRelayNodeNameInput(authoritative);
+        }
+      }
+      setRelayPasswordInput("");
       setRelaySettingsOpen(false);
     } catch (error) {
       setRelayConfigError(
         error instanceof Error ? error.message : t("relay.configFailed"),
       );
+      void bootstrapService
+        .refreshRelayStatus()
+        .catch(() => undefined);
     } finally {
       setRelayConfigBusy(false);
     }
-  }, [relayBaseInput, t]);
-
-  const handleRelayPasswordSave = useCallback(async () => {
-    setRelayPasswordBusy(true);
-    setRelayPasswordError("");
-    try {
-      const status = await bootstrapService.setRelayAccessPassword(
-        relayPasswordInput,
-      );
-      setRelayPasswordInput("");
-      if (status && typeof status.password_set === "boolean") {
-        if (!status.password_set && relayPasswordInput.trim()) {
-          setRelayPasswordError(t("relay.passwordNotSaved"));
-        }
-      } else {
-        void bootstrapService
-          .refreshRelayStatus()
-          .catch(() => undefined);
-      }
-    } catch (error) {
-      setRelayPasswordError(
-        error instanceof Error ? error.message : t("relay.passwordFailed"),
-      );
-      void bootstrapService
-        .refreshRelayStatus()
-        .catch(() => undefined);
-    } finally {
-      setRelayPasswordBusy(false);
-    }
-  }, [relayPasswordInput, t]);
-
-  const handleRelayNodeNameSave = useCallback(async () => {
-    setRelayNodeNameBusy(true);
-    setRelayNodeNameError("");
-    try {
-      const status = await bootstrapService.renameRelayNode(relayNodeNameInput);
-      // Sync the input with the authoritative name returned by the backend
-      // (it may have trimmed or re-echoed the value), so the field never
-      // shows a stale default after a successful save.
-      const authoritative = String(status?.node_name || "").trim();
-      if (authoritative) {
-        setRelayNodeNameInput(authoritative);
-      }
-      setRelayNodeNameError("");
-    } catch (error) {
-      setRelayNodeNameError(
-        error instanceof Error ? error.message : t("relay.nodeNameFailed"),
-      );
-      // Re-read status from the backend so the field reflects what was
-      // actually persisted, instead of reverting to a stale default.
-      void bootstrapService
-        .refreshRelayStatus()
-        .catch(() => undefined);
-    } finally {
-      setRelayNodeNameBusy(false);
-    }
-  }, [relayNodeNameInput, t]);
+  }, [relayBaseInput, relayNodeNameInput, relayPasswordInput, t]);
 
   const reloadPage = useCallback(() => {
     window.location.reload();
@@ -14460,7 +14421,7 @@ export function App({ onGoHome }: AppProps) {
                 }}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !relayConfigBusy) {
-                    void handleSaveRelayConfig();
+                    void handleSaveRelaySettings();
                   }
                 }}
                 placeholder={t("relay.baseUrlPlaceholder")}
@@ -14493,32 +14454,27 @@ export function App({ onGoHome }: AppProps) {
             </div>
 
             <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-              <label
-                htmlFor="relay-access-password-input"
-                style={{ fontSize: "13px", fontWeight: 600, color: "#334155" }}
-              >
-                {t("relay.passwordLabel")}
-              </label>
-              <div style={{ display: "flex", gap: "8px" }}>
+                <label
+                  htmlFor="relay-access-password-input"
+                  style={{ fontSize: "13px", fontWeight: 600, color: "#334155" }}
+                >
+                  {t("relay.passwordLabel")}
+                </label>
                 <input
                   id="relay-access-password-input"
                   type="password"
                   value={relayPasswordInput}
                   onChange={(event) => {
                     setRelayPasswordInput(event.target.value);
-                    if (relayPasswordError) {
-                      setRelayPasswordError("");
-                    }
                   }}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter" && !relayPasswordBusy) {
-                      void handleRelayPasswordSave();
+                    if (event.key === "Enter" && !relayConfigBusy) {
+                      void handleSaveRelaySettings();
                     }
                   }}
                   placeholder={t("relay.passwordPlaceholder")}
-                  disabled={relayPasswordBusy}
+                  disabled={relayConfigBusy}
                   style={{
-                    flex: 1,
                     padding: "10px 12px",
                     borderRadius: "10px",
                     border: "1px solid var(--border-color)",
@@ -14527,84 +14483,51 @@ export function App({ onGoHome }: AppProps) {
                     outline: "none",
                   }}
                 />
-                <button
-                  type="button"
-                  disabled={relayPasswordBusy}
-                  onClick={() => {
-                    void handleRelayPasswordSave();
-                  }}
-                  style={{
-                    padding: "10px 16px",
-                    borderRadius: "10px",
-                    border: "1px solid var(--border-color)",
-                    background: relayPasswordBusy
-                      ? "rgba(148, 163, 184, 0.25)"
-                      : "transparent",
-                    color: "#334155",
-                    fontSize: "13px",
-                    fontWeight: 600,
-                    whiteSpace: "nowrap",
-                    cursor: relayPasswordBusy ? "not-allowed" : "pointer",
-                  }}
-                >
-                  {relayPasswordBusy ? t("relay.saving") : t("relay.passwordSave")}
-                </button>
+                <div style={{ fontSize: "12px", color: "#64748b", lineHeight: 1.5 }}>
+                  {t("relay.passwordHint")}
+                </div>
+                {!relayStatus?.relay_bound ? (
+                  <div style={{ fontSize: "12px", color: "#b45309", lineHeight: 1.5 }}>
+                    {t("relay.passwordBindFirstHint")}
+                  </div>
+                ) : null}
+                {relayStatus?.relay_bound || relayStatus?.password_set ? (
+                  <div
+                    style={{
+                      fontSize: "12px",
+                      fontWeight: 600,
+                      color: relayStatus?.password_set ? "#15803d" : "#64748b",
+                    }}
+                  >
+                    {relayStatus?.password_set
+                      ? t("relay.passwordStatusSet")
+                      : t("relay.passwordStatusUnset")}
+                  </div>
+                ) : null}
               </div>
-              <div style={{ fontSize: "12px", color: "#64748b", lineHeight: 1.5 }}>
-                {t("relay.passwordHint")}
-              </div>
-              {!relayStatus?.relay_bound ? (
-                <div style={{ fontSize: "12px", color: "#b45309", lineHeight: 1.5 }}>
-                  {t("relay.passwordBindFirstHint")}
-                </div>
-              ) : null}
-              {relayStatus?.relay_bound ? (
-                <div
-                  style={{
-                    fontSize: "12px",
-                    fontWeight: 600,
-                    color: relayStatus?.password_set ? "#15803d" : "#64748b",
-                  }}
-                >
-                  {relayStatus?.password_set
-                    ? t("relay.passwordStatusSet")
-                    : t("relay.passwordStatusUnset")}
-                </div>
-              ) : null}
-              {relayPasswordError ? (
-                <div style={{ fontSize: "12px", color: "#dc2626" }}>
-                  {relayPasswordError}
-                </div>
-              ) : null}
-            </div>
 
             <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-              <label
-                htmlFor="relay-node-name-input"
-                style={{ fontSize: "13px", fontWeight: 600, color: "#334155" }}
-              >
-                {t("relay.nodeNameLabel")}
-              </label>
-              <div style={{ display: "flex", gap: "8px" }}>
+                <label
+                  htmlFor="relay-node-name-input"
+                  style={{ fontSize: "13px", fontWeight: 600, color: "#334155" }}
+                >
+                  {t("relay.nodeNameLabel")}
+                </label>
                 <input
                   id="relay-node-name-input"
                   type="text"
                   value={relayNodeNameInput}
                   onChange={(event) => {
                     setRelayNodeNameInput(event.target.value);
-                    if (relayNodeNameError) {
-                      setRelayNodeNameError("");
-                    }
                   }}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter" && !relayNodeNameBusy) {
-                      void handleRelayNodeNameSave();
+                    if (event.key === "Enter" && !relayConfigBusy) {
+                      void handleSaveRelaySettings();
                     }
                   }}
                   placeholder={t("relay.nodeNamePlaceholder")}
-                  disabled={relayNodeNameBusy}
+                  disabled={relayConfigBusy}
                   style={{
-                    flex: 1,
                     padding: "10px 12px",
                     borderRadius: "10px",
                     border: "1px solid var(--border-color)",
@@ -14613,38 +14536,10 @@ export function App({ onGoHome }: AppProps) {
                     outline: "none",
                   }}
                 />
-                <button
-                  type="button"
-                  disabled={relayNodeNameBusy}
-                  onClick={() => {
-                    void handleRelayNodeNameSave();
-                  }}
-                  style={{
-                    padding: "10px 16px",
-                    borderRadius: "10px",
-                    border: "1px solid var(--border-color)",
-                    background: relayNodeNameBusy
-                      ? "rgba(148, 163, 184, 0.25)"
-                      : "transparent",
-                    color: "#334155",
-                    fontSize: "13px",
-                    fontWeight: 600,
-                    whiteSpace: "nowrap",
-                    cursor: relayNodeNameBusy ? "not-allowed" : "pointer",
-                  }}
-                >
-                  {relayNodeNameBusy ? t("relay.saving") : t("relay.saveName")}
-                </button>
-              </div>
-              <div style={{ fontSize: "12px", color: "#64748b", lineHeight: 1.5 }}>
-                {t("relay.nodeNameHint")}
-              </div>
-              {relayNodeNameError ? (
-                <div style={{ fontSize: "12px", color: "#dc2626" }}>
-                  {relayNodeNameError}
+                <div style={{ fontSize: "12px", color: "#64748b", lineHeight: 1.5 }}>
+                  {t("relay.nodeNameHint")}
                 </div>
-              ) : null}
-            </div>
+              </div>
 
             {relayStatus?.relay_bound ? (
               <div
@@ -14715,7 +14610,7 @@ export function App({ onGoHome }: AppProps) {
                 type="button"
                 disabled={relayConfigBusy}
                 onClick={() => {
-                  void handleSaveRelayConfig();
+                  void handleSaveRelaySettings();
                 }}
                 style={{
                   padding: "10px 16px",

@@ -3,7 +3,9 @@ package relay
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +33,30 @@ const (
 const relayDeviceIDHeader = "X-Curvature-Device-ID"
 const relayNodeNameHeader = "X-Curvature-Relay-Node-Name"
 const relayNodePasswordHeader = "X-Curvature-Node-Password"
+
+// relayAccessPasswordWireValue returns the value to send on the device WebSocket
+// handshake for an access password. Pure ASCII passwords travel as-is for
+// compatibility with relays that only understand raw passwords. Anything else
+// is sent as the lowercase SHA-256 hex digest so non-ASCII bytes survive HTTP
+// header transport (proxies may reject or mangle non-ASCII header values).
+func relayAccessPasswordWireValue(password string) string {
+	pw := strings.TrimSpace(password)
+	if pw == "" {
+		return ""
+	}
+	ascii := true
+	for _, b := range []byte(pw) {
+		if b >= 0x80 {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		return pw
+	}
+	sum := sha256.Sum256([]byte(pw))
+	return hex.EncodeToString(sum[:])
+}
 
 type Service struct {
 	localAddr string
@@ -157,7 +183,23 @@ func (s *Service) Run(ctx context.Context) error {
 	backoff := relayReconnectInitialBackoff
 	for {
 		startedAt := time.Now()
-		err := s.runSession(ctx, creds.Relay)
+
+		creds, err := s.store.Load()
+		if err != nil {
+			return err
+		}
+		if creds.Relay.DeviceToken == "" || creds.Relay.Endpoint == "" {
+			return nil
+		}
+		// Push the locally saved node name and access password to the relay
+		// before dialing so both sides always agree, even after a restart or a
+		// password set before the device was bound. Sync failures are non-fatal:
+		// the WebSocket dial itself will surface any residual mismatch.
+		if err := s.syncSettingsToRelay(ctx, creds.Relay); err != nil {
+			log.Printf("[relay] sync settings to relay failed (continuing): %v", err)
+		}
+
+		err = s.runSession(ctx, creds.Relay)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -180,6 +222,31 @@ func (s *Service) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// syncSettingsToRelay pushes this device's locally saved node name and access
+// password to the relay so the relay and this device stay in agreement. Each
+// setting is synced independently; the first failure is reported but does not
+// stop the other settings from being pushed.
+func (s *Service) syncSettingsToRelay(ctx context.Context, creds RelayCredentials) error {
+	base := endpointBaseURL(creds.Endpoint)
+	if base == "" || creds.DeviceToken == "" {
+		return nil
+	}
+	var firstErr error
+	if name := strings.TrimSpace(creds.NodeName); name != "" {
+		if err := s.SetNodeName(ctx, base, creds.DeviceToken, name); err != nil {
+			log.Printf("[relay] sync node name failed: %v", err)
+			firstErr = err
+		}
+	}
+	if err := s.SetAccessPassword(ctx, base, creds.DeviceToken, creds.AccessPassword); err != nil {
+		log.Printf("[relay] sync access password failed: %v", err)
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func (s *Service) PollBind(ctx context.Context, baseURL, pendingCode string) (BindPollResult, error) {
@@ -427,7 +494,7 @@ func buildBindPollURL(baseURL, pendingCode, purpose, nodeName string) (string, e
 func (s *Service) runSession(ctx context.Context, creds RelayCredentials) error {
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+creds.DeviceToken)
-	if pw := strings.TrimSpace(creds.AccessPassword); pw != "" {
+	if pw := relayAccessPasswordWireValue(creds.AccessPassword); pw != "" {
 		headers.Set(relayNodePasswordHeader, pw)
 	}
 	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, creds.Endpoint, headers)
