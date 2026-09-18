@@ -7,6 +7,7 @@
 Thumbs.db
 *.tmp
 *.swp
+*~
 .vscode/
 .idea/
 node_modules/

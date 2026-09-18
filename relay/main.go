@@ -80,6 +80,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/api/devices/"):
 		if r.Method == http.MethodDelete {
 			s.handleDeviceDelete(w, r)
+		} else if r.Method == http.MethodPut && strings.HasSuffix(path, "/name") {
+			s.handleDeviceRename(w, r)
 		} else {
 			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		}
@@ -249,6 +251,76 @@ func (s *Server) handleNodeName(w http.ResponseWriter, r *http.Request) {
 	}
 	if runes := []rune(name); len(runes) > 64 {
 		name = string(runes[:64])
+	}
+	// Reject control characters that would break the WebSocket handshake header.
+	for _, r := range name {
+		if r == '\n' || r == '\r' || r == '\x00' {
+			writeJSONError(w, http.StatusBadRequest, "node_name_invalid")
+			return
+		}
+	}
+	if s.store.isNodeNameTaken(name, dev.NodeID) {
+		writeJSONError(w, http.StatusConflict, "node_name_taken")
+		return
+	}
+	dev.NodeName = name
+	if err := s.store.saveDevice(dev); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "save_failed")
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"node_id":   dev.NodeID,
+		"node_name": dev.NodeName,
+		"node_url":  s.binds.nodeURL(dev.NodeID),
+	})
+}
+
+// handleDeviceRename renames a node from the relay's /nodes admin page. The
+// page is the owner's management surface for the self-hosted relay and can
+// already delete devices, so renaming is offered without a device token. The
+// authoritative name is echoed back to the device through the WebSocket
+// handshake on its next reconnect.
+func (s *Server) handleDeviceRename(w http.ResponseWriter, r *http.Request) {
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/devices/"), "/")
+	if !strings.HasSuffix(rest, "/name") {
+		writeJSONError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	nodeID := strings.TrimSuffix(rest, "/name")
+	nodeID = strings.Trim(nodeID, "/")
+	if nodeID == "" {
+		writeJSONError(w, http.StatusBadRequest, "node_id_required")
+		return
+	}
+	dev := s.store.getDeviceByNode(nodeID)
+	if dev == nil {
+		writeJSONError(w, http.StatusNotFound, "node_not_found")
+		return
+	}
+	var req struct {
+		NodeName string `json:"node_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_json")
+		return
+	}
+	name := strings.TrimSpace(req.NodeName)
+	if name == "" {
+		writeJSONError(w, http.StatusBadRequest, "node_name_required")
+		return
+	}
+	if runes := []rune(name); len(runes) > 64 {
+		name = string(runes[:64])
+	}
+	for _, rr := range name {
+		if rr == '\n' || rr == '\r' || rr == '\x00' {
+			writeJSONError(w, http.StatusBadRequest, "node_name_invalid")
+			return
+		}
+	}
+	if s.store.isNodeNameTaken(name, dev.NodeID) {
+		writeJSONError(w, http.StatusConflict, "node_name_taken")
+		return
 	}
 	dev.NodeName = name
 	if err := s.store.saveDevice(dev); err != nil {

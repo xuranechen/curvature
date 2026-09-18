@@ -8,9 +8,12 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 type Status struct {
@@ -24,6 +27,7 @@ type Status struct {
 	NodeURL      string `json:"node_url"`
 	LastError    string `json:"last_error,omitempty"`
 	E2EERequired bool   `json:"e2ee_required"`
+	PasswordSet  bool   `json:"password_set"`
 }
 
 type Manager struct {
@@ -40,6 +44,10 @@ type Manager struct {
 	pendingSince time.Time
 	nodeName     string
 	lastError    string
+
+	configFingerprint string
+	knownServices     map[string]LocalService
+	watcher           *fsnotify.Watcher
 }
 
 func NewManager(localAddr string, noRelayer bool, relayBaseURL string, useTLS bool) (*Manager, error) {
@@ -57,12 +65,27 @@ func NewManager(localAddr string, noRelayer bool, relayBaseURL string, useTLS bo
 	if resolvedRelayBase == "" {
 		noRelayer = true
 	}
-	return &Manager{
+	nodeName := defaultNodeName()
+	if persisted := service.store.LoadNodeName(); persisted != "" {
+		nodeName = persisted
+	}
+	m := &Manager{
 		service:   service,
 		noRelayer: noRelayer,
 		relayBase: strings.TrimSuffix(resolvedRelayBase, "/"),
-		nodeName:  defaultNodeName(),
-	}, nil
+		nodeName:  nodeName,
+	}
+	// Keep the in-memory node name and the unified relay.json in sync when the
+	// relay reports a node name during the WebSocket handshake.
+	service.SetNodeNameChangedHook(func(name string) {
+		m.mu.Lock()
+		m.nodeName = strings.TrimSpace(name)
+		if saveErr := m.service.store.SaveNodeName(m.nodeName); saveErr != nil {
+			log.Printf("[relay] save synced node name failed: %v", saveErr)
+		}
+		m.mu.Unlock()
+	})
+	return m, nil
 }
 
 func (m *Manager) Start(ctx context.Context) error {
@@ -74,6 +97,14 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	m.started = true
 	m.ctx = ctx
+
+	m.knownServices = map[string]LocalService{}
+	if services, listErr := m.service.store.ListServices(); listErr == nil {
+		for _, service := range services {
+			m.knownServices[service.Slug] = service
+		}
+	}
+	m.initConfigWatchLocked(ctx)
 
 	creds, err := m.service.store.Load()
 	if err != nil {
@@ -200,6 +231,9 @@ func (m *Manager) statusLocked() Status {
 		status.NodeID = creds.Relay.NodeID
 		if nodeName := strings.TrimSpace(creds.Relay.NodeName); nodeName != "" {
 			status.NodeName = nodeName
+		}
+		if strings.TrimSpace(creds.Relay.AccessPassword) != "" {
+			status.PasswordSet = true
 		}
 		if status.RelayBaseURL == "" {
 			status.RelayBaseURL = endpointBaseURL(creds.Relay.Endpoint)
@@ -338,19 +372,213 @@ func (m *Manager) restart() {
 	}
 }
 
+// initConfigWatchLocked records the current unified config fingerprint and
+// starts watching relay.json so external edits (hand-editing the file) are
+// applied and pushed to the relay without restarting the process.
+func (m *Manager) initConfigWatchLocked(ctx context.Context) {
+	if _, fingerprint, err := m.service.store.Snapshot(); err == nil {
+		m.configFingerprint = fingerprint
+	}
+	m.startConfigWatcher(ctx)
+}
+
+func (m *Manager) startConfigWatcher(ctx context.Context) {
+	path := m.service.store.Path()
+	if path == "" || m.watcher != nil {
+		return
+	}
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("[relay] config watcher unavailable: %v", err)
+		return
+	}
+	if err := watcher.Add(filepath.Dir(path)); err != nil {
+		_ = watcher.Close()
+		log.Printf("[relay] config watcher add failed: %v", err)
+		return
+	}
+	m.watcher = watcher
+	go m.watchConfigLoop(ctx, watcher, filepath.Clean(path))
+	log.Printf("[relay] watching relay config for external changes: %s", path)
+}
+
+func (m *Manager) watchConfigLoop(ctx context.Context, watcher *fsnotify.Watcher, path string) {
+	defer func() {
+		_ = watcher.Close()
+		m.mu.Lock()
+		if m.watcher == watcher {
+			m.watcher = nil
+		}
+		m.mu.Unlock()
+	}()
+
+	base := filepath.Base(path)
+	debounce := time.NewTimer(time.Hour)
+	if !debounce.Stop() {
+		<-debounce.C
+	}
+	pending := false
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Name != "" && filepath.Base(event.Name) != base {
+				continue
+			}
+			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename|fsnotify.Remove) == 0 {
+				continue
+			}
+			pending = true
+			debounce.Reset(250 * time.Millisecond)
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("[relay] config watch error: %v", err)
+		case <-debounce.C:
+			if !pending {
+				continue
+			}
+			pending = false
+			m.reconcileFromDisk(ctx)
+		}
+	}
+}
+
+// reconcileFromDisk applies a relay.json that changed on disk. It reloads the
+// unified config, updates the in-memory relay base URL and node name, and
+// re-pushes any changed exposed services to the relay.
+func (m *Manager) reconcileFromDisk(ctx context.Context) {
+	cfg, fingerprint, err := m.service.store.Snapshot()
+	if err != nil {
+		log.Printf("[relay] reload relay config failed: %v", err)
+		return
+	}
+
+	m.mu.Lock()
+	if fingerprint == m.configFingerprint {
+		m.mu.Unlock()
+		return
+	}
+	m.configFingerprint = fingerprint
+	newBase := strings.TrimSuffix(strings.TrimSpace(cfg.RelayBaseURL), "/")
+	baseChanged := newBase != m.relayBase
+	newNodeName := strings.TrimSpace(cfg.NodeName)
+	nodeNameChanged := newNodeName != "" && newNodeName != m.nodeName
+	m.mu.Unlock()
+
+	if baseChanged {
+		if _, err := m.SetRelayBaseURL(newBase); err != nil {
+			log.Printf("[relay] apply relay base from file failed: %v", err)
+		}
+	}
+	if nodeNameChanged {
+		if err := m.RenameNode(ctx, newNodeName); err != nil {
+			log.Printf("[relay] apply node name from file failed: %v", err)
+		}
+	}
+	m.reconcileServices(ctx, cfg.Services)
+	log.Printf("[relay] applied external relay config change")
+}
+
+func (m *Manager) reconcileServices(ctx context.Context, services []LocalService) {
+	desired := make(map[string]LocalService, len(services))
+	for _, service := range services {
+		normalized, err := NormalizeLocalService(service)
+		if err != nil {
+			continue
+		}
+		desired[normalized.Slug] = normalized
+	}
+
+	m.mu.Lock()
+	known := make(map[string]LocalService, len(m.knownServices))
+	for slug, service := range m.knownServices {
+		known[slug] = service
+	}
+	m.mu.Unlock()
+
+	for slug, service := range desired {
+		if prev, ok := known[slug]; ok && prev == service {
+			continue
+		}
+		if _, err := m.SaveService(ctx, service); err != nil {
+			log.Printf("[relay] sync service %q from file failed: %v", slug, err)
+		}
+	}
+	for slug := range known {
+		if _, ok := desired[slug]; ok {
+			continue
+		}
+		if err := m.DeleteService(ctx, slug); err != nil {
+			log.Printf("[relay] remove service %q from file failed: %v", slug, err)
+		}
+	}
+
+	m.mu.Lock()
+	m.knownServices = desired
+	m.mu.Unlock()
+}
+
+func (m *Manager) rememberService(service LocalService) {
+	m.mu.Lock()
+	if m.knownServices == nil {
+		m.knownServices = map[string]LocalService{}
+	}
+	m.knownServices[service.Slug] = service
+	m.mu.Unlock()
+}
+
+func (m *Manager) forgetService(slug string) {
+	m.mu.Lock()
+	if m.knownServices != nil {
+		delete(m.knownServices, slug)
+	}
+	m.mu.Unlock()
+}
+
 func (m *Manager) handlePermanentRelayError(err error) {
 	m.mu.Lock()
 	if m.cancel != nil {
 		m.cancel()
 		m.cancel = nil
 	}
-	if clearErr := m.service.store.Clear(); clearErr != nil {
-		log.Printf("[relay] clear credentials failed after permanent error: %v", clearErr)
+
+	// Determine whether this is a token invalidation or a password mismatch.
+	// Password mismatches should only clear the password, not the entire
+	// credential set, so the device can re-connect once the correct password
+	// is supplied via the relay settings UI.
+	isPasswordError := false
+	var dialErr *relayDialError
+	if errors.As(err, &dialErr) {
+		isPasswordError = dialErr.statusCode == 403 && dialErr.errorCode == "access_password_invalid"
 	}
-	m.lastError = err.Error()
+
+	if isPasswordError {
+		// Clear only the stored access password; keep device token and
+		// endpoint so the device can reconnect once the password is fixed.
+		creds, loadErr := m.service.store.Load()
+		if loadErr == nil && creds.Relay.AccessPassword != "" {
+			creds.Relay.AccessPassword = ""
+			if saveErr := m.service.store.Save(creds); saveErr != nil {
+				log.Printf("[relay] clear access password failed: %v", saveErr)
+			}
+		}
+		m.lastError = "access password mismatch — update the password in relay settings"
+	} else {
+		if clearErr := m.service.store.Clear(); clearErr != nil {
+			log.Printf("[relay] clear credentials failed after permanent error: %v", clearErr)
+		}
+		m.lastError = err.Error()
+	}
 	m.mu.Unlock()
 
-	log.Printf("[relay] credentials invalidated, rebinding required: %v", err)
+	log.Printf("[relay] permanent relay error: %v", err)
 }
 
 func (m *Manager) ensurePendingLocked() {
@@ -464,11 +692,18 @@ func (m *Manager) SetAccessPassword(ctx context.Context, password string) error 
 	if err := m.service.store.Save(creds); err != nil {
 		return err
 	}
+	// If the session stopped (e.g. because the previous password failed on the
+	// relay), resume the connection now that the relay accepted the new one.
+	if m.cancel == nil && m.ctx != nil {
+		m.startLocked(m.ctx)
+	}
 	return nil
 }
 
-// RenameNode changes the display name of this device's node on the relay and
-// persists it locally so status and future bind polls use the new name.
+// RenameNode changes the display name of this device's node. When the device
+// is bound it syncs the new name to the relay first and only persists locally
+// after the relay accepts it (enforcing e.g. namespace uniqueness). When not
+// bound yet it persists the name locally so it is used for the next bind poll.
 func (m *Manager) RenameNode(ctx context.Context, nodeName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -480,12 +715,19 @@ func (m *Manager) RenameNode(ctx context.Context, nodeName string) error {
 	if runes := []rune(nodeName); len(runes) > 64 {
 		nodeName = string(runes[:64])
 	}
+
 	creds, err := m.service.store.Load()
 	if err != nil {
 		return err
 	}
 	if creds.Relay.DeviceToken == "" || creds.Relay.Endpoint == "" {
-		return errors.New("relay not bound")
+		// Not bound yet: persist the name locally and it will be sent with
+		// the next bind poll.
+		if err := m.service.store.SaveNodeName(nodeName); err != nil {
+			return err
+		}
+		m.nodeName = nodeName
+		return nil
 	}
 	base := endpointBaseURL(creds.Relay.Endpoint)
 	if base == "" {
@@ -496,6 +738,9 @@ func (m *Manager) RenameNode(ctx context.Context, nodeName string) error {
 	}
 	creds.Relay.NodeName = nodeName
 	if err := m.service.store.Save(creds); err != nil {
+		return err
+	}
+	if err := m.service.store.SaveNodeName(nodeName); err != nil {
 		return err
 	}
 	m.nodeName = nodeName

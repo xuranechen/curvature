@@ -12,6 +12,7 @@ export type RelayStatusPayload = {
   node_url?: string;
   last_error?: string;
   e2ee_required?: boolean;
+  password_set?: boolean;
 };
 
 export type BootstrapPhase = "idle" | "pending" | "needs_pairing" | "ready" | "error";

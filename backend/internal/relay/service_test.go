@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -39,9 +40,9 @@ func TestCredentialsStoreSaveLoad(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", configRoot)
 	t.Setenv("HOME", configRoot)
 
-	store, err := NewCredentialsStore()
+	store, err := NewRelayStore()
 	if err != nil {
-		t.Fatalf("NewCredentialsStore() error = %v", err)
+		t.Fatalf("NewRelayStore() error = %v", err)
 	}
 
 	input := Credentials{
@@ -78,9 +79,9 @@ func TestCredentialsStoreClear(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", configRoot)
 	t.Setenv("HOME", configRoot)
 
-	store, err := NewCredentialsStore()
+	store, err := NewRelayStore()
 	if err != nil {
-		t.Fatalf("NewCredentialsStore() error = %v", err)
+		t.Fatalf("NewRelayStore() error = %v", err)
 	}
 	if err := store.Save(Credentials{
 		Relay: RelayCredentials{
@@ -103,13 +104,54 @@ func TestCredentialsStoreClear(t *testing.T) {
 	}
 }
 
+func TestCredentialsStoreNodeNamePersistsAcrossRelayBaseChanges(t *testing.T) {
+	configRoot := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configRoot)
+	t.Setenv("HOME", configRoot)
+
+	store, err := NewRelayStore()
+	if err != nil {
+		t.Fatalf("NewRelayStore() error = %v", err)
+	}
+	if err := store.SaveNodeName("客厅电脑"); err != nil {
+		t.Fatalf("SaveNodeName() error = %v", err)
+	}
+	if got := store.LoadNodeName(); got != "客厅电脑" {
+		t.Fatalf("LoadNodeName() = %q, want 客厅电脑", got)
+	}
+	// Saving the relay base must not wipe the node name.
+	if err := store.SaveRelayBase("https://relay.example.com"); err != nil {
+		t.Fatalf("SaveRelayBase() error = %v", err)
+	}
+	if got := store.LoadNodeName(); got != "客厅电脑" {
+		t.Fatalf("LoadNodeName() after SaveRelayBase = %q, want 客厅电脑", got)
+	}
+	if got := store.LoadRelayBase(); got != "https://relay.example.com" {
+		t.Fatalf("LoadRelayBase() = %q", got)
+	}
+	// Clearing the relay base must keep the node name.
+	if err := store.SaveRelayBase(""); err != nil {
+		t.Fatalf("SaveRelayBase(\"\") error = %v", err)
+	}
+	if got := store.LoadNodeName(); got != "客厅电脑" {
+		t.Fatalf("LoadNodeName() after clearing relay base = %q, want 客厅电脑", got)
+	}
+}
+
 func TestBuildBindPollURL(t *testing.T) {
-	got, err := buildBindPollURL("https://relay.example.com", "pc_123")
+	got, err := buildBindPollURL("https://relay.example.com", "pc_123", "", "")
 	if err != nil {
 		t.Fatalf("buildBindPollURL() error = %v", err)
 	}
 	if got != "https://relay.example.com/api/bind/poll?code=pc_123" {
 		t.Fatalf("buildBindPollURL() = %q", got)
+	}
+	got, err = buildBindPollURL("https://relay.example.com", "pc_123", "purpose-x", "my-node")
+	if err != nil {
+		t.Fatalf("buildBindPollURL() error = %v", err)
+	}
+	if got != "https://relay.example.com/api/bind/poll?code=pc_123&node_name=my-node&purpose=purpose-x" {
+		t.Fatalf("buildBindPollURL() with purpose+node_name = %q", got)
 	}
 }
 
@@ -229,6 +271,60 @@ func TestServiceStoreRelayNodeNameFromHandshake(t *testing.T) {
 	}
 	if got.Relay.NodeName != "Renamed Mac" {
 		t.Fatalf("node name = %q", got.Relay.NodeName)
+	}
+}
+
+func TestServiceStoreRelayNodeNameInvokesHook(t *testing.T) {
+	configRoot := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configRoot)
+	t.Setenv("HOME", configRoot)
+	t.Setenv("APPDATA", configRoot)
+
+	svc, err := NewService(":7331", false)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	var hooked string
+	svc.SetNodeNameChangedHook(func(name string) {
+		hooked = name
+	})
+
+	creds := RelayCredentials{
+		DeviceToken: "dev_live",
+		NodeID:      "node_live",
+		Endpoint:    "wss://relay.example.com/ws/connector",
+	}
+	resp := &http.Response{Header: http.Header{}}
+	resp.Header.Set(relayNodeNameHeader, "Renamed Mac")
+
+	svc.storeRelayNodeName(creds, resp)
+
+	if hooked != "Renamed Mac" {
+		t.Fatalf("hook name = %q, want Renamed Mac", hooked)
+	}
+	got, err := svc.store.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got.Relay.NodeName != "Renamed Mac" {
+		t.Fatalf("node name = %q", got.Relay.NodeName)
+	}
+}
+
+func TestRelayStatusErrorTranslatesCodes(t *testing.T) {
+	relayStatusErrorTest := func(code string) string {
+		resp := &http.Response{
+			StatusCode: http.StatusConflict,
+			Status:     "409 Conflict",
+			Body:       io.NopCloser(strings.NewReader(`{"error":"` + code + `"}`)),
+		}
+		return relayStatusError(resp)
+	}
+	if got := relayStatusErrorTest("node_name_taken"); !strings.Contains(got, "already in use") {
+		t.Fatalf("node_name_taken message = %q", got)
+	}
+	if got := relayStatusErrorTest("password_length"); !strings.Contains(got, "4-128") {
+		t.Fatalf("password_length message = %q", got)
 	}
 }
 
@@ -556,6 +652,14 @@ func TestIsPermanentRelayErrorDetectsHandshakeStatus(t *testing.T) {
 	}) {
 		t.Fatal("expected device_token_invalid to be treated as permanent")
 	}
+	if !isPermanentRelayError(&relayDialError{
+		statusCode: http.StatusForbidden,
+		status:     "403 Forbidden",
+		errorCode:  "access_password_invalid",
+		err:        errors.New("websocket: bad handshake"),
+	}) {
+		t.Fatal("expected access_password_invalid to be treated as permanent")
+	}
 	if isPermanentRelayError(&relayDialError{
 		statusCode: http.StatusUnauthorized,
 		status:     "401 Unauthorized",
@@ -574,6 +678,96 @@ func TestIsPermanentRelayErrorDetectsHandshakeStatus(t *testing.T) {
 	}
 	if isPermanentRelayError(errors.New("websocket: bad handshake")) {
 		t.Fatal("plain bad handshake without status should not be treated as permanent")
+	}
+}
+
+func TestManagerPasswordMismatchPermanentErrorKeepsBind(t *testing.T) {
+	configRoot := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configRoot)
+	t.Setenv("HOME", configRoot)
+	t.Setenv("APPDATA", configRoot)
+
+	manager, err := NewManager(":7331", false, "https://relay.example.com", false)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	if err := manager.service.store.Save(Credentials{
+		Relay: RelayCredentials{
+			DeviceToken:    "dev_live",
+			NodeID:         "node_live",
+			NodeName:       "Office Mac",
+			Endpoint:       "wss://relay.example.com/ws/connector",
+			AccessPassword: "secret-old",
+		},
+	}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	manager.handlePermanentRelayError(&relayDialError{
+		statusCode: http.StatusForbidden,
+		status:     "403 Forbidden",
+		errorCode:  "access_password_invalid",
+		err:        errors.New("websocket: bad handshake"),
+	})
+
+	status := manager.Status()
+	if !status.Bound {
+		t.Fatal("expected still bound after access password mismatch")
+	}
+	if status.PasswordSet {
+		t.Fatal("expected password to be cleared after access password mismatch")
+	}
+	if !strings.Contains(status.LastError, "access password mismatch") {
+		t.Fatalf("last error = %q", status.LastError)
+	}
+	creds, err := manager.service.store.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if creds.Relay.DeviceToken == "" || creds.Relay.Endpoint == "" {
+		t.Fatalf("expected credentials to be kept, got %+v", creds.Relay)
+	}
+	if creds.Relay.AccessPassword != "" {
+		t.Fatalf("expected access password cleared, got %q", creds.Relay.AccessPassword)
+	}
+}
+
+func TestManagerReconcilesExternalRelayConfigChange(t *testing.T) {
+	manager, err := NewManager(":7331", false, "https://relay.example.com", false)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	// Guard against the shared real config dir: point the store at a temp file
+	// so the watcher observes only this test's writes.
+	path := filepath.Join(t.TempDir(), "relay.json")
+	manager.service.store.filePath = path
+	if err := manager.service.store.SaveRelayBase("https://relay.example.com"); err != nil {
+		t.Fatalf("SaveRelayBase() error = %v", err)
+	}
+	if err := manager.service.store.SaveNodeName("Original Name"); err != nil {
+		t.Fatalf("SaveNodeName() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	if err := os.WriteFile(path, []byte(`{"relay_base_url":"https://relay.example.com","node_name":"External Edit"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	deadline := time.After(4 * time.Second)
+	for {
+		if manager.Status().NodeName == "External Edit" {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("external node name change was not applied, node name = %q", manager.Status().NodeName)
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 }
 

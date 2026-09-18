@@ -368,6 +368,7 @@ function render() {
         '<div class="meta">' + escapeHtml(d.node_id) + '<span class="bound">' + escapeHtml(boundText) + '</span></div>' +
       '</div>' +
       '<div class="actions">' +
+        '<button class="icon-btn" title="重命名节点" onclick="renameNode(this)">✎</button>' +
         '<button class="icon-btn danger" title="删除节点" onclick="deleteNode(this)">✕</button>' +
         '<a class="open" href="' + escapeHtml(d.node_url) + '">打开</a>' +
       '</div>' +
@@ -401,6 +402,47 @@ async function deleteNode(btn) {
     btn.disabled = false;
     btn.textContent = "✕";
   }
+}
+
+async function renameNode(btn) {
+  const card = btn.closest(".card");
+  const nameEl = card.querySelector(".name");
+  const currentName = nameEl.textContent;
+  const newNodeName = window.prompt("输入新的节点名称：", currentName);
+  if (newNodeName === null) return;
+  const trimmed = String(newNodeName || "").trim();
+  if (!trimmed) {
+    toast("节点名称不能为空");
+    return;
+  }
+  const nodeId = card.querySelector(".meta").textContent.split('·')[0].trim();
+  btn.disabled = true;
+  try {
+    const res = await fetch("/api/devices/" + encodeURIComponent(nodeId) + "/name", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ node_name: trimmed }),
+    });
+    const result = await res.json();
+    if (result.node_name) {
+      const idx = allItems.findIndex(d => d.node_id === nodeId);
+      if (idx >= 0) allItems[idx].node_name = result.node_name;
+      toast("已重命名为「" + result.node_name + "」");
+      render();
+    } else {
+      toast(renameErrorText(result.error) || "重命名失败");
+      btn.disabled = false;
+    }
+  } catch (e) {
+    toast("请求失败");
+    btn.disabled = false;
+  }
+}
+
+function renameErrorText(code) {
+  if (code === "node_name_taken") return "该名称已被其他节点使用";
+  if (code === "node_name_required" || code === "node_name_invalid") return "节点名称无效";
+  return "";
 }
 
 function toast(text) {

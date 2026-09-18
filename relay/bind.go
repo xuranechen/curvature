@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -106,7 +107,10 @@ func (b *BindService) confirm(code string) (map[string]any, error) {
 	deviceToken := "dt_" + randToken()
 	nodeName := strings.TrimSpace(bind.NodeName)
 	if nodeName == "" {
-		nodeName = "home-node"
+		nodeName = defaultNodeNameForBind(b)
+	}
+	for i := 0; i < 100 && b.store.isNodeNameTaken(nodeName, ""); i++ {
+		nodeName = defaultNodeNameForBind(b)
 	}
 
 	dev := &Device{
@@ -203,4 +207,21 @@ func randHex(n int) string {
 		buf[i] = digits[raw[i/2]>>uint((i%2)*4)&0x0f]
 	}
 	return string(buf)
+}
+
+// defaultNodeNameForBind returns a default display name for a freshly bound
+// node. A counter suffix avoids collisions when multiple devices bind without
+// an explicit node name.
+func defaultNodeNameForBind(b *BindService) string {
+	base := "home-node"
+	if !b.store.isNodeNameTaken(base, "") {
+		return base
+	}
+	for i := 2; i <= 100; i++ {
+		probe := base + "-" + strconv.Itoa(i)
+		if !b.store.isNodeNameTaken(probe, "") {
+			return probe
+		}
+	}
+	return base + "-" + randHex(6)
 }

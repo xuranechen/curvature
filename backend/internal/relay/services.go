@@ -8,14 +8,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
-
-	configpkg "curvature/backend/internal/config"
 )
 
 const serviceSlugHeader = "X-Curvature-Relay-Service-Slug"
@@ -27,121 +22,6 @@ type LocalService struct {
 	Name     string `json:"name"`
 	LocalURL string `json:"local_url"`
 	Enabled  bool   `json:"enabled"`
-}
-
-type ServiceStore struct {
-	mu       sync.RWMutex
-	filePath string
-}
-
-func NewServiceStore() (*ServiceStore, error) {
-	configDir, err := configpkg.CurvatureConfigDir()
-	if err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
-		return nil, err
-	}
-	return &ServiceStore{filePath: filepath.Join(configDir, "relay-services.json")}, nil
-}
-
-func (s *ServiceStore) List() ([]LocalService, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.loadLocked()
-}
-
-func (s *ServiceStore) Get(slug string) (LocalService, bool, error) {
-	slug = NormalizeServiceSlug(slug)
-	services, err := s.List()
-	if err != nil {
-		return LocalService{}, false, err
-	}
-	for _, service := range services {
-		if service.Slug == slug {
-			return service, true, nil
-		}
-	}
-	return LocalService{}, false, nil
-}
-
-func (s *ServiceStore) Save(service LocalService) error {
-	normalized, err := NormalizeLocalService(service)
-	if err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	services, err := s.loadLocked()
-	if err != nil {
-		return err
-	}
-	replaced := false
-	for i := range services {
-		if services[i].Slug == normalized.Slug {
-			services[i] = normalized
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		services = append(services, normalized)
-	}
-	return s.saveLocked(services)
-}
-
-func (s *ServiceStore) Delete(slug string) error {
-	slug = NormalizeServiceSlug(slug)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	services, err := s.loadLocked()
-	if err != nil {
-		return err
-	}
-	next := services[:0]
-	for _, service := range services {
-		if service.Slug != slug {
-			next = append(next, service)
-		}
-	}
-	return s.saveLocked(next)
-}
-
-func (s *ServiceStore) loadLocked() ([]LocalService, error) {
-	var payload struct {
-		Services []LocalService `json:"services"`
-	}
-	data, err := os.ReadFile(s.filePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []LocalService{}, nil
-		}
-		return nil, err
-	}
-	if len(strings.TrimSpace(string(data))) == 0 {
-		return []LocalService{}, nil
-	}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return nil, err
-	}
-	out := make([]LocalService, 0, len(payload.Services))
-	for _, service := range payload.Services {
-		normalized, err := NormalizeLocalService(service)
-		if err == nil {
-			out = append(out, normalized)
-		}
-	}
-	return out, nil
-}
-
-func (s *ServiceStore) saveLocked(services []LocalService) error {
-	payload, err := json.MarshalIndent(struct {
-		Services []LocalService `json:"services"`
-	}{Services: services}, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(s.filePath, payload, 0o600)
 }
 
 func NormalizeServiceSlug(value string) string {
@@ -189,7 +69,7 @@ func normalizeLocalServiceURL(raw string) (string, error) {
 }
 
 func (m *Manager) ListServices() ([]LocalService, error) {
-	return m.service.services.List()
+	return m.service.store.ListServices()
 }
 
 func (m *Manager) SaveService(ctx context.Context, service LocalService) (LocalService, error) {
@@ -197,7 +77,7 @@ func (m *Manager) SaveService(ctx context.Context, service LocalService) (LocalS
 	if err != nil {
 		return LocalService{}, err
 	}
-	previous, hadPrevious, err := m.service.services.Get(normalized.Slug)
+	previous, hadPrevious, err := m.service.store.GetService(normalized.Slug)
 	if err != nil {
 		return LocalService{}, err
 	}
@@ -210,9 +90,10 @@ func (m *Manager) SaveService(ctx context.Context, service LocalService) (LocalS
 			return LocalService{}, err
 		}
 	}
-	if err := m.service.services.Save(normalized); err != nil {
+	if err := m.service.store.SaveService(normalized); err != nil {
 		return LocalService{}, err
 	}
+	m.rememberService(normalized)
 	return normalized, nil
 }
 
@@ -224,7 +105,11 @@ func (m *Manager) DeleteService(ctx context.Context, slug string) error {
 	if err := m.deleteRemoteService(ctx, slug); err != nil {
 		return err
 	}
-	return m.service.services.Delete(slug)
+	if err := m.service.store.DeleteService(slug); err != nil {
+		return err
+	}
+	m.forgetService(slug)
+	return nil
 }
 
 func (m *Manager) registerService(ctx context.Context, service LocalService) error {

@@ -229,9 +229,73 @@ func (f *Forwarder) handleServiceHost(w http.ResponseWriter, r *http.Request) bo
 		writeJSONError(w, http.StatusForbidden, "service_disabled")
 		return true
 	}
+	dev := f.store.getDeviceByNode(nodeID)
+	if dev == nil {
+		writeJSONError(w, http.StatusNotFound, "node_not_found")
+		return true
+	}
+	// The service subdomain is a public entry point just like /n/{node_id}/,
+	// so it must enforce the node's access password too.
+	if r.URL.Path == "/_auth" {
+		f.ServeServiceAuth(w, r, dev)
+		return true
+	}
+	if dev.AccessPassword != "" && !nodeAuthValid(r, dev) {
+		f.serveServiceAuthPage(w, r, dev)
+		return true
+	}
 	targetURI := r.URL.RequestURI()
 	f.forward(w, r, nodeID, targetURI, slug)
 	return true
+}
+
+// ServeServiceAuth handles POST /_auth on a service subdomain with the access
+// password as form field "password". On success it sets a host-scoped signed
+// cookie and redirects back to the requested path.
+func (f *Forwarder) ServeServiceAuth(w http.ResponseWriter, r *http.Request, dev *Device) {
+	if dev == nil || dev.AccessPassword == "" {
+		http.Redirect(w, r, "/nodes", http.StatusFound)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_form")
+		return
+	}
+	entered := strings.TrimSpace(r.PostFormValue("password"))
+	if !passwordMatch(dev.AccessPassword, entered) {
+		q := url.Values{}
+		q.Set("next", r.FormValue("next"))
+		http.Redirect(w, r, "/_auth?error=1&"+q.Encode(), http.StatusFound)
+		return
+	}
+	http.SetCookie(w, serviceAuthCookie(dev))
+	next := strings.TrimSpace(r.FormValue("next"))
+	if next == "" || !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
+		next = "/"
+	}
+	http.Redirect(w, r, next, http.StatusFound)
+}
+
+// serviceAuthCookie returns the signed cookie granting access to the service
+// subdomain until the password (or token) changes. It is scoped to the whole
+// subdomain host.
+func serviceAuthCookie(dev *Device) *http.Cookie {
+	c := nodeAuthCookie(dev)
+	c.Path = "/"
+	return c
+}
+
+// serveServiceAuthPage renders the password entry page for a protected service
+// subdomain.
+func (f *Forwarder) serveServiceAuthPage(w http.ResponseWriter, r *http.Request, dev *Device) {
+	next := r.URL.RequestURI()
+	if next == "" {
+		next = "/"
+	}
+	q := url.Values{}
+	q.Set("next", next)
+	authURL := "/_auth?" + q.Encode()
+	writeHTML(w, nodeAuthPageHTML(dev.NodeName, authURL, r.URL.Query().Get("error") == "1"))
 }
 
 // forward sends a single HTTP request over a yamux stream to the device.

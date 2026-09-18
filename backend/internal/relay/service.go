@@ -35,10 +35,21 @@ const relayNodePasswordHeader = "X-Curvature-Node-Password"
 type Service struct {
 	localAddr string
 	localURL  string
-	store     *CredentialsStore
-	services  *ServiceStore
+	store     *RelayStore
 	client    *http.Client
 	useTLS    bool
+
+	// nodeNameChangedHook, when set, is invoked whenever the relay reports a
+	// node name that differs from the locally persisted one (e.g. the node was
+	// renamed on the relay's /nodes page). The manager uses it to keep its
+	// in-memory name and the unified relay.json file in sync.
+	nodeNameChangedHook func(name string)
+}
+
+// SetNodeNameChangedHook registers a callback invoked with the authoritative
+// node display name echoed by the relay during the WebSocket handshake.
+func (s *Service) SetNodeNameChangedHook(fn func(name string)) {
+	s.nodeNameChangedHook = fn
 }
 
 type credentialResponse struct {
@@ -96,15 +107,11 @@ func (e *relayDialError) Unwrap() error {
 }
 
 func NewService(localAddr string, useTLS bool) (*Service, error) {
-	store, err := NewCredentialsStore()
+	store, err := NewRelayStore()
 	if err != nil {
 		return nil, err
 	}
 	if _, err := getOrCreateDeviceID(); err != nil {
-		return nil, err
-	}
-	services, err := NewServiceStore()
-	if err != nil {
 		return nil, err
 	}
 
@@ -130,7 +137,6 @@ func NewService(localAddr string, useTLS bool) (*Service, error) {
 		localAddr: localAddr,
 		localURL:  addrToURL(localAddr, "", useTLS),
 		store:     store,
-		services:  services,
 		client:    client,
 		useTLS:    useTLS,
 	}, nil
@@ -266,8 +272,17 @@ func (s *Service) SetAccessPassword(ctx context.Context, baseURL, deviceToken, p
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("relay set access password failed: %s %s", resp.Status, strings.TrimSpace(string(body)))
+		return fmt.Errorf("relay set access password failed: %s", relayStatusError(resp))
+	}
+	// Verify the relay confirmed the change by reading back password_set.
+	var out struct {
+		PasswordSet bool `json:"password_set"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&out); err == nil {
+		wantSet := strings.TrimSpace(password) != ""
+		if out.PasswordSet != wantSet {
+			log.Printf("[relay] warning: relay reports password_set=%v but %v was requested", out.PasswordSet, wantSet)
+		}
 	}
 	return nil
 }
@@ -295,8 +310,7 @@ func (s *Service) SetNodeName(ctx context.Context, baseURL, deviceToken, nodeNam
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("relay set node name failed: %s %s", resp.Status, strings.TrimSpace(string(body)))
+		return fmt.Errorf("relay set node name failed: %s", relayStatusError(resp))
 	}
 	return nil
 }
@@ -337,7 +351,6 @@ func (s *Service) UnbindNode(ctx context.Context, baseURL, deviceToken, nodeID s
 	return nil
 }
 
-
 func buildAccessPasswordURL(baseURL string) (string, error) {
 	base, err := parseRelayBase(baseURL)
 	if err != nil {
@@ -377,9 +390,11 @@ func parseRelayBase(baseURL string) (*url.URL, error) {
 	}
 }
 
-func buildBindPollURL(baseURL, pendingCode string, nameAndPurpose ...string) (string, error) {
+func buildBindPollURL(baseURL, pendingCode, purpose, nodeName string) (string, error) {
 	baseURL = strings.TrimSuffix(strings.TrimSpace(baseURL), "/")
 	pendingCode = strings.TrimSpace(pendingCode)
+	purpose = strings.TrimSpace(purpose)
+	nodeName = strings.TrimSpace(nodeName)
 	if baseURL == "" {
 		return "", errors.New("relay base URL required")
 	}
@@ -395,13 +410,11 @@ func buildBindPollURL(baseURL, pendingCode string, nameAndPurpose ...string) (st
 		u.Path = strings.TrimSuffix(u.Path, "/") + "/api/bind/poll"
 		q := u.Query()
 		q.Set("code", pendingCode)
-		if len(nameAndPurpose) > 0 {
-			if name := strings.TrimSpace(nameAndPurpose[0]); name != "" {
-				q.Set("node_name", name)
-			}
+		if purpose != "" {
+			q.Set("purpose", purpose)
 		}
-		if len(nameAndPurpose) > 1 && strings.TrimSpace(nameAndPurpose[1]) != "" {
-			q.Set("purpose", strings.TrimSpace(nameAndPurpose[1]))
+		if nodeName != "" {
+			q.Set("node_name", nodeName)
 		}
 		u.RawQuery = q.Encode()
 		u.Fragment = ""
@@ -484,7 +497,7 @@ func (s *Service) handleStream(ctx context.Context, stream net.Conn) error {
 }
 
 func (s *Service) handleServiceStream(req *http.Request, stream net.Conn, slug string) error {
-	service, ok, err := s.services.Get(slug)
+	service, ok, err := s.store.GetService(slug)
 	if err != nil {
 		return err
 	}
@@ -618,6 +631,9 @@ func (s *Service) storeRelayNodeName(creds RelayCredentials, resp *http.Response
 	creds.NodeName = nodeName
 	if err := s.store.Save(Credentials{Relay: creds}); err != nil {
 		log.Printf("[relay] save relay node name failed: %v", err)
+	}
+	if s.nodeNameChangedHook != nil {
+		s.nodeNameChangedHook(nodeName)
 	}
 }
 
@@ -811,6 +827,41 @@ func readRelayErrorCode(resp *http.Response) string {
 	return strings.TrimSpace(out.Error)
 }
 
+// relayStatusError builds a human-readable message from a non-2xx relay
+// response, translating known error codes to friendly text where possible.
+func relayStatusError(resp *http.Response) string {
+	if resp == nil {
+		return "empty response"
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	raw := strings.TrimSpace(string(body))
+	code := readRelayErrorCodeRaw(raw)
+	switch code {
+	case "node_name_taken":
+		return "node name is already in use on this relay"
+	case "node_name_required", "node_name_invalid":
+		return "node name is missing or invalid"
+	case "password_length":
+		return "access password must be 4-128 characters"
+	case "device_token_invalid":
+		return "device token was rejected by the relay"
+	}
+	if raw != "" {
+		return resp.Status + " (" + raw + ")"
+	}
+	return resp.Status
+}
+
+func readRelayErrorCodeRaw(body string) string {
+	var out struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &out); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out.Error)
+}
+
 func isPermanentRelayError(err error) bool {
 	if err == nil {
 		return false
@@ -819,5 +870,11 @@ func isPermanentRelayError(err error) bool {
 	if !errors.As(err, &dialErr) {
 		return false
 	}
-	return dialErr.statusCode == http.StatusUnauthorized && dialErr.errorCode == "device_token_invalid"
+	if dialErr.statusCode == http.StatusUnauthorized && dialErr.errorCode == "device_token_invalid" {
+		return true
+	}
+	if dialErr.statusCode == http.StatusForbidden && dialErr.errorCode == "access_password_invalid" {
+		return true
+	}
+	return false
 }
