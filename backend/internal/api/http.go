@@ -362,6 +362,7 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Post("/api/relay/config", h.protectedEndpoint(h.handleRelayConfigSet))
 	r.Put("/api/relay/access-password", h.protectedEndpoint(h.handleRelayAccessPasswordSet))
 	r.Put("/api/relay/node-name", h.protectedEndpoint(h.handleRelayNodeNameSet))
+	r.Put("/api/relay/settings", h.protectedEndpoint(h.handleRelaySettingsSet))
 	r.Delete("/api/relay/bind", h.protectedEndpoint(h.handleRelayUnbind))
 	r.Get("/api/relay/services", h.protectedEndpoint(h.handleRelayServicesList))
 	r.Post("/api/relay/services", h.protectedEndpoint(h.handleRelayServiceSave))
@@ -2565,6 +2566,38 @@ func (h *HTTPHandler) handleRelayNodeNameSet(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if err := manager.RenameNode(r.Context(), strings.TrimSpace(req.NodeName)); err != nil {
+		respondError(w, http.StatusInternalServerError, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, h.relayStatusWithE2EE(manager.Status()))
+}
+
+func (h *HTTPHandler) handleRelaySettingsSet(w http.ResponseWriter, r *http.Request) {
+	manager := h.AppContext.GetRelayManager()
+	if manager == nil {
+		respondError(w, http.StatusServiceUnavailable, errServiceUnavailable("relay manager not configured"))
+		return
+	}
+	var req struct {
+		NodeName       string `json:"node_name"`
+		AccessPassword string `json:"access_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if strings.Contains(req.NodeName, "\n") || strings.Contains(req.NodeName, "\r") {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid node_name"))
+		return
+	}
+	nodeName := strings.TrimSpace(req.NodeName)
+	if nodeName != "" {
+		if err := manager.RenameNode(r.Context(), nodeName); err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	if err := manager.SetAccessPassword(r.Context(), strings.TrimSpace(req.AccessPassword)); err != nil {
 		respondError(w, http.StatusInternalServerError, err)
 		return
 	}

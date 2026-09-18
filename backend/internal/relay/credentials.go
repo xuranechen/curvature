@@ -31,10 +31,11 @@ type RelayCredentials struct {
 // relay_base_url is the single source of truth for the relay base URL and
 // node_name is the single source of truth for the node display name.
 type onDiskRelayConfig struct {
-	RelayBaseURL string                  `json:"relay_base_url,omitempty"`
-	NodeName     string                  `json:"node_name,omitempty"`
-	Credentials  *onDiskRelayCredentials `json:"credentials,omitempty"`
-	Services     []LocalService          `json:"services,omitempty"`
+	RelayBaseURL   string                  `json:"relay_base_url,omitempty"`
+	NodeName       string                  `json:"node_name,omitempty"`
+	AccessPassword string                  `json:"access_password,omitempty"`
+	Credentials    *onDiskRelayCredentials `json:"credentials,omitempty"`
+	Services       []LocalService          `json:"services,omitempty"`
 }
 
 type onDiskRelayCredentials struct {
@@ -47,6 +48,7 @@ type onDiskRelayCredentials struct {
 func (c onDiskRelayConfig) empty() bool {
 	return strings.TrimSpace(c.RelayBaseURL) == "" &&
 		strings.TrimSpace(c.NodeName) == "" &&
+		strings.TrimSpace(c.AccessPassword) == "" &&
 		c.Credentials == nil &&
 		len(c.Services) == 0
 }
@@ -246,6 +248,42 @@ func (s *RelayStore) SaveNodeName(nodeName string) error {
 	return s.writeLocked(cfg)
 }
 
+// LoadAccessPassword returns the locally persisted access password (set before
+// or after binding). An empty string means no access password is configured.
+func (s *RelayStore) LoadAccessPassword() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg, err := s.loadLocked()
+	if err != nil {
+		return ""
+	}
+	if pw := strings.TrimSpace(cfg.AccessPassword); pw != "" {
+		return pw
+	}
+	if cfg.Credentials != nil {
+		return strings.TrimSpace(cfg.Credentials.AccessPassword)
+	}
+	return ""
+}
+
+// SaveAccessPassword persists the access password independently from binding
+// credentials so a password set before binding or while offline survives and is
+// pushed to the relay once the device binds or reconnects.
+func (s *RelayStore) SaveAccessPassword(accessPassword string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	pw := strings.TrimSpace(accessPassword)
+	cfg.AccessPassword = pw
+	if cfg.Credentials != nil {
+		cfg.Credentials.AccessPassword = pw
+	}
+	return s.writeLocked(cfg)
+}
+
 func (s *RelayStore) Load() (Credentials, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -256,12 +294,19 @@ func (s *RelayStore) Load() (Credentials, error) {
 	var creds Credentials
 	if cfg.Credentials != nil {
 		creds.Relay = RelayCredentials{
-			DeviceToken:    cfg.Credentials.DeviceToken,
-			NodeID:         cfg.Credentials.NodeID,
-			Endpoint:       cfg.Credentials.Endpoint,
-			AccessPassword: cfg.Credentials.AccessPassword,
+			DeviceToken: cfg.Credentials.DeviceToken,
+			NodeID:      cfg.Credentials.NodeID,
+			Endpoint:    cfg.Credentials.Endpoint,
 		}
 	}
+	// The top-level access password is the single source of truth so a password
+	// saved before binding survives the bind. Older files kept it inside the
+	// credentials block; fall back to that during migration.
+	pw := strings.TrimSpace(cfg.AccessPassword)
+	if pw == "" && cfg.Credentials != nil {
+		pw = strings.TrimSpace(cfg.Credentials.AccessPassword)
+	}
+	creds.Relay.AccessPassword = pw
 	creds.Relay.NodeName = strings.TrimSpace(cfg.NodeName)
 	return creds, nil
 }

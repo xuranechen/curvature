@@ -226,14 +226,14 @@ func (m *Manager) statusLocked() Status {
 		return status
 	}
 	creds, err := m.service.store.Load()
+	if err == nil && strings.TrimSpace(creds.Relay.AccessPassword) != "" {
+		status.PasswordSet = true
+	}
 	if err == nil && creds.Relay.DeviceToken != "" && creds.Relay.Endpoint != "" {
 		status.Bound = true
 		status.NodeID = creds.Relay.NodeID
 		if nodeName := strings.TrimSpace(creds.Relay.NodeName); nodeName != "" {
 			status.NodeName = nodeName
-		}
-		if strings.TrimSpace(creds.Relay.AccessPassword) != "" {
-			status.PasswordSet = true
 		}
 		if status.RelayBaseURL == "" {
 			status.RelayBaseURL = endpointBaseURL(creds.Relay.Endpoint)
@@ -559,13 +559,12 @@ func (m *Manager) handlePermanentRelayError(err error) {
 		isPasswordError = dialErr.statusCode == 403 && dialErr.errorCode == "access_password_invalid"
 	}
 
+	creds, loadErr := m.service.store.Load()
 	if isPasswordError {
 		// Clear only the stored access password; keep device token and
 		// endpoint so the device can reconnect once the password is fixed.
-		creds, loadErr := m.service.store.Load()
 		if loadErr == nil && creds.Relay.AccessPassword != "" {
-			creds.Relay.AccessPassword = ""
-			if saveErr := m.service.store.Save(creds); saveErr != nil {
+			if saveErr := m.service.store.SaveAccessPassword(""); saveErr != nil {
 				log.Printf("[relay] clear access password failed: %v", saveErr)
 			}
 		}
@@ -667,19 +666,25 @@ func endpointBaseURL(endpoint string) string {
 	return strings.TrimSuffix(u.String(), "/")
 }
 
-// SetAccessPassword pushes the user-chosen access password to the relay for
-// this device's public node and persists it locally so status can echo whether
-// one is configured. An empty password clears it on the relay.
+// SetAccessPassword records the user-chosen access password for this device's
+// public node. The password may be set before the device is bound: it is merely
+// persisted locally then, and pushed to the relay once the device binds or
+// reconnects. When already bound, it is pushed to the relay immediately and
+// persisted locally. An empty password clears it on the relay.
 func (m *Manager) SetAccessPassword(ctx context.Context, password string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	password = strings.TrimSpace(password)
 
 	creds, err := m.service.store.Load()
 	if err != nil {
 		return err
 	}
 	if creds.Relay.DeviceToken == "" || creds.Relay.Endpoint == "" {
-		return errors.New("relay not bound")
+		// Not bound yet: persist locally; it is synced to the relay on bind
+		// and on every reconnect.
+		return m.service.store.SaveAccessPassword(password)
 	}
 	base := endpointBaseURL(creds.Relay.Endpoint)
 	if base == "" {
@@ -688,12 +693,12 @@ func (m *Manager) SetAccessPassword(ctx context.Context, password string) error 
 	if err := m.service.SetAccessPassword(ctx, base, creds.Relay.DeviceToken, password); err != nil {
 		return err
 	}
-	creds.Relay.AccessPassword = strings.TrimSpace(password)
-	if err := m.service.store.Save(creds); err != nil {
+	if err := m.service.store.SaveAccessPassword(password); err != nil {
 		return err
 	}
-	// If the session stopped (e.g. because the previous password failed on the
-	// relay), resume the connection now that the relay accepted the new one.
+	// If the session stopped (e.g. because the previous access password failed
+	// on the relay), resume the connection now that the relay accepted the new
+	// one. The sync-on-reconnect keeps both sides in agreement afterwards.
 	if m.cancel == nil && m.ctx != nil {
 		m.startLocked(m.ctx)
 	}

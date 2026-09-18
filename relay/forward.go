@@ -177,6 +177,12 @@ func passwordMatch(storedHash, candidate string) bool {
 	if err != nil || len(want) != sha256.Size {
 		return false
 	}
+	// Accept the SHA-256 hex digest directly (clients send this for non-ASCII
+	// passwords so HTTP headers stay ASCII-safe) or a raw password (legacy, and
+	// what visitors type on the node auth page), which is hashed on the fly.
+	if sum, err := hex.DecodeString(candidate); err == nil && len(sum) == sha256.Size {
+		return hmac.Equal(sum, want)
+	}
 	got := sha256.Sum256([]byte(candidate))
 	return hmac.Equal(got[:], want)
 }
