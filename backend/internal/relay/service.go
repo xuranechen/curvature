@@ -418,6 +418,37 @@ func (s *Service) UnbindNode(ctx context.Context, baseURL, deviceToken, nodeID s
 	return nil
 }
 
+// ProbeDevice checks whether the device is still registered on the relay. It
+// returns (true, nil) when the relay still knows this device, (false, nil) when
+// the device was deleted (node gone / token invalid), or an error for transient
+// transport failures. StartBinding uses this to detect a relay-side deletion
+// and fall back to a fresh bind flow instead of staying dead-bound.
+func (s *Service) ProbeDevice(ctx context.Context, baseURL, deviceToken, nodeID string) (bool, error) {
+	reqURL, err := buildDeviceURL(baseURL, nodeID)
+	if err != nil {
+		return false, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(deviceToken))
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound, http.StatusUnauthorized:
+		return false, nil
+	default:
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return false, fmt.Errorf("relay device probe failed: %s %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+}
+
 func buildAccessPasswordURL(baseURL string) (string, error) {
 	base, err := parseRelayBase(baseURL)
 	if err != nil {

@@ -78,7 +78,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == "/api/devices":
 		s.handleDevicesList(w, r)
 	case strings.HasPrefix(path, "/api/devices/"):
-		if r.Method == http.MethodDelete {
+		if r.Method == http.MethodGet {
+			s.handleDeviceGet(w, r)
+		} else if r.Method == http.MethodDelete {
 			s.handleDeviceDelete(w, r)
 		} else if r.Method == http.MethodPut && strings.HasSuffix(path, "/name") {
 			s.handleDeviceRename(w, r)
@@ -174,6 +176,36 @@ func (s *Server) handleDeviceDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respondJSON(w, http.StatusOK, map[string]any{"deleted": nodeID})
+}
+
+// handleDeviceGet reports whether the calling device is still registered on
+// the relay. It authenticates via the device's Bearer token so only the device
+// itself can probe its own registration; the status endpoint used for
+// re-binding on the client side relies on a 404 (node gone) to trigger a fresh
+// bind flow.
+func (s *Server) handleDeviceGet(w http.ResponseWriter, r *http.Request) {
+	nodeID := strings.TrimPrefix(r.URL.Path, "/api/devices/")
+	nodeID = strings.Trim(nodeID, "/")
+	if nodeID == "" {
+		writeJSONError(w, http.StatusBadRequest, "node_id_required")
+		return
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	token := strings.TrimPrefix(auth, "Bearer ")
+	if token == "" || token == auth {
+		writeJSONError(w, http.StatusUnauthorized, "device_token_required")
+		return
+	}
+	dev := s.store.getDeviceByNode(nodeID)
+	if dev == nil || dev.DeviceToken != token {
+		writeJSONError(w, http.StatusNotFound, "node_not_found")
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"node_id":   dev.NodeID,
+		"node_name": dev.NodeName,
+		"node_url":  s.binds.nodeURL(dev.NodeID),
+	})
 }
 
 // handleAccessPassword sets or clears the access password for the calling
