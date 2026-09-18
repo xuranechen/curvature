@@ -365,7 +365,31 @@ func resolveStaticDir() string {
 	}
 
 	if exe, err := os.Executable(); err == nil {
-		return resolveStaticDirFromExecutable(exe)
+		if dir := resolveStaticDirFromExecutable(exe); dir != "" {
+			return dir
+		}
+	}
+
+	// 源码运行（go run）时 os.Executable 指向临时构建目录，
+	// 回退到当前工作目录（仓库根）下的 web/dist 或 web。
+	if wd, err := os.Getwd(); err == nil {
+		return resolveStaticDirFromWorkingDir(wd)
+	}
+	return ""
+}
+
+func resolveStaticDirFromWorkingDir(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return ""
+	}
+	for _, candidate := range []string{
+		filepath.Join(dir, "web", "dist"),
+		filepath.Join(dir, "web"),
+	} {
+		if isFrontendStaticDir(candidate) {
+			return candidate
+		}
 	}
 	return ""
 }

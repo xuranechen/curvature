@@ -419,16 +419,48 @@ func ResolveConfigPath() (string, error) {
 
 func installedDefaultConfigPath() (string, error) {
 	exe, err := os.Executable()
+	if err == nil {
+		candidate := installedDefaultConfigPathFromExecutable(exe)
+		if isRegularFile(candidate) {
+			return candidate, nil
+		}
+	}
+
+	// 源码运行（go run）时 os.Executable 指向临时构建目录，
+	// 回退到当前工作目录（仓库根）下的 agents.json。
+	if wd, wdErr := os.Getwd(); wdErr == nil {
+		if candidate := installedDefaultConfigPathFromWorkingDir(wd); candidate != "" {
+			return candidate, nil
+		}
+	}
+
 	if err != nil {
 		return "", err
 	}
 	return installedDefaultConfigPathFromExecutable(exe), nil
 }
 
+func installedDefaultConfigPathFromWorkingDir(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return ""
+	}
+	candidate := filepath.Join(dir, "agents.json")
+	if isRegularFile(candidate) {
+		return candidate
+	}
+	return ""
+}
+
+func isRegularFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
 func installedDefaultConfigPathFromExecutable(exe string) string {
 	exeDir := filepath.Dir(exe)
 	candidate := filepath.Join(exeDir, "agents.json")
-	if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+	if isRegularFile(candidate) {
 		return candidate
 	}
 	return filepath.Join(filepath.Dir(exeDir), "share", "curvature", "agents.json")

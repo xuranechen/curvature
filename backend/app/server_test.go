@@ -70,6 +70,36 @@ func TestResolveStaticDirFromExecutableUsesBuiltWebDistWhenSourceWebIsPresent(t 
 	}
 }
 
+func TestResolveStaticDirFromWorkingDirPrefersBuiltWebDist(t *testing.T) {
+	root := t.TempDir()
+	builtWeb := filepath.Join(root, "web", "dist")
+	releaseWeb := filepath.Join(root, "web")
+	writeFrontendAssets(t, builtWeb)
+	writeFrontendAssets(t, releaseWeb)
+
+	got := resolveStaticDirFromWorkingDir(root)
+	if got != builtWeb {
+		t.Fatalf("resolveStaticDirFromWorkingDir() = %q, want %q", got, builtWeb)
+	}
+}
+
+func TestResolveStaticDirFromWorkingDirFallsBackToSourceWeb(t *testing.T) {
+	root := t.TempDir()
+	releaseWeb := filepath.Join(root, "web")
+	writeFrontendAssets(t, releaseWeb)
+
+	got := resolveStaticDirFromWorkingDir(root)
+	if got != releaseWeb {
+		t.Fatalf("resolveStaticDirFromWorkingDir() = %q, want %q", got, releaseWeb)
+	}
+}
+
+func TestResolveStaticDirFromWorkingDirEmptyWhenAssetsMissing(t *testing.T) {
+	if got := resolveStaticDirFromWorkingDir(t.TempDir()); got != "" {
+		t.Fatalf("resolveStaticDirFromWorkingDir() = %q, want empty", got)
+	}
+}
+
 func TestAutoAddExternalProjectRootsSkipsGitWorktrees(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found")

@@ -620,6 +620,25 @@ func TestInstalledDefaultConfigPathFallsBackToInstalledLayout(t *testing.T) {
 	}
 }
 
+func TestInstalledDefaultConfigPathFromWorkingDirPrefersAgentsJSON(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "agents.json")
+	if err := os.WriteFile(configPath, []byte(`{"agents":[{"name":"wd-agent","command":"wd-agent"}]}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	got := installedDefaultConfigPathFromWorkingDir(tempDir)
+	if got != configPath {
+		t.Fatalf("installedDefaultConfigPathFromWorkingDir() = %q, want %q", got, configPath)
+	}
+}
+
+func TestInstalledDefaultConfigPathFromWorkingDirEmptyWhenMissing(t *testing.T) {
+	if got := installedDefaultConfigPathFromWorkingDir(t.TempDir()); got != "" {
+		t.Fatalf("installedDefaultConfigPathFromWorkingDir() = %q, want empty", got)
+	}
+}
+
 func TestLoadConfigPrefersAgentsConfigEnv(t *testing.T) {
 	tempDir := t.TempDir()
 	configPath := filepath.Join(tempDir, "agents.json")
