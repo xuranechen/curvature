@@ -100,3 +100,112 @@ export async function updateIdleSessionResourceReleasePreference(
     }),
   );
 }
+
+export type VersioningAutoCheckpointsPreference = {
+  enabled: boolean;
+};
+
+// Automatic checkpoints default to on, so only an explicit `false` from the
+// server means disabled. This mirrors the backend, which stores the preference
+// as a negated flag so an unset value reads as enabled.
+function normalizeVersioningAutoCheckpointsPreference(
+  value: unknown,
+): VersioningAutoCheckpointsPreference {
+  const input = value && typeof value === "object"
+    ? value as Partial<VersioningAutoCheckpointsPreference>
+    : {};
+  return { enabled: input.enabled !== false };
+}
+
+export async function fetchVersioningAutoCheckpointsPreference(): Promise<VersioningAutoCheckpointsPreference> {
+  return normalizeVersioningAutoCheckpointsPreference(
+    await protectedJSON(appPath("/api/preferences/versioning-auto-checkpoints")),
+  );
+}
+
+export async function updateVersioningAutoCheckpointsPreference(
+  enabled: boolean,
+): Promise<VersioningAutoCheckpointsPreference> {
+  return normalizeVersioningAutoCheckpointsPreference(
+    await protectedJSON(appPath("/api/preferences/versioning-auto-checkpoints"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    }),
+  );
+}
+
+// Agent autonomy is the opposite convention from the switch above: it defaults
+// to off, so an unset value must read as denied. Normalizing with `=== true` is
+// what enforces that; copying the `!== false` form here would silently hand
+// agents the right to rewrite the working tree.
+export type VersioningAgentAutonomyPreference = {
+  enabled: boolean;
+};
+
+function normalizeVersioningAgentAutonomyPreference(
+  value: unknown,
+): VersioningAgentAutonomyPreference {
+  const input = value && typeof value === "object"
+    ? value as Partial<VersioningAgentAutonomyPreference>
+    : {};
+  return { enabled: input.enabled === true };
+}
+
+export async function fetchVersioningAgentAutonomyPreference(): Promise<VersioningAgentAutonomyPreference> {
+  return normalizeVersioningAgentAutonomyPreference(
+    await protectedJSON(appPath("/api/preferences/versioning-agent-autonomy")),
+  );
+}
+
+export async function updateVersioningAgentAutonomyPreference(
+  enabled: boolean,
+): Promise<VersioningAgentAutonomyPreference> {
+  return normalizeVersioningAgentAutonomyPreference(
+    await protectedJSON(appPath("/api/preferences/versioning-agent-autonomy"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    }),
+  );
+}
+
+// Retention bounds the store, so the backend rejects a zero or negative count
+// and resolves an unset one to its own default. Anything the client cannot read
+// as a positive count therefore falls back to that same default rather than
+// disabling retention.
+export const DEFAULT_VERSIONING_CHECKPOINT_RETENTION = 200;
+
+export type VersioningCheckpointRetentionPreference = {
+  keep: number;
+};
+
+function normalizeVersioningCheckpointRetentionPreference(
+  value: unknown,
+): VersioningCheckpointRetentionPreference {
+  const input = value && typeof value === "object"
+    ? value as { keep?: unknown }
+    : {};
+  const keep = typeof input.keep === "number" && Number.isFinite(input.keep) && input.keep > 0
+    ? Math.floor(input.keep)
+    : DEFAULT_VERSIONING_CHECKPOINT_RETENTION;
+  return { keep };
+}
+
+export async function fetchVersioningCheckpointRetentionPreference(): Promise<VersioningCheckpointRetentionPreference> {
+  return normalizeVersioningCheckpointRetentionPreference(
+    await protectedJSON(appPath("/api/preferences/versioning-checkpoint-retention")),
+  );
+}
+
+export async function updateVersioningCheckpointRetentionPreference(
+  keep: number,
+): Promise<VersioningCheckpointRetentionPreference> {
+  return normalizeVersioningCheckpointRetentionPreference(
+    await protectedJSON(appPath("/api/preferences/versioning-checkpoint-retention"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ keep }),
+    }),
+  );
+}

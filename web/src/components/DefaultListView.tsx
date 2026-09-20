@@ -12,7 +12,7 @@ import { useI18n, type MessageKey } from "../i18n";
 import { CompactUploadProgress } from "./CompactUploadProgress";
 
 type DirectorySortControlValue = DirectorySortMode | "inherit";
-export type MainContentViewMode = "task-kanban" | "file-browser";
+export type MainContentViewMode = "task-kanban" | "file-browser" | "time-machine" | "session";
 
 const sortLabelKeys: Partial<Record<DirectorySortControlValue, MessageKey>> = {
   "name-asc": "sort.nameAsc",
@@ -49,6 +49,10 @@ type DefaultListViewProps = {
   entries: FileEntry[];
   errorMessage?: string;
   topContent?: React.ReactNode;
+  // The four main-area view tabs, rendered inline at the head of this header so
+  // the directory listing has one toolbar rather than two stacked bars. App
+  // renders the standalone bar instead on every surface that is not this list.
+  viewTabs?: React.ReactNode;
   showHiddenFiles?: boolean;
   sortMode: DirectorySortMode;
   sortControlValue: DirectorySortControlValue;
@@ -419,6 +423,7 @@ export function DefaultListView({
   entries,
   errorMessage,
   topContent,
+  viewTabs,
   showHiddenFiles = false,
   sortMode,
   sortControlValue,
@@ -467,7 +472,12 @@ export function DefaultListView({
   const isRootView = !!root && (!!path ? path === root : true);
   const showTaskKanban = currentViewMode === "task-kanban";
   const showFileBrowser = currentViewMode === "file-browser";
-  const currentViewLabel = showTaskKanban ? t("directory.taskKanban") : t("directory.fileBrowser");
+  const showTimeMachine = currentViewMode === "time-machine";
+  const currentViewLabel = showTaskKanban
+    ? t("directory.taskKanban")
+    : showTimeMachine
+      ? t("directory.timeMachine")
+      : t("directory.fileBrowser");
   const sortLabel = (value: DirectorySortControlValue): string => {
     if (value === "inherit") return t("directory.followGlobal");
     const key = sortLabelKeys[value];
@@ -547,7 +557,7 @@ export function DefaultListView({
       <header
         style={{
           height: "36px",
-          padding: "0 3px 0 16px",
+          padding: "0 3px 0 8px",
           borderBottom: "1px solid var(--border-color)",
           display: "flex",
           alignItems: "center",
@@ -557,6 +567,18 @@ export function DefaultListView({
           flexShrink: 0,
         }}
       >
+        {viewTabs ? (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              flexShrink: 0,
+              marginRight: "10px",
+            }}
+          >
+            {viewTabs}
+          </div>
+        ) : null}
         <div
           style={{
             display: "flex",
@@ -817,6 +839,7 @@ export function DefaultListView({
                     {([
                       ["task-kanban", t("directory.taskKanban")],
                       ["file-browser", t("directory.fileBrowser")],
+                      ["time-machine", t("directory.timeMachine")],
                     ] as const).map(([mode, label]) => {
                       const active = currentViewMode === mode;
                       return (
@@ -1215,6 +1238,13 @@ export function DefaultListView({
       <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
         {showTaskKanban && topContent ? (
           <div style={{ padding: "8px 16px 24px" }}>{topContent}</div>
+        ) : null}
+        {showTimeMachine && topContent ? (
+          // The time machine panel fills the content area and scrolls its own
+          // panes, so it must not inherit the kanban's outer padding.
+          <div style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column" }}>
+            {topContent}
+          </div>
         ) : null}
         {showFileBrowser ? (
           <div style={{ padding: "24px 16px" }}>

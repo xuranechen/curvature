@@ -126,6 +126,7 @@ import {
 import { FileViewer } from "./components/FileViewer";
 import { GitDiffViewer } from "./components/GitDiffViewer";
 import { GitHistoryPanel } from "./components/GitHistoryPanel";
+import { TimeMachinePanel, type HistoricalFilePreview } from "./components/TimeMachinePanel";
 import { GitStatusPanel } from "./components/GitStatusPanel";
 import { SessionViewer } from "./components/SessionViewer";
 import { DefaultListView, type MainContentViewMode } from "./components/DefaultListView";
@@ -140,6 +141,8 @@ import { ToastContainer } from "./components/Toast";
 import { BottomSheet } from "./components/BottomSheet";
 import { ScheduledAgentTaskDialog } from "./components/ScheduledAgentTaskDialog";
 import { TaskTemplateDialog } from "./components/TaskTemplateDialog";
+import { VersioningSettingsDialog } from "./components/VersioningSettingsDialog";
+import { MainViewTabs } from "./components/MainViewTabs";
 import { OnboardingTour } from "./components/OnboardingTour";
 import { WorktreeBranchSelector } from "./components/WorktreeBranchSelector";
 import { NoWorktreeIcon } from "./components/NoWorktreeIcon";
@@ -1334,7 +1337,7 @@ type TaskCreateWorktreePreference = {
 };
 
 function isMainContentViewMode(value: unknown): value is MainContentViewMode {
-  return value === "task-kanban" || value === "file-browser";
+  return value === "task-kanban" || value === "file-browser" || value === "time-machine";
 }
 
 function loadMainContentViewByRoot(): Record<string, MainContentViewMode> {
@@ -1610,6 +1613,7 @@ export function App({ onGoHome }: AppProps) {
   const [isRightOpen, setIsRightOpen] = useState(
     () => window.innerWidth >= 768,
   );
+  const [versioningSettingsOpen, setVersioningSettingsOpen] = useState(false);
   const [onboardingOpen, setOnboardingOpen] = useState(false);
   const [onboardingMainContentViewRoot, setOnboardingMainContentViewRoot] =
     useState<string | null>(null);
@@ -2869,7 +2873,51 @@ export function App({ onGoHome }: AppProps) {
     setOnboardingMainContentViewRoot(null);
     setMainContentViewForRoot(rootID, mode);
     setDefaultMainContentView(mode);
-  }, [setMainContentViewForRoot]);
+    // mainViewPreferenceByRootRef is read in exactly one place — to answer "is
+    // the user looking at a session?" — so any non-session value is equivalent
+    // there. Keeping it in step with the tab is what stops that check from
+    // believing we never left the session view.
+    setMainViewPreferenceForRoot(rootID, mode === "session" ? "session" : "file");
+  }, [setMainContentViewForRoot, setMainViewPreferenceForRoot]);
+  // Anything that selects a session — a sidebar click, URL restore, or the
+  // auto-bind on load — should land on the session tab, because that is what
+  // makes the four tabs behave as one switcher. This is keyed on the session
+  // key rather than the session object so that streamed updates to the active
+  // session cannot yank the user back out of a tab they deliberately chose.
+  const selectedSessionTabKey = selectedSession
+    ? String(selectedSession.key || selectedSession.session_key || "")
+    : "";
+  useEffect(() => {
+    if (!selectedSessionTabKey) return;
+    const rootID = currentRootIdRef.current;
+    if (!rootID) return;
+    setMainContentViewForRoot(rootID, "session");
+    setMainViewPreferenceForRoot(rootID, "session");
+  }, [
+    selectedSessionTabKey,
+    setMainContentViewForRoot,
+    setMainViewPreferenceForRoot,
+  ]);
+  // Opening a file or a diff should show it, and showing either one is the file
+  // browser's job — so the tab follows the surface instead of every setFile and
+  // setGitDiff call site having to remember to switch tabs. Keyed on the file
+  // path so unrelated re-renders cannot yank the user out of a tab they chose.
+  const fileSurfaceKey = file
+    ? `file:${file.path || ""}`
+    : gitDiff
+      ? "git-diff"
+      : "";
+  useEffect(() => {
+    if (!fileSurfaceKey) return;
+    const rootID = currentRootIdRef.current;
+    if (!rootID) return;
+    setMainContentViewForRoot(rootID, "file-browser");
+    setMainViewPreferenceForRoot(rootID, "file");
+  }, [
+    fileSurfaceKey,
+    setMainContentViewForRoot,
+    setMainViewPreferenceForRoot,
+  ]);
   const currentDirectorySortMode = currentDirectorySortOverride || treeSortMode;
 
   const replaceURLState = useCallback((next: URLState) => {
@@ -5304,6 +5352,7 @@ export function App({ onGoHome }: AppProps) {
         buildDirectorySelectionKey(targetRoot, targetRoot, true),
       );
       setMainViewPreferenceForRoot(targetRoot, "session");
+      setMainContentViewForRoot(targetRoot, "session");
       const currentDrawer = drawerSessionByRootRef.current[targetRoot];
       const preservePending =
         currentDrawer?.key === key
@@ -5428,6 +5477,7 @@ export function App({ onGoHome }: AppProps) {
       restoreActiveSession,
       setDrawerOpenForRoot,
       setDrawerSessionForRoot,
+      setMainContentViewForRoot,
       setMainViewPreferenceForRoot,
       replaceURLState,
     ],
@@ -6849,6 +6899,9 @@ export function App({ onGoHome }: AppProps) {
       suppressedAutoBindSessionByRootRef.current[rootID] = previousBoundKey;
     }
     setMainViewPreferenceForRoot(rootID, "session");
+    if (rootID) {
+      setMainContentViewForRoot(rootID, "session");
+    }
     selectedSessionRef.current = null;
     currentSessionRef.current = null;
     interactionModeRef.current = "main";
@@ -6864,6 +6917,7 @@ export function App({ onGoHome }: AppProps) {
     setBoundSessionForRoot,
     setDrawerOpenForRoot,
     setDrawerSessionForRoot,
+    setMainContentViewForRoot,
     setMainViewPreferenceForRoot,
   ]);
 
@@ -10818,6 +10872,38 @@ export function App({ onGoHome }: AppProps) {
     );
   }, [actionBarSessionKey, currentRootId, queueVersion, rootSessionKey]);
 
+  // Lets the time machine render a historical revision with the same view
+  // plugins as the live file browser. The pipeline lives here rather than being
+  // duplicated into the panel, which keeps the monolith untouched structurally.
+  const renderHistoricalFile = useCallback(
+    (historical: HistoricalFilePreview) => {
+      if (!currentRootId) return null;
+      const input = {
+        ...buildMatchInputFromPath(historical.path, {}),
+        content: historical.content,
+        size: historical.size,
+        truncated: historical.truncated,
+      };
+      const plugin = pluginManagerRef.current.match(currentRootId, input);
+      if (!plugin) return null;
+      try {
+        const output = pluginManagerRef.current.run(plugin, input);
+        return (
+          <Renderer
+            key={`${currentRootId}:${historical.path}:${historical.revision}`}
+            tree={output.tree as any}
+            initialState={(output.data || {}) as Record<string, unknown>}
+            handlers={{}}
+          />
+        );
+      } catch {
+        // A failing plugin must degrade to plain text, not break the panel.
+        return null;
+      }
+    },
+    [currentRootId],
+  );
+
   const matchedPlugin = useMemo(() => {
     if (!currentRootId || !file) return null;
     const input = toPluginInput(file, pluginQuery);
@@ -13250,6 +13336,34 @@ export function App({ onGoHome }: AppProps) {
       )}
     </div>
   ) : null;
+  // The file browser owns the surfaces that replace the directory listing, so
+  // the active tab decides whether one of them can appear at all. Without this
+  // the open file won and the kanban and time machine tabs were unreachable
+  // while a file was open.
+  const showingFileBrowser = currentMainContentView === "file-browser";
+  // Which surface the main area shows when the active tab is not the session
+  // tab. This mirrors the dispatch below, which is deliberately left untouched
+  // because its branches rely on the type narrowing their own conditions give
+  // them. Keep the two in step when adding a surface.
+  const workspaceSurface: "plugin-trust" | "git-diff" | "plugin" | "file" | "directory" =
+    // A consent prompt is not the file browser's business and must never be
+    // hidden behind a tab the user did not ask for.
+    activePendingPluginTrust
+      ? "plugin-trust"
+      : !showingFileBrowser
+        ? "directory"
+        : gitDiff
+          ? "git-diff"
+          : file
+            ? pluginRender && pluginRender.output
+              ? "plugin"
+              : "file"
+            : "directory";
+  // The directory listing already has its own toolbar, so the tabs ride along in
+  // it and the main area shows one bar instead of two. Every other surface gets
+  // the standalone bar, which is what keeps the tabs reachable everywhere.
+  const tabsHostedByDefaultListView =
+    currentMainContentView !== "session" && workspaceSurface === "directory";
   if (activePendingPluginTrust) {
     workspaceView = (
       <div
@@ -13351,7 +13465,7 @@ export function App({ onGoHome }: AppProps) {
         </section>
       </div>
     );
-  } else if (gitDiff) {
+  } else if (gitDiff && showingFileBrowser) {
     workspaceView = (
       <GitDiffViewer
         diff={gitDiff}
@@ -13364,7 +13478,7 @@ export function App({ onGoHome }: AppProps) {
         onSelectionChange={handleViewerSelectionChange}
       />
     );
-  } else if (file) {
+  } else if (file && showingFileBrowser) {
     if (pluginRender && pluginRender.output) {
       workspaceView = (
         <div
@@ -13538,9 +13652,30 @@ export function App({ onGoHome }: AppProps) {
       <DefaultListView
         root={currentRootId || undefined}
         path={selectedDir || ""}
+        viewTabs={
+          <MainViewTabs
+            value={currentMainContentView}
+            onChange={handleMainContentViewChange}
+            variant="inline"
+          />
+        }
         entries={currentMainContentView === "file-browser" ? visibleMainEntries : []}
         errorMessage={currentMainContentView === "file-browser" ? mainDirectoryError : ""}
-        topContent={currentMainContentView === "task-kanban" ? kanbanTaskPanel : null}
+        topContent={
+          currentMainContentView === "task-kanban" ? (
+            kanbanTaskPanel
+          ) : currentMainContentView === "time-machine" && currentRootId ? (
+            <TimeMachinePanel
+              rootId={currentRootId}
+              rootName={currentRootId}
+              onOpenSettings={() => setVersioningSettingsOpen(true)}
+              onWorkingTreeChanged={() => {
+                void refreshTreeDir(currentRootId, selectedDirRef.current || ".", true);
+              }}
+              renderHistoricalFile={renderHistoricalFile}
+            />
+          ) : null
+        }
         showHiddenFiles={showHiddenFiles}
         sortMode={currentDirectorySortMode}
         sortControlValue={currentDirectorySortOverride || "inherit"}
@@ -14069,6 +14204,7 @@ export function App({ onGoHome }: AppProps) {
             selectedDirKey={selectedDirKey}
             selectedPath={file?.path}
             rootId={currentRootId}
+            onOpenVersioningSettings={() => setVersioningSettingsOpen(true)}
             rootSessionIndicators={rootSessionIndicators}
             creatingRootName={
               creatingRootKind === "worktree" ? null : creatingRootName
@@ -14160,6 +14296,12 @@ export function App({ onGoHome }: AppProps) {
               position: "relative",
             }}
           >
+            {tabsHostedByDefaultListView ? null : (
+              <MainViewTabs
+                value={currentMainContentView}
+                onChange={handleMainContentViewChange}
+              />
+            )}
             <div
               style={{
                 flex: 1,
@@ -14170,27 +14312,48 @@ export function App({ onGoHome }: AppProps) {
                 flexDirection: "column",
               }}
             >
-              <div
-                style={{
-                  display: selectedSession ? "flex" : "none",
-                  flex: 1,
-                  minHeight: 0,
-                  minWidth: 0,
-                }}
-              >
-                {sessionView}
-              </div>
-              <div
-                style={{
-                  display: selectedSession ? "none" : "flex",
-                  flex: 1,
-                  minHeight: 0,
-                  minWidth: 0,
-                  flexDirection: "column",
-                }}
-              >
-                {workspaceView}
-              </div>
+              {currentMainContentView === "session" ? (
+                selectedSession ? (
+                  <div
+                    style={{
+                      display: "flex",
+                      flex: 1,
+                      minHeight: 0,
+                      minWidth: 0,
+                    }}
+                  >
+                    {sessionView}
+                  </div>
+                ) : (
+                  <div
+                    style={{
+                      flex: 1,
+                      minHeight: 0,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      padding: "24px",
+                      color: "var(--text-secondary)",
+                      fontSize: "12px",
+                      textAlign: "center",
+                    }}
+                  >
+                    {t("mainViewTabs.selectSession")}
+                  </div>
+                )
+              ) : (
+                <div
+                  style={{
+                    display: "flex",
+                    flex: 1,
+                    minHeight: 0,
+                    minWidth: 0,
+                    flexDirection: "column",
+                  }}
+                >
+                  {workspaceView}
+                </div>
+              )}
             </div>
           </div>
         }
@@ -15221,6 +15384,10 @@ export function App({ onGoHome }: AppProps) {
         template={taskTemplateDialogTemplate}
         onClose={() => setTaskTemplateDialogOpen(false)}
         onSaved={handleTaskTemplateSaved}
+      />
+      <VersioningSettingsDialog
+        open={versioningSettingsOpen}
+        onClose={() => setVersioningSettingsOpen(false)}
       />
       <ToastContainer />
     </>

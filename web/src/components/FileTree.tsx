@@ -169,6 +169,7 @@ type FileTreeProps = {
   onRestartAgent?: (agentName: string) => void | Promise<void>;
   onGoHome?: () => void;
   footerTopContent?: React.ReactNode;
+  onOpenVersioningSettings?: () => void;
 };
 
 type AgentConfigFlow = "backup" | "switch";
@@ -1360,6 +1361,7 @@ export function FileTree({
   onRestartAgent,
   onGoHome,
   footerTopContent,
+  onOpenVersioningSettings,
 }: FileTreeProps) {
   const { locale, setLocale, t } = useI18n();
   const sortLabel = React.useCallback((mode: DirectorySortMode): string => {
@@ -3061,6 +3063,15 @@ export function FileTree({
                 <span style={{ color: "var(--text-secondary)", fontSize: "11px" }}>
                   {t(newProjectMetaLocation === "home" ? "fileTree.metaLocationHome" : "fileTree.metaLocationProject")}
                 </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onOpenVersioningSettings?.()}
+                title={t("fileTree.versioningSettings")}
+                style={{ ...fileTreeMenuButtonStyle, justifyContent: "space-between" }}
+              >
+                <span>{t("fileTree.versioningSettings")}</span>
+                <span style={{ color: "var(--text-secondary)", fontSize: "11px" }}>›</span>
               </button>
               <button
                 type="button"
