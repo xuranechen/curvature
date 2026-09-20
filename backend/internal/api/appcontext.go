@@ -28,6 +28,7 @@ import (
 	"curvature/backend/internal/scheduled"
 	"curvature/backend/internal/session"
 	"curvature/backend/internal/update"
+	"curvature/backend/internal/versioning"
 	"curvature/backend/internal/webpush"
 )
 
@@ -50,6 +51,10 @@ type AppContext struct {
 	Prefs     *preferences.Store
 	Scheduled *scheduled.Service
 	Kanban    *kanban.Service
+
+	// AutoCheckpoints coalesces working-tree activity into automatic
+	// checkpoints. Nil disables the feature.
+	AutoCheckpoints *versioning.AutoScheduler
 
 	mu                       sync.RWMutex
 	sessionWorktreeMu        sync.Mutex

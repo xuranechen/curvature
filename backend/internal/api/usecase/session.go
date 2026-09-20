@@ -2357,6 +2357,10 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	}
 	flushThought()
 	claudeSubagents.FinishAll()
+	// The agent has stopped writing files by now, regardless of how the turn is
+	// eventually reported. Recording the activity here means a turn that fails
+	// during persistence still leaves an automatic checkpoint behind.
+	notifyVersioningAutoCheckpoint(s.Registry, in.RootID, current.Key)
 	if sendErr != nil && !isCanceledTurnError(sendErr) {
 		log.Printf("[session] turn.send.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, sendErr)
 	}
@@ -3293,11 +3297,18 @@ func stopCommandProcess(proc commandexec.Process) {
 	if proc == nil {
 		return
 	}
+	// Ask politely first: a shell that handles Ctrl-C can clean up after itself.
 	_ = proc.Interrupt()
 	time.Sleep(2 * time.Second)
-	_ = proc.Terminate()
-	time.Sleep(3 * time.Second)
+	// Then destroy the whole tree, while the parent is still alive. The tree is
+	// discovered through the parent, so running this after Terminate could only
+	// ever find a recycled id — which on Windows meant `taskkill /T /F` could
+	// take down the gateway alongside the command.
 	_ = proc.KillTree()
+	// Terminate is the backstop for a tree kill that failed. It addresses a
+	// handle (Windows) or a process group (unix), never a bare pid, so it stays
+	// safe on an already-exited process.
+	_ = proc.Terminate()
 }
 
 func configuredShells(registry Registry) []commandexec.ShellSpec {

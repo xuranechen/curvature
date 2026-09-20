@@ -313,6 +313,12 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Post("/api/agents/release-idle", h.protectedEndpoint(h.handleAgentIdleRelease))
 	r.Get("/api/preferences/new-project-meta-location", h.protectedEndpoint(h.handleNewProjectMetaLocationPreferenceGet))
 	r.Put("/api/preferences/new-project-meta-location", h.protectedEndpoint(h.handleNewProjectMetaLocationPreferencePut))
+	r.Get("/api/preferences/versioning-auto-checkpoints", h.protectedEndpoint(h.handleVersioningAutoCheckpointsPreferenceGet))
+	r.Put("/api/preferences/versioning-auto-checkpoints", h.protectedEndpoint(h.handleVersioningAutoCheckpointsPreferencePut))
+	r.Get("/api/preferences/versioning-checkpoint-retention", h.protectedEndpoint(h.handleVersioningCheckpointRetentionPreferenceGet))
+	r.Put("/api/preferences/versioning-checkpoint-retention", h.protectedEndpoint(h.handleVersioningCheckpointRetentionPreferencePut))
+	r.Get("/api/preferences/versioning-agent-autonomy", h.protectedEndpoint(h.handleVersioningAgentAutonomyPreferenceGet))
+	r.Put("/api/preferences/versioning-agent-autonomy", h.protectedEndpoint(h.handleVersioningAgentAutonomyPreferencePut))
 	r.Get("/api/replying-sessions", h.protectedEndpoint(h.handleReplyingSessions))
 	r.Get("/api/sessions/search", h.protectedEndpoint(h.handleSessionSearch))
 	r.Get("/api/sessions/children", h.protectedEndpoint(h.handleSessionChildren))
@@ -391,6 +397,29 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Post("/api/agent-api-providers/sync", h.protectedEndpoint(h.handleAgentAPIProvidersSync))
 	r.Delete("/api/agent-api-providers", h.protectedEndpoint(h.handleAgentAPIProviderDelete))
 	r.Post("/api/agent-api-providers/switch", h.protectedEndpoint(h.handleAgentAPIProviderSwitch))
+
+	// Local versioning, the "project time machine".
+	r.Get("/api/versioning/info", h.protectedEndpoint(h.handleVersioningInfo))
+	r.Get("/api/versioning/status", h.protectedEndpoint(h.handleVersioningStatus))
+	r.Post("/api/versioning/snapshots", h.protectedEndpoint(h.handleVersioningSnapshotCreate))
+	r.Get("/api/versioning/log", h.protectedEndpoint(h.handleVersioningLog))
+	r.Get("/api/versioning/changes", h.protectedEndpoint(h.handleVersioningChanges))
+	r.Get("/api/versioning/timeline", h.protectedEndpoint(h.handleVersioningTimeline))
+	r.Get("/api/versioning/file/diff", h.protectedEndpoint(h.handleVersioningFileDiff))
+	r.Get("/api/versioning/file", h.protectedEndpoint(h.handleVersioningFile))
+	r.Get("/api/versioning/tree", h.protectedEndpoint(h.handleVersioningTree))
+	r.Post("/api/versioning/restore", h.protectedEndpoint(h.handleVersioningRestore))
+	r.Get("/api/versioning/branches", h.protectedEndpoint(h.handleVersioningBranches))
+	r.Post("/api/versioning/branches", h.protectedEndpoint(h.handleVersioningBranchCreate))
+	r.Post("/api/versioning/checkout", h.protectedEndpoint(h.handleVersioningCheckout))
+	r.Get("/api/versioning/tags", h.protectedEndpoint(h.handleVersioningTags))
+	r.Post("/api/versioning/tags", h.protectedEndpoint(h.handleVersioningTagCreate))
+	r.Delete("/api/versioning/tags", h.protectedEndpoint(h.handleVersioningTagDelete))
+	r.Post("/api/versioning/gc", h.protectedEndpoint(h.handleVersioningGC))
+	r.Post("/api/versioning/checkpoints/prune", h.protectedEndpoint(h.handleVersioningCheckpointsPrune))
+	r.Get("/api/versioning/checkpoints", h.protectedEndpoint(h.handleVersioningCheckpoints))
+	r.Get("/api/versioning/verify", h.protectedEndpoint(h.handleVersioningVerify))
+
 	r.NotFound(h.handleNotFound)
 
 	return r
@@ -1270,6 +1299,112 @@ type idleSessionResourceReleasePreferenceRequest struct {
 
 type newProjectMetaLocationPreferenceRequest struct {
 	Location string `json:"location"`
+}
+
+// versioningAutoCheckpointsPreferenceRequest uses a pointer so that a body
+// omitting the field is rejected instead of silently meaning "off".
+type versioningAutoCheckpointsPreferenceRequest struct {
+	Enabled *bool `json:"enabled"`
+}
+
+// versioningCheckpointRetentionPreferenceRequest carries the retention count.
+type versioningCheckpointRetentionPreferenceRequest struct {
+	Keep *int `json:"keep"`
+}
+
+func (h *HTTPHandler) handleVersioningCheckpointRetentionPreferenceGet(w http.ResponseWriter, _ *http.Request) {
+	if h.AppContext == nil || h.AppContext.GetPreferences() == nil {
+		respondError(w, http.StatusServiceUnavailable, errInvalidRequest("preferences not configured"))
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"keep": h.AppContext.GetPreferences().VersioningCheckpointRetentionValue(),
+	})
+}
+
+func (h *HTTPHandler) handleVersioningCheckpointRetentionPreferencePut(w http.ResponseWriter, r *http.Request) {
+	if h.AppContext == nil || h.AppContext.GetPreferences() == nil {
+		respondError(w, http.StatusServiceUnavailable, errInvalidRequest("preferences not configured"))
+		return
+	}
+	var req versioningCheckpointRetentionPreferenceRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest(err.Error()))
+		return
+	}
+	if req.Keep == nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("keep is required"))
+		return
+	}
+	if err := h.AppContext.GetPreferences().UpdateVersioningCheckpointRetention(*req.Keep); err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest(err.Error()))
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"keep": *req.Keep})
+}
+
+func (h *HTTPHandler) handleVersioningAutoCheckpointsPreferenceGet(w http.ResponseWriter, _ *http.Request) {
+	if h.AppContext == nil || h.AppContext.GetPreferences() == nil {
+		respondError(w, http.StatusServiceUnavailable, errInvalidRequest("preferences not configured"))
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"enabled": h.AppContext.GetPreferences().VersioningAutoCheckpointsEnabled(),
+	})
+}
+
+func (h *HTTPHandler) handleVersioningAutoCheckpointsPreferencePut(w http.ResponseWriter, r *http.Request) {
+	if h.AppContext == nil || h.AppContext.GetPreferences() == nil {
+		respondError(w, http.StatusServiceUnavailable, errInvalidRequest("preferences not configured"))
+		return
+	}
+	var req versioningAutoCheckpointsPreferenceRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest(err.Error()))
+		return
+	}
+	if req.Enabled == nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("enabled is required"))
+		return
+	}
+	if err := h.AppContext.GetPreferences().UpdateVersioningAutoCheckpointsEnabled(*req.Enabled); err != nil {
+		respondError(w, http.StatusInternalServerError, errInvalidRequest(err.Error()))
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"enabled": *req.Enabled})
+}
+
+// handleVersioningAgentAutonomyPreferenceGet reports whether agents may rewrite
+// the working tree through restore and checkout.
+func (h *HTTPHandler) handleVersioningAgentAutonomyPreferenceGet(w http.ResponseWriter, _ *http.Request) {
+	if h.AppContext == nil || h.AppContext.GetPreferences() == nil {
+		respondError(w, http.StatusServiceUnavailable, errInvalidRequest("preferences not configured"))
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"enabled": h.AppContext.GetPreferences().VersioningAgentAutonomyEnabled(),
+	})
+}
+
+func (h *HTTPHandler) handleVersioningAgentAutonomyPreferencePut(w http.ResponseWriter, r *http.Request) {
+	if h.AppContext == nil || h.AppContext.GetPreferences() == nil {
+		respondError(w, http.StatusServiceUnavailable, errInvalidRequest("preferences not configured"))
+		return
+	}
+	var req versioningAutoCheckpointsPreferenceRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest(err.Error()))
+		return
+	}
+	if req.Enabled == nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("enabled is required"))
+		return
+	}
+	if err := h.AppContext.GetPreferences().UpdateVersioningAgentAutonomy(*req.Enabled); err != nil {
+		respondError(w, http.StatusInternalServerError, errInvalidRequest(err.Error()))
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"enabled": *req.Enabled})
 }
 
 func (h *HTTPHandler) handleNewProjectMetaLocationPreferenceGet(w http.ResponseWriter, _ *http.Request) {

@@ -117,6 +117,44 @@ func TestLongShellEnvOverridesHistoryFile(t *testing.T) {
 	}
 }
 
+// This package serves the user's integrated terminal, so it must never hand a
+// shell the agent marker -- not even one inherited from the server's own
+// environment, and not one a caller smuggled in through extra. Either would make
+// the versioning guardrail refuse the user's own CLI.
+func TestCommandEnvStripsAgentSessionMarker(t *testing.T) {
+	t.Setenv(agentSessionEnvKey, "inherited-from-server")
+	env := commandEnv([]string{agentSessionEnvKey + "=smuggled", "FOO=bar"})
+	if got := lastEnvValue(env, agentSessionEnvKey); got != "" {
+		t.Fatalf("%s = %q, want the marker stripped", agentSessionEnvKey, got)
+	}
+	if got := countEnvKey(env, agentSessionEnvKey); got != 0 {
+		t.Fatalf("found %d assignments of %s, want 0", got, agentSessionEnvKey)
+	}
+	if got := lastEnvValue(env, "FOO"); got != "bar" {
+		t.Fatalf("FOO = %q, want bar (the strip must not drop unrelated entries)", got)
+	}
+}
+
+// The long-lived shell is a separate spawn path, so it needs the strip too.
+func TestLongShellEnvStripsAgentSessionMarker(t *testing.T) {
+	t.Setenv(agentSessionEnvKey, "inherited-from-server")
+	env := longShellEnv(nil, "zsh")
+	if got := countEnvKey(env, agentSessionEnvKey); got != 0 {
+		t.Fatalf("found %d assignments of %s, want 0", got, agentSessionEnvKey)
+	}
+}
+
+func countEnvKey(env []string, key string) int {
+	prefix := key + "="
+	count := 0
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			count++
+		}
+	}
+	return count
+}
+
 func lastEnvValue(env []string, key string) string {
 	prefix := key + "="
 	value := ""

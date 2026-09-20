@@ -17,6 +17,14 @@ const preferencesFileName = "preferences.json"
 const DefaultIdleSessionResourceReleaseHours = 72
 const MaxIdleSessionResourceReleaseHours = 2_562_047
 
+// DefaultVersioningCheckpointRetention is how many automatic checkpoints are
+// kept before the oldest are pruned.
+const DefaultVersioningCheckpointRetention = 200
+
+// MaxVersioningCheckpointRetention bounds the preference so a typo cannot pin an
+// unbounded number of checkpoints.
+const MaxVersioningCheckpointRetention = 100_000
+
 type Store struct {
 	mu   sync.RWMutex
 	path string
@@ -28,6 +36,107 @@ type UserPreferences struct {
 	SessionNaming                   SessionNamingDefaults    `json:"session_naming,omitempty"`
 	IdleSessionResourceReleaseHours int                      `json:"idle_session_resource_release_hours,omitempty"`
 	NewProjectMetaLocation          string                   `json:"new_project_meta_location,omitempty"`
+	// VersioningAutoCheckpointsDisabled is stored as a negative flag so that an
+	// absent value means enabled: automatic checkpoints default to on.
+	VersioningAutoCheckpointsDisabled bool `json:"versioning_auto_checkpoints_disabled,omitempty"`
+	// VersioningCheckpointRetention is how many automatic checkpoints to keep.
+	// Zero means the default.
+	VersioningCheckpointRetention int `json:"versioning_checkpoint_retention,omitempty"`
+	// VersioningAgentAutonomyEnabled lets an agent rewrite the working tree
+	// through restore and checkout. Unlike the two fields above this one is a
+	// plain positive flag, because the default is *off*: agents may read history
+	// and take snapshots, but rolling the tree back stays a human decision until
+	// the user opts in.
+	VersioningAgentAutonomyEnabled bool `json:"versioning_agent_autonomy_enabled,omitempty"`
+}
+
+// VersioningAgentAutonomyEnabled reports whether agents may run restore and
+// checkout. The default is off, so an unset preference must read as disabled —
+// that is why this field is not negated.
+func (s *Store) VersioningAgentAutonomyEnabled() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.data.VersioningAgentAutonomyEnabled
+}
+
+// UpdateVersioningAgentAutonomy grants or revokes an agent's authority to
+// rewrite the working tree.
+func (s *Store) UpdateVersioningAgentAutonomy(enabled bool) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data.VersioningAgentAutonomyEnabled == enabled {
+		return nil
+	}
+	s.data.VersioningAgentAutonomyEnabled = enabled
+	return s.saveLocked()
+}
+
+// VersioningCheckpointRetentionValue reports how many automatic checkpoints to
+// retain, falling back to the default for an unset or out-of-range value.
+func (s *Store) VersioningCheckpointRetentionValue() int {
+	if s == nil {
+		return DefaultVersioningCheckpointRetention
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	value := s.data.VersioningCheckpointRetention
+	if value <= 0 || value > MaxVersioningCheckpointRetention {
+		return DefaultVersioningCheckpointRetention
+	}
+	return value
+}
+
+// UpdateVersioningCheckpointRetention sets how many automatic checkpoints to
+// keep. Retention is what bounds the store, so the value may not be zero: use
+// the prune action to drop every checkpoint explicitly.
+func (s *Store) UpdateVersioningCheckpointRetention(value int) error {
+	if s == nil {
+		return nil
+	}
+	if value <= 0 || value > MaxVersioningCheckpointRetention {
+		return errors.New("versioning checkpoint retention is out of range")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data.VersioningCheckpointRetention == value {
+		return nil
+	}
+	s.data.VersioningCheckpointRetention = value
+	return s.saveLocked()
+}
+
+// VersioningAutoCheckpointsEnabled reports whether automatic checkpoints are on.
+//
+// The default is on, so an unset preference must read as enabled. That is why
+// the stored field is negated rather than a plain "enabled" boolean.
+func (s *Store) VersioningAutoCheckpointsEnabled() bool {
+	if s == nil {
+		return true
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return !s.data.VersioningAutoCheckpointsDisabled
+}
+
+// UpdateVersioningAutoCheckpointsEnabled turns automatic checkpoints on or off.
+func (s *Store) UpdateVersioningAutoCheckpointsEnabled(enabled bool) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	disabled := !enabled
+	if s.data.VersioningAutoCheckpointsDisabled == disabled {
+		return nil
+	}
+	s.data.VersioningAutoCheckpointsDisabled = disabled
+	return s.saveLocked()
 }
 
 func (s *Store) NewProjectMetaLocation() string {
@@ -111,8 +220,20 @@ func NewStore() (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	return NewStoreAt(filepath.Join(configDir, preferencesFileName))
+}
+
+// NewStoreAt opens a preference store backed by an explicit file.
+//
+// It exists so callers outside this package (notably tests) can exercise
+// preference-driven behaviour without touching the real user configuration
+// directory.
+func NewStoreAt(path string) (*Store, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("preferences path is required")
+	}
 	store := &Store{
-		path: filepath.Join(configDir, preferencesFileName),
+		path: path,
 		data: UserPreferences{Agents: map[string]AgentDefaults{}},
 	}
 	if err := store.load(); err != nil {

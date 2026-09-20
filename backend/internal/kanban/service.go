@@ -26,6 +26,7 @@ type Service struct {
 	Templates *TemplateStore
 	Roots     RootProvider
 	Runner    Runner
+	Observer  TaskObserver
 
 	mu           sync.Mutex
 	stores       map[string]*TaskStore
@@ -46,6 +47,42 @@ func (s *Service) SetRunner(runner Runner) {
 	s.mu.Lock()
 	s.Runner = runner
 	s.mu.Unlock()
+}
+
+// SetObserver installs the terminal-state observer. Passing nil detaches it.
+func (s *Service) SetObserver(observer TaskObserver) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.Observer = observer
+	s.mu.Unlock()
+}
+
+// taskObserver returns the installed observer, if any.
+//
+// It reads without the mutex deliberately: the observer is installed once at
+// startup, and finishTask can be reached from scheduler paths that already hold
+// the lock, so locking here would risk a deadlock. This matches how Runner is
+// read elsewhere in this file.
+func (s *Service) taskObserver() TaskObserver {
+	if s == nil {
+		return nil
+	}
+	return s.Observer
+}
+
+// notifyTaskTerminal tells the observer that a task has finished.
+//
+// Both terminal paths report: finishTask for success and setTaskStatus for
+// failure and cancellation. A task can reach a terminal state either way, so a
+// hook in only one of them would silently miss whole categories of completion.
+func (s *Service) notifyTaskTerminal(rootID, taskID, status string) {
+	observer := s.taskObserver()
+	if observer == nil {
+		return
+	}
+	observer.ObserveTaskTerminal(rootID, taskID, status)
 }
 
 type CreateTaskInput struct {
@@ -1008,6 +1045,9 @@ func (s *Service) finishTask(ctx context.Context, store *TaskStore, task Task, s
 	if detail, err := store.GetDetail(ctx, task.ID); err == nil && s.Runner != nil {
 		s.Runner.TaskUpdated(task.RootID, detail)
 	}
+	// Reported after the status is durable, so an observer that records a
+	// checkpoint never sees a task that is not yet finished.
+	s.notifyTaskTerminal(task.RootID, task.ID, status)
 	return nil
 }
 
@@ -1159,6 +1199,7 @@ func (s *Service) setTaskStatus(ctx context.Context, rootID, taskID, status, eve
 	detail, err := store.GetDetail(ctx, taskID)
 	if err == nil && terminal {
 		s.Schedule(rootID)
+		s.notifyTaskTerminal(rootID, taskID, status)
 	}
 	return detail, err
 }

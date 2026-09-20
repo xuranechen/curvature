@@ -354,6 +354,20 @@ func resolveConfiguredShell(command string) string {
 	return ""
 }
 
+// agentSessionEnvKey is the marker an agent process sets for itself and, by
+// inheritance, every shell it spawns (see agent/acp.Start).
+//
+// This package serves the user's own integrated terminal, which is a human
+// terminal by definition, so the variable is stripped here instead of set. That
+// direction matters: the marker sits in os.Environ() whenever Curvature itself was
+// launched from inside an agent's shell, so without the strip every terminal the
+// user opened would look like an agent command and the guardrail would refuse the
+// user's own CLI.
+//
+// Either way it is a cooperative signal, not a sandbox -- see the
+// agentSessionHeader comment in backend/internal/api.
+const agentSessionEnvKey = "CURVATURE_AGENT_SESSION"
+
 func commandEnv(extra []string) []string {
 	env := os.Environ()
 	env = append(env,
@@ -364,5 +378,19 @@ func commandEnv(extra []string) []string {
 		"CLICOLOR_FORCE=1",
 	)
 	env = append(env, extra...)
-	return env
+	return withoutEnvKey(env, agentSessionEnvKey)
+}
+
+// withoutEnvKey drops every assignment of key, including any the caller passed in
+// extra, so nothing can smuggle an agent marker into the user's terminal.
+func withoutEnvKey(env []string, key string) []string {
+	prefix := key + "="
+	out := env[:0]
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
 }

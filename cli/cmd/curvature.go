@@ -66,6 +66,9 @@ func main() {
 		fmt.Fprintf(out, "  curvature -remove /path/to/project\n")
 		fmt.Fprintf(out, "  curvature <rootid> -task 12\n")
 		fmt.Fprintf(out, "  curvature <rootid> -task 12 -next\n")
+		fmt.Fprintf(out, "  curvature <rootid> -versioning status\n")
+		fmt.Fprintf(out, "  curvature <rootid> -versioning snapshot -message \"before refactor\"\n")
+		fmt.Fprintf(out, "  curvature <rootid> -versioning restore -rev <hash>\n")
 	}
 
 	addr := flag.String("addr", "127.0.0.1:7331", "listen address")
@@ -89,6 +92,13 @@ func main() {
 	taskNumber := flag.String("task", "", "task number for task stage control; defaults to status when set")
 	taskNext := flag.Bool("next", false, "advance task to next stage")
 	taskPrev := flag.Bool("prev", false, "move task to previous stage")
+	versioningAction := flag.String("versioning", "", "local version management action: info, status, log, snapshot, restore, branches, branch, checkout, gc, prune, verify")
+	versioningRev := flag.String("rev", "", "revision (commit hash, branch, or tag) for -versioning restore, or the base for -versioning branch")
+	versioningMessage := flag.String("message", "", "commit message for -versioning snapshot")
+	versioningMode := flag.String("mode", "", "restore mode for -versioning restore/checkout: revert (default) or overwrite")
+	versioningName := flag.String("name", "", "timeline name for -versioning branch and -versioning checkout")
+	versioningLimit := flag.Int("limit", 20, "entry limit for -versioning log")
+	versioningKeep := flag.Int("keep", -1, "automatic checkpoints to retain for -versioning prune; -1 uses the default")
 	tlsFlag := flag.Bool("tls", false, "enable HTTPS (auto-generates self-signed cert if -cert/-key not provided)")
 	certFlag := flag.String("cert", "", "TLS certificate file (PEM); auto-generated if empty with -tls")
 	keyFlag := flag.String("key", "", "TLS private key file (PEM); auto-generated if empty with -tls")
@@ -116,6 +126,26 @@ func main() {
 		}
 		action := taskCLIAction(*statusFlag, *taskNext, *taskPrev)
 		if err := handleTaskCommand(*addr, *tlsFlag, rootID, strings.TrimSpace(*taskNumber), action); err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+		return
+	}
+	if strings.TrimSpace(*versioningAction) != "" {
+		rootID := ""
+		if flag.NArg() > 0 {
+			rootID = flag.Arg(0)
+		}
+		if err := handleVersioningCommand(*addr, *tlsFlag, versioningCommandRequest{
+			Action:   strings.TrimSpace(*versioningAction),
+			RootID:   strings.TrimSpace(rootID),
+			Revision: strings.TrimSpace(*versioningRev),
+			Message:  strings.TrimSpace(*versioningMessage),
+			Mode:     strings.TrimSpace(*versioningMode),
+			Name:     strings.TrimSpace(*versioningName),
+			Limit:    *versioningLimit,
+			Keep:     *versioningKeep,
+		}); err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
@@ -861,13 +891,30 @@ func removeManagedDir(addr string, useTLS bool, path string) error {
 }
 
 func normalizeTaskRootFirstArgs(args []string) []string {
-	if len(args) < 2 || strings.HasPrefix(args[0], "-") || !containsTaskFlag(args[1:]) {
+	if len(args) < 2 || strings.HasPrefix(args[0], "-") || !containsRootFirstFlag(args[1:]) {
 		return args
 	}
 	out := make([]string, 0, len(args))
 	out = append(out, args[1:]...)
 	out = append(out, args[0])
 	return out
+}
+
+// containsRootFirstFlag reports whether args carry a flag that is written after
+// a positional root id. Go's flag package stops at the first positional
+// argument, so such a root has to be moved to the end before parsing.
+func containsRootFirstFlag(args []string) bool {
+	return containsTaskFlag(args) || containsVersioningFlag(args)
+}
+
+func containsVersioningFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "-versioning" || arg == "--versioning" ||
+			strings.HasPrefix(arg, "-versioning=") || strings.HasPrefix(arg, "--versioning=") {
+			return true
+		}
+	}
+	return false
 }
 
 func containsTaskFlag(args []string) bool {

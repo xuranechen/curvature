@@ -158,3 +158,11 @@ type Runner interface {
 	RunAgentStage(ctx context.Context, exec AgentStageExecution) error
 	TaskUpdated(rootID string, detail TaskDetail)
 }
+
+// TaskObserver is notified when a task reaches a terminal state.
+//
+// It is optional: the kanban service has no dependency on the versioning
+// subsystem, and wiring one in is the caller's choice.
+type TaskObserver interface {
+	ObserveTaskTerminal(rootID, taskID, status string)
+}

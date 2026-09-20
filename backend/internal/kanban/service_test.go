@@ -1380,6 +1380,78 @@ func containsAll(value string, parts []string) bool {
 	return true
 }
 
+// recordingObserver captures the terminal transitions it is told about. The
+// kanban service reports them synchronously, so no locking is needed.
+type recordingObserver struct {
+	calls []string
+}
+
+func (o *recordingObserver) ObserveTaskTerminal(rootID, taskID, status string) {
+	o.calls = append(o.calls, rootID+"/"+taskID+"/"+status)
+}
+
+// A terminal transition is the boundary an automatic checkpoint should record, so
+// the observer must fire exactly once per finished task and never for the
+// transitions that leave a task unfinished.
+func TestTaskObserverFiresOnlyOnTerminalTransitions(t *testing.T) {
+	ctx := context.Background()
+	root := fs.NewRootInfo("root", "root", t.TempDir())
+	store := NewTemplateStoreAt(t.TempDir())
+	svc := NewService(store, testRoots{root: root})
+	observer := &recordingObserver{}
+	svc.SetObserver(observer)
+
+	tmpl, err := store.SaveTaskTemplate(TaskTemplate{
+		Name: "Observed",
+		Stages: []TaskTemplateStage{{
+			Position: 0,
+			Snapshot: StageTemplate{Name: "Describe", Role: RoleUser, AutoAdvance: false},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("SaveTaskTemplate: %v", err)
+	}
+	detail, err := svc.CreateTask(ctx, CreateTaskInput{RootID: root.ID, TaskTemplateID: tmpl.ID, Input: "go"})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if len(observer.calls) != 0 {
+		t.Fatalf("creating a task reported %v, want nothing", observer.calls)
+	}
+
+	if _, err := svc.Complete(ctx, MoveInput{RootID: root.ID, TaskID: detail.Task.ID, Reason: "approved"}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if len(observer.calls) != 1 {
+		t.Fatalf("terminal transition reported %v, want exactly one", observer.calls)
+	}
+	if want := root.ID + "/" + detail.Task.ID + "/" + StatusSuccess; observer.calls[0] != want {
+		t.Fatalf("reported %q, want %q", observer.calls[0], want)
+	}
+
+	// Pausing leaves the task unfinished, so it must stay silent.
+	second, err := svc.CreateTask(ctx, CreateTaskInput{RootID: root.ID, TaskTemplateID: tmpl.ID, Input: "again"})
+	if err != nil {
+		t.Fatalf("CreateTask second: %v", err)
+	}
+	if _, err := svc.Pause(ctx, MoveInput{RootID: root.ID, TaskID: second.Task.ID}); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if len(observer.calls) != 1 {
+		t.Fatalf("pausing reported %v, want nothing", observer.calls)
+	}
+
+	// Cancelling is terminal, so it would report — unless the observer is
+	// detached, which is what makes turning the feature off possible.
+	svc.SetObserver(nil)
+	if _, err := svc.Cancel(ctx, MoveInput{RootID: root.ID, TaskID: second.Task.ID}); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if len(observer.calls) != 1 {
+		t.Fatalf("a detached observer still reported %v", observer.calls)
+	}
+}
+
 func TestMain(m *testing.M) {
 	time.Local = time.UTC
 	os.Exit(m.Run())

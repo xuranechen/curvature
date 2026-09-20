@@ -1028,18 +1028,42 @@ func isExpectedStreamCloseError(err error) bool {
 	return err == nil || errors.Is(err, os.ErrClosed) || errors.Is(err, io.ErrClosedPipe)
 }
 
+// agentSessionEnvKey marks an agent process and, by inheritance, every shell it
+// spawns, so the local CLI can tell an agent's shell from the user's own terminal.
+//
+// Curvature spawns the ACP agent, which makes this the one place that can set the
+// marker truthfully. commandexec serves the user's integrated terminal and strips
+// the variable instead, so the user's own CLI is never mistaken for an agent's.
+//
+// It is a cooperative signal, not a sandbox: an agent that unsets the variable, or
+// that reads the local CLI token and calls the API directly, bypasses the
+// guardrail entirely. See the agentSessionHeader comment in backend/internal/api.
+const agentSessionEnvKey = "CURVATURE_AGENT_SESSION"
+
 func configureProcessCommand(cmd *exec.Cmd, env map[string]string) {
 	if cmd == nil {
 		return
 	}
 	configurePlatformProcessCommand(cmd)
-	if len(env) == 0 {
-		return
+
+	// Rebuilt rather than appended: the inherited environment can already carry a
+	// marker (when Curvature itself was launched from inside an agent's shell), and
+	// with a duplicate key which value wins is platform-dependent.
+	prefix := agentSessionEnvKey + "="
+	built := make([]string, 0, len(env)+1)
+	for _, entry := range cmd.Environ() {
+		if !strings.HasPrefix(entry, prefix) {
+			built = append(built, entry)
+		}
 	}
-	cmd.Env = cmd.Environ()
 	for key, value := range env {
-		cmd.Env = append(cmd.Env, key+"="+value)
+		if key == agentSessionEnvKey {
+			// Replaced below, so a caller cannot supply its own value.
+			continue
+		}
+		built = append(built, key+"="+value)
 	}
+	cmd.Env = append(built, agentSessionEnvKey+"=1")
 }
 
 func (p *Process) wrapPromptError(sessionKey, sessionID string, err error) error {

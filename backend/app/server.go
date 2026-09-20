@@ -137,6 +137,10 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 	}
 	services.Kanban = kanban.NewService(taskTemplates, services)
 	services.Kanban.SetRunner(services)
+	// A finished task is a natural boundary between units of work, so it also
+	// triggers a checkpoint rather than waiting for the session to end.
+	services.Kanban.SetObserver(services)
+	services.StartVersioningAutoCheckpoints(ctx)
 	githubImportSvc, err := githubimport.NewService(services)
 	if err != nil {
 		return err
