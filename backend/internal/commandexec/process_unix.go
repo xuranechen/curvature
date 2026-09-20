@@ -154,6 +154,14 @@ func (p *platformProcess) KillTree() error {
 	if p == nil || p.cmd == nil || p.cmd.Process == nil {
 		return nil
 	}
+	// A process group id is recycled just like a pid, and signalling the group
+	// destroys every member, so confirm the group still exists immediately
+	// before signalling it rather than trusting an id the process may have
+	// already released. EPERM means it exists but is not ours to signal, which
+	// is not a reason to skip the attempt.
+	if err := syscall.Kill(-p.cmd.Process.Pid, 0); err == syscall.ESRCH {
+		return nil
+	}
 	return syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
 }
 

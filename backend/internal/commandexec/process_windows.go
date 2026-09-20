@@ -343,15 +343,43 @@ func (p *platformProcess) Terminate() error {
 	return windows.TerminateProcess(p.pi.Process, 1)
 }
 
+// taskkillCommand is the program used to destroy a process tree. It is a
+// variable so tests can observe whether a tree kill actually shelled out.
+var taskkillCommand = "taskkill"
+
 func (p *platformProcess) KillTree() error {
 	if p == nil || p.pi.ProcessId == 0 {
 		return nil
 	}
-	kill := exec.Command("taskkill", "/PID", strconv.FormatUint(uint64(p.pi.ProcessId), 10), "/T", "/F")
+	// Never address an exited process by PID. Windows recycles process ids, so
+	// once this process is gone its id can belong to anything — and
+	// `taskkill /T /F` destroys the whole tree, which in practice meant taking
+	// the gateway itself down. The callers that arm a watchdog check p.exited
+	// themselves, but the ones going through the Process interface cannot, so
+	// the guard belongs here.
+	if p.hasExited() {
+		return nil
+	}
+	kill := exec.Command(taskkillCommand, "/PID", strconv.FormatUint(uint64(p.pi.ProcessId), 10), "/T", "/F")
 	if err := kill.Run(); err == nil {
 		return nil
 	}
+	// The process may have exited while taskkill ran; re-check before falling
+	// back, because Terminate addresses the handle rather than the id.
+	if p.hasExited() {
+		return nil
+	}
 	return p.Terminate()
+}
+
+// hasExited reports whether the process is known to have exited.
+func (p *platformProcess) hasExited() bool {
+	select {
+	case <-p.exited:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *platformProcess) Wait() Result {
