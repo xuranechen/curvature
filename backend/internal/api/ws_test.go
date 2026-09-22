@@ -94,8 +94,24 @@ func TestAppendReplyEventBuildsCompositeCursor(t *testing.T) {
 		Data: agenttypes.MessageChunk{Content: "second"},
 	})
 
-	if first.EventCursor != "8:1" || second.EventCursor != "8:2" {
-		t.Fatalf("event cursors = %q, %q; want 8:1, 8:2", first.EventCursor, second.EventCursor)
+	// "turn:baseExchangeSeq:eventSeq" — the turn id makes the cursor unambiguous
+	// across turns of the same session.
+	if first.EventCursor != "1:8:1" || second.EventCursor != "1:8:2" {
+		t.Fatalf("event cursors = %q, %q; want 1:8:1, 1:8:2", first.EventCursor, second.EventCursor)
+	}
+
+	// A new turn must produce cursors that cannot be confused with the previous
+	// turn's, even when the base exchange seq is identical.
+	hub.SetPendingUserAt("root", "sess-1", "title", "codex", "", "", "", "", false, "again", time.Now(), 8)
+	next := hub.AppendReplyEvent("sess-1", StreamEvent{
+		Type: string(agenttypes.EventTypeMessageChunk),
+		Data: agenttypes.MessageChunk{Content: "third"},
+	})
+	if next.EventCursor == first.EventCursor || next.EventCursor == second.EventCursor {
+		t.Fatalf("new turn reused a previous turn's cursor: %q", next.EventCursor)
+	}
+	if next.EventCursor != "2:8:1" {
+		t.Fatalf("new turn cursor = %q, want 2:8:1", next.EventCursor)
 	}
 }
 
@@ -111,7 +127,7 @@ func TestReplayPendingStartsAfterCompositeCursor(t *testing.T) {
 	}
 
 	step := hub.collectReplayStep("client", "sess-1")
-	if len(step.events) != 1 || step.events[0].EventCursor != "8:3" {
+	if len(step.events) != 1 || step.events[0].EventCursor != "1:8:3" {
 		t.Fatalf("replayed events = %#v; want only cursor 8:3", step.events)
 	}
 }
@@ -138,8 +154,8 @@ func TestCoalescedToolStreamAdvancesCursor(t *testing.T) {
 	}
 
 	step := hub.collectReplayStep("client", "sess-1")
-	if len(step.events) != 1 || step.events[0].EventCursor != "4:2" {
-		t.Fatalf("replayed events = %#v; want coalesced cursor 4:2", step.events)
+	if len(step.events) != 1 || step.events[0].EventCursor != "1:4:2" {
+		t.Fatalf("replayed events = %#v; want coalesced cursor 1:4:2", step.events)
 	}
 	tool, ok := step.events[0].Data.(agenttypes.ToolCall)
 	if !ok || len(tool.Content) != 1 || tool.Content[0].Text != "hello world" {

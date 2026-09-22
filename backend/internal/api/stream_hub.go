@@ -28,6 +28,7 @@ type StreamHub struct {
 	pendingSessions map[string]*SessionPendingState
 	replayStates    map[string]*ClientReplayState
 	completed       map[string]*CompletedSessionState
+	nextTurnID      uint64
 }
 
 type PendingUserMessage struct {
@@ -57,8 +58,14 @@ type SessionPendingState struct {
 	ReplyingList    []StreamEvent
 	BaseExchangeSeq int
 	NextEventSeq    uint64
-	Summary         string
-	UpdatedAt       time.Time
+	// TurnID identifies this turn uniquely and for the lifetime of the process.
+	// BaseExchangeSeq alone is not enough: two consecutive turns can compute the
+	// same value when the previous turn's exchanges were not persisted yet (a
+	// queued message, or a resend after a reconnect), and a stale event cursor
+	// would then be mistaken for a cursor of the current turn.
+	TurnID    uint64
+	Summary   string
+	UpdatedAt time.Time
 }
 
 type ClientStreamStatus string
@@ -383,6 +390,7 @@ func (h *StreamHub) SetPendingUserAt(rootID, sessionKey, sessionTitle, agent, mo
 	if len(baseExchangeSeq) > 0 && baseExchangeSeq[0] > 0 {
 		state.BaseExchangeSeq = baseExchangeSeq[0]
 	}
+	h.assignTurnIDLocked(state)
 	state.NextEventSeq = 0
 	state.Summary = ""
 	state.UpdatedAt = state.User.Timestamp
@@ -588,9 +596,22 @@ func (h *StreamHub) SetPendingReply(rootID, sessionKey, sessionTitle string) {
 	state.RootID = rootID
 	state.SessionTitle = strings.TrimSpace(sessionTitle)
 	state.Active = true
+	// Sub-agent sessions start a turn here instead of via SetPendingUserAt, so
+	// they need their own turn identity too.
+	h.assignTurnIDLocked(state)
 	if state.UpdatedAt.IsZero() {
 		state.UpdatedAt = time.Now().UTC()
 	}
+}
+
+// assignTurnIDLocked stamps the session with a fresh turn identity. The caller
+// must hold h.mu.
+func (h *StreamHub) assignTurnIDLocked(state *SessionPendingState) {
+	if state == nil {
+		return
+	}
+	h.nextTurnID++
+	state.TurnID = h.nextTurnID
 }
 
 func (h *StreamHub) GetPendingUserExchange(sessionKey string) *session.Exchange {
@@ -622,8 +643,14 @@ func (h *StreamHub) AppendReplyEvent(sessionKey string, event StreamEvent) Strea
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	state := h.ensurePendingSessionLocked(sessionKey)
+	if state.TurnID == 0 {
+		// Defensive: a turn that started without an explicit turn-start call still
+		// needs a unique identity, otherwise its cursors could be confused with a
+		// later turn's.
+		h.assignTurnIDLocked(state)
+	}
 	state.NextEventSeq++
-	event.EventCursor = formatEventCursor(state.BaseExchangeSeq, state.NextEventSeq)
+	event.EventCursor = formatEventCursor(state.TurnID, state.BaseExchangeSeq, state.NextEventSeq)
 	if coalesceUserShellStreamEvent(state, event) {
 		state.UpdatedAt = time.Now().UTC()
 		return event
@@ -640,24 +667,49 @@ func (h *StreamHub) AppendReplyEvent(sessionKey string, event StreamEvent) Strea
 	return event
 }
 
-func formatEventCursor(baseExchangeSeq int, eventSeq uint64) string {
-	return fmt.Sprintf("%d:%d", baseExchangeSeq, eventSeq)
+// formatEventCursor encodes everything needed to place an event: the turn it
+// belongs to, the exchange seq that turn started from, and the event seq within
+// the turn. The turn id is what makes a cursor unambiguous across turns.
+func formatEventCursor(turnID uint64, baseExchangeSeq int, eventSeq uint64) string {
+	return fmt.Sprintf("%d:%d:%d", turnID, baseExchangeSeq, eventSeq)
 }
 
-func parseEventCursor(value string) (int, uint64, bool) {
+// parseEventCursor decodes a turn id, base exchange seq and event seq. Cursors
+// that do not carry a turn id (legacy two-part values) are rejected, which makes
+// the caller fall back to replaying the whole turn instead of trusting them.
+func parseEventCursor(value string) (uint64, int, uint64, bool) {
 	parts := strings.Split(strings.TrimSpace(value), ":")
-	if len(parts) != 2 {
-		return 0, 0, false
+	if len(parts) != 3 {
+		return 0, 0, 0, false
 	}
-	baseExchangeSeq, err := strconv.Atoi(parts[0])
+	turnID, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil || turnID == 0 {
+		return 0, 0, 0, false
+	}
+	baseExchangeSeq, err := strconv.Atoi(parts[1])
 	if err != nil || baseExchangeSeq < 0 {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
-	eventSeq, err := strconv.ParseUint(parts[1], 10, 64)
+	eventSeq, err := strconv.ParseUint(parts[2], 10, 64)
 	if err != nil {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
-	return baseExchangeSeq, eventSeq, true
+	return turnID, baseExchangeSeq, eventSeq, true
+}
+
+// resumeEventSeq decides how much of the buffered turn a reconnecting client has
+// already seen. It only trusts a cursor that belongs to the turn currently in the
+// buffer: a cursor from an earlier turn must never be read as "caught up", or the
+// client would silently miss the whole turn (the relay-reconnect incident).
+func resumeEventSeq(state *SessionPendingState, eventCursor string) uint64 {
+	if state == nil {
+		return 0
+	}
+	turnID, baseExchangeSeq, eventSeq, ok := parseEventCursor(eventCursor)
+	if !ok || turnID != state.TurnID || baseExchangeSeq != state.BaseExchangeSeq || eventSeq > state.NextEventSeq {
+		return 0
+	}
+	return eventSeq
 }
 
 func isAuxiliarySummaryBoundary(eventType string) bool {
@@ -749,13 +801,7 @@ func (h *StreamHub) ListReplyingSessions() []ReplyingSessionState {
 
 func (h *StreamHub) ReplayPending(rootID, clientID, sessionKey, eventCursor string) {
 	h.mu.Lock()
-	lastEventSeq := uint64(0)
-	if state := h.pendingSessions[sessionKey]; state != nil {
-		if baseExchangeSeq, parsedEventSeq, ok := parseEventCursor(eventCursor); ok &&
-			baseExchangeSeq == state.BaseExchangeSeq && parsedEventSeq <= state.NextEventSeq {
-			lastEventSeq = parsedEventSeq
-		}
-	}
+	lastEventSeq := resumeEventSeq(h.pendingSessions[sessionKey], eventCursor)
 	h.replayStates[pendingClientKey(clientID, sessionKey)] = &ClientReplayState{
 		Status:       ClientStreamStatusReplay,
 		LastEventSeq: lastEventSeq,
@@ -979,8 +1025,8 @@ func (h *StreamHub) nextReplayStepLocked(clientID, sessionKey string) replayStep
 	events := make([]StreamEvent, 0, len(state.ReplyingList))
 	maxEventSeq := replay.LastEventSeq
 	for _, event := range state.ReplyingList {
-		baseExchangeSeq, eventSeq, ok := parseEventCursor(event.EventCursor)
-		if !ok || baseExchangeSeq != state.BaseExchangeSeq || eventSeq <= replay.LastEventSeq {
+		turnID, baseExchangeSeq, eventSeq, ok := parseEventCursor(event.EventCursor)
+		if !ok || turnID != state.TurnID || baseExchangeSeq != state.BaseExchangeSeq || eventSeq <= replay.LastEventSeq {
 			continue
 		}
 		events = append(events, cloneEvent(event))
@@ -993,8 +1039,8 @@ func (h *StreamHub) nextReplayStepLocked(clientID, sessionKey string) replayStep
 		return replayStep{live: true}
 	}
 	sort.SliceStable(events, func(i, j int) bool {
-		_, left, _ := parseEventCursor(events[i].EventCursor)
-		_, right, _ := parseEventCursor(events[j].EventCursor)
+		_, _, left, _ := parseEventCursor(events[i].EventCursor)
+		_, _, right, _ := parseEventCursor(events[j].EventCursor)
 		return left < right
 	})
 	replay.LastEventSeq = maxEventSeq
