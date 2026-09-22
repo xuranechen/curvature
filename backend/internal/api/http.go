@@ -35,6 +35,7 @@ import (
 	"curvature/backend/internal/preferences"
 	"curvature/backend/internal/relay"
 	"curvature/backend/internal/session"
+	"curvature/backend/mcpaskuser"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -282,6 +283,10 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Get("/", h.handleFrontend)
 	r.Get("/health", h.handleHealth)
 	r.Get("/api/tree", h.protectedEndpoint(h.handleTree))
+	// The ask-user bridge is called by the MCP server process Curvature itself
+	// started for a session, so it authenticates with the local CLI token and
+	// bypasses the browser session proof.
+	r.Post(mcpaskuser.EndpointPath, h.handleMCPAskUser)
 	r.Get("/api/file", h.handleFile)
 	r.Get("/api/git/status", h.protectedEndpoint(h.handleGitStatus))
 	r.Get("/api/git/diff", h.protectedEndpoint(h.handleGitDiff))

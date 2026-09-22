@@ -425,6 +425,7 @@
       ],
       "command": "dsh",
       "protocol": "acp",
+      "mcpAskUser": true,
       "args": [
         "--profile", "curvature-acp"
       ],

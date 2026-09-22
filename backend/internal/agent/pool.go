@@ -3,8 +3,13 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"net"
+	"os"
+	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +18,7 @@ import (
 	"curvature/backend/internal/agent/claude"
 	"curvature/backend/internal/agent/codex"
 	agenttypes "curvature/backend/internal/agent/types"
+	"curvature/backend/mcpaskuser"
 )
 
 // Pool routes agent session creation to protocol-specific runtimes.
@@ -32,6 +38,204 @@ type Pool struct {
 	memoryMu        sync.RWMutex
 	memoryCollectMu sync.Mutex
 	memorySnapshot  MemorySnapshot
+	askUserMu       sync.RWMutex
+	askUserBridge   askUserBridge
+}
+
+// askUserBridge is the loopback endpoint of the ask-user MCP server Curvature
+// hands to agents that have no ask-user channel of their own.
+type askUserBridge struct {
+	endpoint   string
+	token      string
+	executable string
+	// verified records that the command answered the bridge self test. An
+	// unverified command is never attached: an agent that cannot start the MCP
+	// server it was given fails to open its session at all, so a bad command
+	// would break the agent instead of just losing the tool.
+	verified bool
+}
+
+// askUserBridgeConfig is the bridge value published at startup.
+func (b askUserBridge) configured() bool {
+	return b.verified && b.endpoint != "" && b.token != "" && b.executable != ""
+}
+
+const (
+	// EnvMCPAskUser controls the ask-user bridge from the environment. "0",
+	// "false", "off" or "no" disable it; any other non-empty value names the
+	// executable to launch (useful when the binary serving MCP is not the one
+	// running the backend).
+	EnvMCPAskUser = "CURVATURE_MCP_ASK_USER"
+	// askUserVerifyTimeout bounds the self test so a hung command can never
+	// stall startup.
+	askUserVerifyTimeout = 5 * time.Second
+)
+
+// verifyAskUserCommand checks that a command can actually serve the bridge. It
+// is a variable so tests can stub the process spawn.
+var verifyAskUserCommand = defaultVerifyAskUserCommand
+
+func defaultVerifyAskUserCommand(ctx context.Context, command string) error {
+	ctx, cancel := context.WithTimeout(ctx, askUserVerifyTimeout)
+	defer cancel()
+	probe := exec.CommandContext(ctx, command, "mcp-ask-user", "--selftest")
+	output, err := probe.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s mcp-ask-user --selftest: %w (%s)", command, err, strings.TrimSpace(string(output)))
+	}
+	if !strings.Contains(string(output), mcpaskuser.ServerName) {
+		return fmt.Errorf("%s does not answer the bridge self test: %s", command, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// MCPAskUserBridgeOptions configures the ask-user bridge. Command is the
+// executable the agent launches as its MCP server; empty means this process,
+// which is the normal case because the server is the same binary.
+type MCPAskUserBridgeOptions struct {
+	Addr    string
+	Token   string
+	Command string
+}
+
+// ConfigureMCPAskUserBridge publishes the endpoint agent sessions may call back
+// on. It must be called before the first session is opened; sessions opened
+// earlier simply do not get the tool.
+//
+// The command is self-tested here. If it cannot serve the bridge, the bridge is
+// left disabled and the reason is logged: handing an agent an MCP server that
+// does not speak the protocol makes session/new fail, which would stop that
+// agent from starting at all.
+func (p *Pool) ConfigureMCPAskUserBridge(opts MCPAskUserBridgeOptions) {
+	if p == nil {
+		return
+	}
+	bridge := askUserBridge{
+		token:    strings.TrimSpace(opts.Token),
+		endpoint: loopbackEndpoint(opts.Addr),
+	}
+	bridge.executable = resolveAskUserCommand(opts.Command)
+	if disabledByEnv() {
+		log.Printf("[mcp-ask-user] bridge disabled by %s", EnvMCPAskUser)
+		p.askUserMu.Lock()
+		p.askUserBridge = askUserBridge{}
+		p.askUserMu.Unlock()
+		return
+	}
+	if bridge.executable == "" {
+		log.Printf("[mcp-ask-user] bridge disabled: no executable to launch as the MCP server")
+		p.askUserMu.Lock()
+		p.askUserBridge = askUserBridge{}
+		p.askUserMu.Unlock()
+		return
+	}
+	if bridge.endpoint == "" || bridge.token == "" {
+		log.Printf("[mcp-ask-user] bridge disabled: incomplete endpoint configuration")
+		p.askUserMu.Lock()
+		p.askUserBridge = askUserBridge{}
+		p.askUserMu.Unlock()
+		return
+	}
+	if err := verifyAskUserCommand(context.Background(), bridge.executable); err != nil {
+		log.Printf("[mcp-ask-user] bridge disabled: %v", err)
+		p.askUserMu.Lock()
+		p.askUserBridge = askUserBridge{}
+		p.askUserMu.Unlock()
+		return
+	}
+	bridge.verified = true
+	log.Printf("[mcp-ask-user] bridge ready command=%s endpoint=%s", bridge.executable, bridge.endpoint)
+	p.askUserMu.Lock()
+	p.askUserBridge = bridge
+	p.askUserMu.Unlock()
+}
+
+// resolveAskUserCommand decides which executable serves MCP: an explicit
+// option, then the environment, then this process.
+func resolveAskUserCommand(configured string) string {
+	if trimmed := strings.TrimSpace(configured); trimmed != "" {
+		return trimmed
+	}
+	if fromEnv := strings.TrimSpace(os.Getenv(EnvMCPAskUser)); fromEnv != "" && !isDisabledValue(fromEnv) {
+		return fromEnv
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(executable)
+}
+
+func disabledByEnv() bool {
+	return isDisabledValue(os.Getenv(EnvMCPAskUser))
+}
+
+func isDisabledValue(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "0", "false", "off", "no", "disable", "disabled":
+		return true
+	}
+	return false
+}
+
+// askUserSpec builds the MCP server entry for one session, or nil when the
+// agent did not opt in or the bridge was never configured.
+func (p *Pool) askUserSpec(def Definition, in agenttypes.OpenSessionInput) []acp.MCPServerSpec {
+	if p == nil || !def.MCPAskUser {
+		return nil
+	}
+	// Internal sessions (title generation and similar) and probes have no human
+	// in them, so a question asked there could never be answered.
+	if in.Internal || in.Probe {
+		return nil
+	}
+	p.askUserMu.RLock()
+	bridge := p.askUserBridge
+	p.askUserMu.RUnlock()
+	if !bridge.configured() {
+		log.Printf("[mcp-ask-user] skipped session=%s agent=%s reason=bridge_not_ready", in.SessionKey, def.Name)
+		return nil
+	}
+	log.Printf("[mcp-ask-user] attach session=%s agent=%s command=%s", in.SessionKey, def.Name, bridge.executable)
+	return []acp.MCPServerSpec{{
+		Name:    mcpaskuser.ServerName,
+		Command: bridge.executable,
+		Args:    []string{"mcp-ask-user"},
+		Env: map[string]string{
+			mcpaskuser.EnvEndpoint: bridge.endpoint,
+			mcpaskuser.EnvToken:    bridge.token,
+			// in.SessionKey is the key the pool stores this session under, so the
+			// backend can resolve the bridge call with a verbatim pool lookup.
+			mcpaskuser.EnvSession: in.SessionKey,
+			mcpaskuser.EnvAgent:   in.AgentName,
+		},
+	}}
+}
+
+// loopbackEndpoint turns a listen address into the URL the bridge calls. It
+// fails closed: an address it cannot read a port from yields no endpoint, so the
+// agent simply does not get the tool instead of getting an unreachable one.
+func loopbackEndpoint(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		if !strings.HasPrefix(addr, ":") {
+			return ""
+		}
+		host, port = "", strings.TrimPrefix(addr, ":")
+	}
+	switch strings.TrimSpace(host) {
+	case "", "0.0.0.0", "::", "[::]":
+		host = "127.0.0.1"
+	}
+	port = strings.TrimSpace(port)
+	if _, err := strconv.Atoi(port); err != nil {
+		return ""
+	}
+	return "http://" + net.JoinHostPort(host, port)
 }
 
 type sessionEntry struct {
@@ -406,6 +610,7 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			Env:             cloneEnv(def.Env),
 			Cwd:             def.ResolveCwd(in.RootPath),
 			ResumeSessionID: in.AgentSessionID,
+			MCPServers:      p.askUserSpec(def, in),
 		})
 	}
 }
@@ -609,6 +814,20 @@ func (p *Pool) Get(sessionKey string) (agenttypes.Session, bool) {
 		return nil, false
 	}
 	return entry.session, true
+}
+
+// SessionKeys returns the keys of the sessions currently held by the pool,
+// sorted. It exists so lookups that fail (for example a bridge call naming an
+// unknown session) can report what the pool actually has.
+func (p *Pool) SessionKeys() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	keys := make([]string, 0, len(p.sessions))
+	for key := range p.sessions {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // Context returns the pool lifecycle context (read-only).

@@ -11,11 +11,18 @@ import (
 	"syscall"
 
 	"curvature/backend/app"
+	"curvature/backend/mcpaskuser"
 )
 
 var version = "dev"
 
 func main() {
+	// The agent launches this same binary as the ask-user MCP server for a
+	// session; that mode speaks MCP on stdio instead of serving HTTP.
+	if len(os.Args) > 1 && os.Args[1] == "mcp-ask-user" {
+		os.Exit(mcpaskuser.RunCLI(context.Background(), os.Args[2:]))
+	}
+
 	addr := flag.String("addr", "127.0.0.1:7331", "listen address")
 	noRelayer := flag.Bool("no-relayer", false, "disable relay integration")
 	webPushFlag := flag.Bool("web-push", true, "enable PWA Web Push notifications")

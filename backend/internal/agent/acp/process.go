@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,6 +47,39 @@ type Process struct {
 	commands      []acp.AvailableCommand
 	stderrHint    stderrHintState
 	activePrompt  activePromptState
+	// Sessions of this process advertise their own MCP servers; see
+	// mcpServerList. Nothing about that is stored on the process, because a
+	// process is shared by sessions that must not see each other's servers.
+}
+
+// MCPServerSpec describes an MCP server the client hands to the agent for a
+// session. The agent launches and connects to it itself, which is what makes a
+// client-supplied tool reachable no matter which protocol the agent speaks.
+type MCPServerSpec struct {
+	Name    string
+	Command string
+	Args    []string
+	Env     map[string]string
+}
+
+func (s MCPServerSpec) toSDK() acp.McpServer {
+	env := make([]acp.EnvVariable, 0, len(s.Env))
+	keys := make([]string, 0, len(s.Env))
+	for key := range s.Env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		env = append(env, acp.EnvVariable{Name: key, Value: s.Env[key]})
+	}
+	return acp.McpServer{
+		Stdio: &acp.McpServerStdio{
+			Name:    s.Name,
+			Command: s.Command,
+			Args:    append([]string{}, s.Args...),
+			Env:     env,
+		},
+	}
 }
 
 type CapabilitySnapshot struct {
@@ -533,8 +567,26 @@ func (p *Process) Initialize(ctx context.Context) error {
 	return nil
 }
 
+// mcpServerList converts the servers handed to one session into the wire shape.
+// The ACP schema wants a list, never nil.
+//
+// This is per session, not per process: a process is shared by every session of
+// an agent, and sessions differ (an internal title-generation session gets no
+// ask-user bridge), so process-wide state would leak one session's servers into
+// another's session/new.
+func mcpServerList(specs []MCPServerSpec) []acp.McpServer {
+	if len(specs) == 0 {
+		return []acp.McpServer{}
+	}
+	out := make([]acp.McpServer, 0, len(specs))
+	for _, spec := range specs {
+		out = append(out, spec.toSDK())
+	}
+	return out
+}
+
 // NewSession creates a new ACP session for the given Curvature session key.
-func (p *Process) NewSession(ctx context.Context, sessionKey, cwd string) error {
+func (p *Process) NewSession(ctx context.Context, sessionKey, cwd string, mcpServers []MCPServerSpec) error {
 	p.mu.Lock()
 	if _, ok := p.sessions[sessionKey]; ok {
 		p.mu.Unlock()
@@ -544,7 +596,7 @@ func (p *Process) NewSession(ctx context.Context, sessionKey, cwd string) error 
 
 	resp, err := p.conn.NewSession(ctx, acp.NewSessionRequest{
 		Cwd:        cwd,
-		McpServers: []acp.McpServer{},
+		McpServers: mcpServerList(mcpServers),
 	})
 	if err != nil {
 		return err
@@ -576,7 +628,7 @@ func (p *Process) NewSession(ctx context.Context, sessionKey, cwd string) error 
 	return nil
 }
 
-func (p *Process) ResumeSession(ctx context.Context, sessionKey, sessionID, cwd string) error {
+func (p *Process) ResumeSession(ctx context.Context, sessionKey, sessionID, cwd string, mcpServers []MCPServerSpec) error {
 	p.mu.Lock()
 	if _, ok := p.sessions[sessionKey]; ok {
 		p.mu.Unlock()
@@ -586,7 +638,7 @@ func (p *Process) ResumeSession(ctx context.Context, sessionKey, sessionID, cwd 
 
 	resp, err := p.conn.ResumeSession(ctx, acp.ResumeSessionRequest{
 		Cwd:        cwd,
-		McpServers: []acp.McpServer{},
+		McpServers: mcpServerList(mcpServers),
 		SessionId:  acp.SessionId(strings.TrimSpace(sessionID)),
 	})
 	if err != nil {

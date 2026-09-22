@@ -174,6 +174,9 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 		return err
 	}
 	httpHandler.LocalCLIToken = localCLIToken
+	// Agents that opt in get Curvature's own ask-user MCP server, which calls
+	// this backend back on the loopback address.
+	agentPool.ConfigureMCPAskUserBridge(agent.MCPAskUserBridgeOptions{Addr: addr, Token: localCLIToken})
 
 	relayMgr, err := relay.NewManager(addr, opts.NoRelayer, relayBaseURL, opts.UseTLS)
 	if err != nil {

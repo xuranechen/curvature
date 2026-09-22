@@ -24,9 +24,14 @@ import (
 	"time"
 
 	"curvature/backend/app"
+	"curvature/backend/mcpaskuser"
 )
 
 var version = "dev"
+
+// agentMCPAskUserCommand is the subcommand that turns this binary into the
+// stdio MCP server an agent session uses to ask the human a question.
+const agentMCPAskUserCommand = "mcp-ask-user"
 
 var errBrowserUnavailable = errors.New("browser auto-open unavailable")
 
@@ -38,6 +43,15 @@ const (
 )
 
 func main() {
+	// The agent launches this binary as its ask-user MCP server for a session.
+	// This must come first: with any other entry point the process would start
+	// serving HTTP instead of speaking MCP on stdio, and the agent's session/new
+	// would fail with "mcp-client(...): initial connection or tool
+	// synchronization failed", which stops the agent from starting at all.
+	if len(os.Args) > 1 && os.Args[1] == agentMCPAskUserCommand {
+		os.Exit(mcpaskuser.RunCLI(context.Background(), os.Args[2:]))
+	}
+
 	autoStartBoot := autoStartRequested(os.Args[1:])
 	if autoStartBoot {
 		if err := prepareAutoStartEnvironment(); err != nil {

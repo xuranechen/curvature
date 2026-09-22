@@ -1360,6 +1360,9 @@ func sessionNameRunner(ctx context.Context, pool *agent.Pool, rootAbs string, in
 		AgentName:  agentName,
 		Model:      strings.TrimSpace(in.Model),
 		RootPath:   tmpRoot,
+		// Title generation is an internal one-shot turn: no human is watching it,
+		// so it must not be given tools that ask the human a question.
+		Internal: true,
 	})
 	if err != nil {
 		return "", err

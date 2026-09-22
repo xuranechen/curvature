@@ -113,14 +113,18 @@ type TokenUsage struct {
 }
 
 type OpenSessionInput struct {
-	SessionKey            string
-	AgentName             string
-	Model                 string
-	Mode                  string
-	Effort                string
-	FastService           string
-	PlanMode              bool
-	Probe                 bool
+	SessionKey  string
+	AgentName   string
+	Model       string
+	Mode        string
+	Effort      string
+	FastService string
+	PlanMode    bool
+	Probe       bool
+	// Internal marks a session Curvature drives by itself (title generation and
+	// similar). No human is sitting in it, so the ask-user bridge is never
+	// attached: a question asked there could not be answered.
+	Internal              bool
 	RootPath              string
 	DeveloperInstructions string
 	AgentSessionID        string
@@ -365,6 +369,39 @@ type AskUserQuestionItem struct {
 type AskUserAnswer struct {
 	ToolUseID string            `json:"toolUseId"`
 	Answers   map[string]string `json:"answers"`
+}
+
+// MCPAskUserQuestion is a question that arrived over a model-visible tool call
+// (an MCP tool the client supplied), so it carries the tool's own question id
+// and the answer goes back to the model, not to the agent's native channel.
+type MCPAskUserQuestion struct {
+	ID          string                  `json:"id"`
+	Question    string                  `json:"question"`
+	Header      string                  `json:"header,omitempty"`
+	Options     []AskUserQuestionOption `json:"options,omitempty"`
+	MultiSelect bool                    `json:"multi_select,omitempty"`
+}
+
+type MCPAskUserRequest struct {
+	CallID    string               `json:"call_id,omitempty"`
+	Questions []MCPAskUserQuestion `json:"questions"`
+}
+
+type MCPAskUserAnswerItem struct {
+	ID       string   `json:"id"`
+	Selected []string `json:"selected,omitempty"`
+	Custom   string   `json:"custom,omitempty"`
+}
+
+type MCPAskUserAnswer struct {
+	Answers []MCPAskUserAnswerItem `json:"answers"`
+}
+
+// MCPAskUserSession is implemented by sessions that can turn an incoming MCP
+// ask-user tool call into a card and block until the human answers it. It is an
+// optional interface: only sessions that can host the bridge implement it.
+type MCPAskUserSession interface {
+	AskUserQuestion(ctx context.Context, req MCPAskUserRequest) (MCPAskUserAnswer, error)
 }
 
 type ToolKind string

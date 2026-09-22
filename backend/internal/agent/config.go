@@ -90,6 +90,11 @@ type Definition struct {
 	// CwdTemplate is the working directory template ({root} is replaced).
 	CwdTemplate string `json:"cwdTemplate,omitempty"`
 
+	// MCPAskUser attaches Curvature's ask-user MCP server to this agent's
+	// sessions, which lets the model ask the human through a tool call even when
+	// the agent has no ask-user channel of its own.
+	MCPAskUser bool `json:"mcpAskUser,omitempty"`
+
 	// ProbeArgs are arguments for availability check.
 	ProbeArgs []string `json:"probeArgs,omitempty"`
 }

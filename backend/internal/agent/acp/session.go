@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"curvature/backend/internal/agent/logs"
 	types "curvature/backend/internal/agent/types"
+	"curvature/backend/mcpaskuser"
 
 	acpsdk "github.com/coder/acp-go-sdk"
 )
@@ -27,6 +30,10 @@ type OpenOptions struct {
 	Env             map[string]string
 	Cwd             string
 	ResumeSessionID string
+	// MCPServers are handed to the agent for this session. The agent connects to
+	// them itself, so a client-supplied MCP server is a channel the agent can use
+	// without speaking any client-specific protocol (see the ask-user bridge).
+	MCPServers []MCPServerSpec
 }
 
 type Runtime struct {
@@ -55,11 +62,11 @@ func (r *Runtime) OpenSession(ctx context.Context, opts OpenOptions) (types.Sess
 	}
 
 	if strings.TrimSpace(opts.ResumeSessionID) != "" {
-		if err := proc.ResumeSession(ctx, opts.SessionKey, opts.ResumeSessionID, opts.Cwd); err != nil {
+		if err := proc.ResumeSession(ctx, opts.SessionKey, opts.ResumeSessionID, opts.Cwd, opts.MCPServers); err != nil {
 			return nil, err
 		}
 	} else {
-		if err := proc.NewSession(ctx, opts.SessionKey, opts.RootPath); err != nil {
+		if err := proc.NewSession(ctx, opts.SessionKey, opts.RootPath, opts.MCPServers); err != nil {
 			return nil, err
 		}
 	}
@@ -307,14 +314,140 @@ type session struct {
 	proc          *Process
 	sessionKey    string
 	agentDebugLog *logs.AgentLogger
+
+	emitMu sync.Mutex
+	emit   func(types.Event)
+
+	questionMu   sync.Mutex
+	questionSeq  uint64
+	questionWait map[string]*pendingAskUser
+}
+
+// pendingAskUser is one MCP-sourced question waiting for the human.
+type pendingAskUser struct {
+	questions []types.MCPAskUserQuestion
+	answers   chan map[string]string
 }
 
 func (s *session) SendMessage(ctx context.Context, content string) error {
 	return s.proc.SendMessage(ctx, s.sessionKey, content)
 }
 
-func (s *session) AnswerQuestion(context.Context, types.AskUserAnswer) error {
-	return errors.New("ask user question is not supported by acp sessions")
+// AnswerQuestion routes a card answer to the tool call that posed the question.
+// The question is claimed here, under the lock, so a second answer can never
+// race the waiter's cleanup and slip through.
+func (s *session) AnswerQuestion(ctx context.Context, answer types.AskUserAnswer) error {
+	callID := strings.TrimSpace(answer.ToolUseID)
+	if callID == "" {
+		return errors.New("toolUseId required")
+	}
+	if len(answer.Answers) == 0 {
+		return errors.New("answers required")
+	}
+	s.questionMu.Lock()
+	pending, ok := s.questionWait[callID]
+	if ok {
+		delete(s.questionWait, callID)
+	}
+	s.questionMu.Unlock()
+	if !ok {
+		return errors.New("question is not pending: " + callID)
+	}
+	select {
+	case pending.answers <- answer.Answers:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// AskUserQuestion turns an incoming tool call from the client-supplied ask-user
+// MCP server into the usual ask-user card and blocks until the human answers.
+// It is the ACP half of the MCP bridge: the agent has no way to ask on its own,
+// so the question arrives here as data and leaves as a tool result.
+func (s *session) AskUserQuestion(ctx context.Context, req types.MCPAskUserRequest) (types.MCPAskUserAnswer, error) {
+	if s == nil || s.proc == nil {
+		return types.MCPAskUserAnswer{}, errors.New("acp session not initialized")
+	}
+	if len(req.Questions) == 0 {
+		return types.MCPAskUserAnswer{}, errors.New("at least one question is required")
+	}
+
+	callID := s.questionCallID(req.CallID)
+	pending := &pendingAskUser{questions: req.Questions, answers: make(chan map[string]string, 1)}
+	s.questionMu.Lock()
+	if s.questionWait == nil {
+		s.questionWait = make(map[string]*pendingAskUser)
+	}
+	if _, exists := s.questionWait[callID]; exists {
+		s.questionMu.Unlock()
+		return types.MCPAskUserAnswer{}, errors.New("question is already pending: " + callID)
+	}
+	s.questionWait[callID] = pending
+	s.questionMu.Unlock()
+	defer func() {
+		s.questionMu.Lock()
+		delete(s.questionWait, callID)
+		s.questionMu.Unlock()
+	}()
+
+	card := mcpaskuser.Card(callID, req.Questions)
+	s.emitEvent(types.Event{Type: types.EventTypeToolCall, SessionID: s.SessionID(), Data: card})
+	log.Printf("[agent/acp] ask_user.card.emitted agent=%s session=%s call=%s questions=%d", s.proc.agentLabel(), s.sessionKey, callID, len(req.Questions))
+
+	select {
+	case answers := <-pending.answers:
+		answer, err := mcpaskuser.Answers(req.Questions, answers)
+		if err != nil {
+			s.finishCard(card, req.Questions, nil, err)
+			return types.MCPAskUserAnswer{}, err
+		}
+		s.finishCard(card, req.Questions, answers, nil)
+		return answer, nil
+	case <-ctx.Done():
+		s.finishCard(card, req.Questions, nil, ctx.Err())
+		return types.MCPAskUserAnswer{}, ctx.Err()
+	}
+}
+
+// finishCard closes the card so it stops looking answerable, and records the
+// answer for a reloaded session.
+func (s *session) finishCard(card types.ToolCall, questions []types.MCPAskUserQuestion, answers map[string]string, cause error) {
+	card.Status = "complete"
+	if card.Meta == nil {
+		card.Meta = map[string]any{}
+	}
+	if len(answers) > 0 {
+		card.Meta["answers"] = mcpaskuser.AnswerMeta(questions, answers)
+		card.Meta["answered"] = true
+	} else {
+		card.Meta["answered"] = false
+	}
+	if cause != nil {
+		card.Meta["error"] = cause.Error()
+	}
+	s.emitEvent(types.Event{Type: types.EventTypeToolUpdate, SessionID: s.SessionID(), Data: card})
+}
+
+func (s *session) questionCallID(raw string) string {
+	if trimmed := strings.TrimSpace(raw); trimmed != "" {
+		return "mcp-ask-user:" + trimmed
+	}
+	seq := atomic.AddUint64(&s.questionSeq, 1)
+	return "mcp-ask-user:" + strconv.FormatUint(seq, 10)
+}
+
+func (s *session) emitEvent(event types.Event) {
+	s.emitMu.Lock()
+	emit := s.emit
+	s.emitMu.Unlock()
+	if emit == nil {
+		// Without a handler the event has nowhere to go, which for an ask-user
+		// card means the question would hang unanswered until it times out.
+		log.Printf("[agent/acp] event.dropped agent=%s session=%s type=%s reason=no_update_handler", s.proc.agentLabel(), s.sessionKey, event.Type)
+		return
+	}
+	emit(event)
 }
 
 func (s *session) CurrentModel() string {
@@ -377,9 +510,17 @@ func (s *session) CancelCurrentTurn() error {
 }
 
 func (s *session) OnUpdate(onUpdate func(types.Event)) {
+	s.emitMu.Lock()
+	s.emit = onUpdate
+	s.emitMu.Unlock()
 	s.proc.SetOnUpdate(s.sessionKey, func(update SessionUpdate) {
 		s.logRawToolUpdate(update)
 		if update.Type == UpdateTypeUserMessage {
+			return
+		}
+		if isBridgedAskUserToolUpdate(update) {
+			// The question is already on screen as an ask-user card; showing the
+			// agent's raw tool row as well would duplicate it.
 			return
 		}
 		if onUpdate != nil {
@@ -405,6 +546,64 @@ func (s *session) SessionID() string {
 	return s.proc.SessionID(s.sessionKey)
 }
 
+// bridgedAskUserToolMarker identifies the tool from the MCP server Curvature
+// attaches for ask-user questions. Agents name MCP tools
+// "<server>__<tool>", so both parts must appear for the update to be ours.
+const (
+	bridgedAskUserServerMarker = "curvature-ask-user"
+	bridgedAskUserToolMarker   = "ask_user_question"
+)
+
+// isBridgedAskUserToolUpdate reports whether an agent tool-call update belongs to
+// the bridged ask_user_question tool, which the ask-user card already shows.
+func isBridgedAskUserToolUpdate(update SessionUpdate) bool {
+	if update.Type != UpdateTypeToolCall && update.Type != UpdateTypeToolUpdate {
+		return false
+	}
+	for _, name := range []string{
+		toolNameFromUpdate(update),
+		toolRawInputText(update),
+	} {
+		lower := strings.ToLower(strings.TrimSpace(name))
+		if strings.Contains(lower, bridgedAskUserServerMarker) && strings.Contains(lower, bridgedAskUserToolMarker) {
+			return true
+		}
+	}
+	return false
+}
+
+func toolNameFromUpdate(update SessionUpdate) string {
+	if update.Raw.ToolCall != nil {
+		return update.Raw.ToolCall.Title
+	}
+	if update.Raw.ToolCallUpdate != nil && update.Raw.ToolCallUpdate.Title != nil {
+		return *update.Raw.ToolCallUpdate.Title
+	}
+	return ""
+}
+
+// toolRawInputText renders the tool call's raw input, which some agents use to
+// carry the tool name when the title is empty.
+func toolRawInputText(update SessionUpdate) string {
+	var raw any
+	switch {
+	case update.Raw.ToolCall != nil:
+		raw = update.Raw.ToolCall.RawInput
+	case update.Raw.ToolCallUpdate != nil:
+		raw = update.Raw.ToolCallUpdate.RawInput
+	}
+	if raw == nil {
+		return ""
+	}
+	if text, ok := raw.(string); ok {
+		return text
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
 func (s *session) ContextWindow(_ context.Context) (types.ContextWindow, error) {
 	if s == nil || s.proc == nil {
 		return types.ContextWindow{}, errors.New("acp session not initialized")
