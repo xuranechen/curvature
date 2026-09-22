@@ -401,11 +401,8 @@ export const enUS = {
   "association.source": "Source: {name}",
   "association.viewSession": "View session",
   "association.noMatches": "No matching related files",
-  "session.jumpLatest": "Jump to latest message",
   "session.jumpBottom": "Jump to bottom",
   "session.userSummary": "User message summary",
-  "session.hideUserSummary": "Hide user message summary",
-  "session.showUserSummary": "Show user message summary",
 
   "scheduled.neverRun": "Never run",
   "scheduled.nameRequired": "Task name is required",

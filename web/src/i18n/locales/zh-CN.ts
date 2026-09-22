@@ -399,11 +399,8 @@ export const zhCN = {
   "association.source": "来源: {name}",
   "association.viewSession": "查看会话",
   "association.noMatches": "未找到匹配的关联文件",
-  "session.jumpLatest": "回到底部最新消息",
   "session.jumpBottom": "回到底部",
   "session.userSummary": "用户消息摘要",
-  "session.hideUserSummary": "隐藏用户消息摘要",
-  "session.showUserSummary": "显示用户消息摘要",
 
   "scheduled.neverRun": "未执行",
   "scheduled.nameRequired": "任务名称不能为空",

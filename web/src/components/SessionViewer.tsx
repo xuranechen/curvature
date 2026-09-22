@@ -15,6 +15,7 @@ import { copyText } from "../services/clipboard";
 import type { AgentStatus } from "../services/agents";
 import { useI18n, type Locale } from "../i18n";
 import { formatSessionDuration } from "../services/sessionDuration";
+import { SessionTurnRail, type TurnRailItem } from "./SessionTurnRail";
 import {
   relatedFileStatKey,
   useRelatedFileStats,
@@ -1034,24 +1035,40 @@ function shouldDefaultCollapseRelatedFiles(
 }
 
 const USER_MESSAGE_SUMMARY_LENGTH = 48;
+const TURN_RESPONSE_SUMMARY_LENGTH = 120;
 
-function normalizeUserMessageSummary(content: string, emptyLabel: string): string {
+function normalizeUserMessageSummary(
+  content: string,
+  emptyLabel: string,
+  limit = USER_MESSAGE_SUMMARY_LENGTH,
+): string {
   const text = stripUploadAttachmentTokens(content || "")
     .replace(/\s+/g, " ")
     .trim();
   if (!text) {
     return emptyLabel;
   }
-  return text.length > USER_MESSAGE_SUMMARY_LENGTH
-    ? `${text.slice(0, USER_MESSAGE_SUMMARY_LENGTH)}...`
-    : text;
+  return text.length > limit ? `${text.slice(0, limit)}...` : text;
 }
 
-function UserMessageListIcon() {
+/** Chevron-down, the jump-to-bottom glyph the DSH web client uses. */
+function ChevronDownIcon() {
   return (
-    <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 32 32" aria-hidden="true">
-      <path d="M0 0h32v32H0z" fill="none" />
-      <path fill="currentColor" d="M4.082 4.083v3h22.835v-3zm0 16.223h22.835v-3H4.082zm0-6.612h22.835v-3H4.082zm0 13.223h22.835v-3H4.082z" />
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width="1em"
+      height="1em"
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+    >
+      <path
+        d="M3.6 5.9 8 10.3l4.4-4.4"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
     </svg>
   );
 }
@@ -1094,8 +1111,7 @@ function SessionViewerInner({
   const onFileClickRef = useRef(onFileClick);
   const copyResetTimersRef = useRef<Record<string, number>>({});
   const relatedFilesDefaultStateRef = useRef<string>("");
-  const userSummaryRootRef = useRef<HTMLDivElement | null>(null);
-  const userSummaryListRef = useRef<HTMLDivElement | null>(null);
+  const sessionAreaRef = useRef<HTMLDivElement | null>(null);
   const sessionKey = session?.key || session?.session_key || null;
   const exchanges = Array.isArray(session?.exchanges) ? session.exchanges : [];
   const isAwaiting = !!(session as any)?.pending;
@@ -1112,8 +1128,6 @@ function SessionViewerInner({
   const targetSeqFrameRef = useRef<number | null>(null);
   const targetSeqTimerRefs = useRef<number[]>([]);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
-  const [userSummaryHoverOpen, setUserSummaryHoverOpen] = useState(false);
-  const [userSummaryPinnedOpen, setUserSummaryPinnedOpen] = useState(false);
   const [currentUserMessageIndex, setCurrentUserMessageIndex] = useState(0);
   const viewportStickFrameRef = useRef<number | null>(null);
 
@@ -1157,8 +1171,6 @@ function SessionViewerInner({
   useEffect(() => {
     setSavedPromptKeys({});
     setCopiedMessageKeys({});
-    setUserSummaryHoverOpen(false);
-    setUserSummaryPinnedOpen(false);
     setCurrentUserMessageIndex(0);
     relatedFilesDefaultStateRef.current = "";
     Object.values(copyResetTimersRef.current).forEach((timer) =>
@@ -1167,18 +1179,46 @@ function SessionViewerInner({
     copyResetTimersRef.current = {};
   }, [sessionKey]);
 
-  const userMessageSummaries = useMemo(
-    () =>
-      timeline
-        .filter((item): item is TimelineItem & { type: "user_text"; id: string; content: string } => item.type === "user_text")
-        .map((item, index) => ({
-          id: item.id || `user-${index}`,
-          index: index + 1,
-          summary: normalizeUserMessageSummary(item.content || "", t("session.emptyMessage")),
-        })),
-    [timeline, t],
-  );
-  const userSummaryOpen = userSummaryHoverOpen || userSummaryPinnedOpen;
+  const turnRailItems = useMemo(() => {
+    const items: TurnRailItem[] = [];
+    timeline.forEach((item, idx) => {
+      if (item.type !== "user_text") {
+        return;
+      }
+      let response = "";
+      for (let next = idx + 1; next < timeline.length; next += 1) {
+        const candidate = timeline[next];
+        if (candidate.type === "user_text") {
+          break;
+        }
+        if (
+          candidate.type === "assistant_text" &&
+          (candidate.content || "").trim()
+        ) {
+          response = normalizeUserMessageSummary(
+            candidate.content || "",
+            "",
+            TURN_RESPONSE_SUMMARY_LENGTH,
+          );
+        }
+      }
+      items.push({
+        id: item.id || `user-${items.length}`,
+        index: items.length + 1,
+        prompt: normalizeUserMessageSummary(
+          item.content || "",
+          t("session.emptyMessage"),
+        ),
+        response,
+      });
+    });
+    return items;
+  }, [timeline, t]);
+
+  const turnRailBusyIndex =
+    (isStreaming || isAwaiting) && turnRailItems.length > 0
+      ? turnRailItems[turnRailItems.length - 1].index
+      : 0;
 
   const readCurrentUserMessageIndex = useCallback(() => {
     const container = scrollRef.current;
@@ -1259,45 +1299,18 @@ function SessionViewerInner({
     );
     container.scrollTop = nextTop;
     setShowJumpToLatest(nextTop < maxTop - 40);
-    setUserSummaryPinnedOpen(false);
-    setUserSummaryHoverOpen(false);
     setCurrentUserMessageIndex(index);
   };
 
+  // The rail is always on screen, so its active bar must be right even when a
+  // freshly loaded transcript never fires a scroll event.
   useEffect(() => {
-    if (!userSummaryOpen) {
+    if (turnRailItems.length === 0) {
       return;
     }
-    const nextIndex = readCurrentUserMessageIndex();
-    setCurrentUserMessageIndex(nextIndex);
-    if (!nextIndex) {
-      return;
-    }
-    const frame = window.requestAnimationFrame(() => {
-      const list = userSummaryListRef.current;
-      const item = list?.querySelector<HTMLElement>(
-        `[data-user-summary-index="${nextIndex}"]`,
-      );
-      item?.scrollIntoView({ block: "center" });
-    });
+    const frame = window.requestAnimationFrame(refreshCurrentUserMessageIndex);
     return () => window.cancelAnimationFrame(frame);
-  }, [readCurrentUserMessageIndex, userSummaryOpen, userMessageSummaries.length]);
-
-  useEffect(() => {
-    if (!userSummaryOpen) {
-      return;
-    }
-    const handlePointerDown = (event: PointerEvent) => {
-      const root = userSummaryRootRef.current;
-      if (!root || root.contains(event.target as Node)) {
-        return;
-      }
-      setUserSummaryPinnedOpen(false);
-      setUserSummaryHoverOpen(false);
-    };
-    document.addEventListener("pointerdown", handlePointerDown, true);
-    return () => document.removeEventListener("pointerdown", handlePointerDown, true);
-  }, [userSummaryOpen]);
+  }, [refreshCurrentUserMessageIndex, turnRailItems.length]);
 
   useEffect(() => {
     return () => {
@@ -2476,6 +2489,49 @@ function SessionViewerInner({
     );
   };
 
+  // DSH-style floating control: a 34px circle with a chevron, no label text.
+  const jumpToBottomButton = (
+    <button
+      type="button"
+      onClick={() => {
+        cancelTargetSeqScroll();
+        if (targetSeq) {
+          targetSeqScrollKeyRef.current = `${sessionKey || ""}:${targetSeq}:${targetSeqRequestKey}`;
+        }
+        shouldStickToBottomRef.current = true;
+        setShowJumpToLatest(false);
+        stickSessionToBottom("smooth");
+      }}
+      aria-label={t("session.jumpBottom")}
+      title={t("session.jumpBottom")}
+      style={{
+        width: "34px",
+        height: "34px",
+        padding: 0,
+        border: "1px solid var(--menu-border)",
+        borderRadius: "100px",
+        background: "var(--menu-bg)",
+        color: "var(--text-primary)",
+        boxShadow: "0 10px 24px rgba(15, 23, 42, 0.16)",
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        cursor: "pointer",
+        fontSize: "16px",
+        lineHeight: 1,
+        flexShrink: 0,
+      }}
+      onMouseEnter={(event) => {
+        event.currentTarget.style.background = "var(--menu-active-bg)";
+      }}
+      onMouseLeave={(event) => {
+        event.currentTarget.style.background = "var(--menu-bg)";
+      }}
+    >
+      <ChevronDownIcon />
+    </button>
+  );
+
   return (
     <div
       style={{
@@ -2510,6 +2566,8 @@ function SessionViewerInner({
               fontWeight: 600,
               margin: 0,
               minWidth: 0,
+              flex: 1,
+              overflow: "hidden",
             }}
           >
             {rootId ? (
@@ -2539,8 +2597,28 @@ function SessionViewerInner({
         </header>
       )}
 
-      {/* 滚动容器 */}
-      <div style={{ flex: 1, minHeight: 0, minWidth: 0, position: "relative" }}>
+      {/* 滚动容器 + 右侧轮次导航轨道 */}
+      <div
+        ref={sessionAreaRef}
+        style={{
+          flex: 1,
+          minHeight: 0,
+          minWidth: 0,
+          position: "relative",
+          display: "flex",
+          flexDirection: "row",
+        }}
+      >
+        <div
+          style={{
+            flex: 1,
+            minWidth: 0,
+            minHeight: 0,
+            position: "relative",
+            display: "flex",
+            flexDirection: "column",
+          }}
+        >
         <div ref={scrollRef} style={{ flex: 1, minHeight: 0, minWidth: 0, height: "100%", overflowY: "auto", overflowX: "hidden", position: "relative", WebkitOverflowScrolling: "touch" }}>
           <div style={{
             width: "100%",
@@ -2898,212 +2976,30 @@ function SessionViewerInner({
           </div>
           </div>
         </div>
-        {userMessageSummaries.length > 0 || showJumpToLatest ? (
+        {showJumpToLatest ? (
           <div
             style={{
               position: "absolute",
-              right: "16px",
+              right: "12px",
               bottom: `${16 + composerOverlayInset}px`,
               zIndex: 4,
               display: "flex",
               alignItems: "center",
-              gap: "6px",
             }}
           >
-            {showJumpToLatest ? (
-              <button
-                type="button"
-                onClick={() => {
-                  cancelTargetSeqScroll();
-                  if (targetSeq) {
-                    targetSeqScrollKeyRef.current = `${sessionKey || ""}:${targetSeq}:${targetSeqRequestKey}`;
-                  }
-                  shouldStickToBottomRef.current = true;
-                  setShowJumpToLatest(false);
-                  stickSessionToBottom("smooth");
-                }}
-                aria-label={t("session.jumpLatest")}
-                title={t("session.jumpLatest")}
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: "6px",
-                  height: "34px",
-                  border: "1px solid rgba(37,99,235,0.35)",
-                  background: "#2563eb",
-                  color: "#ffffff",
-                  borderRadius: "999px",
-                  padding: "0 12px",
-                  boxShadow: "0 8px 24px rgba(15, 23, 42, 0.14)",
-                  cursor: "pointer",
-                  fontSize: "12px",
-                  whiteSpace: "nowrap",
-                }}
-              >
-                <span>{t("session.jumpBottom")}</span>
-              </button>
-            ) : null}
-            {userMessageSummaries.length > 0 ? (
-              <div
-                ref={userSummaryRootRef}
-                onMouseEnter={() => {
-                  refreshCurrentUserMessageIndex();
-                  setUserSummaryHoverOpen(true);
-                }}
-                onMouseLeave={() => setUserSummaryHoverOpen(false)}
-                style={{
-                  position: "relative",
-                  display: "inline-flex",
-                }}
-              >
-                {userSummaryOpen ? (
-                  <>
-                    <div
-                      aria-hidden="true"
-                      style={{
-                        position: "absolute",
-                        right: 0,
-                        bottom: "100%",
-                        width: "min(320px, calc(100vw - 72px))",
-                        height: "8px",
-                      }}
-                    />
-                    <div
-                      role="dialog"
-                      aria-label={t("session.userSummary")}
-                      style={{
-                        position: "absolute",
-                        right: 0,
-                        bottom: "calc(100% + 8px)",
-                        width: "min(320px, calc(100vw - 72px))",
-                        maxHeight: "260px",
-                        overflowY: "auto",
-                        padding: "6px",
-                        borderRadius: "8px",
-                        border: "1px solid var(--menu-border)",
-                        background: "var(--menu-bg)",
-                        boxShadow: "0 16px 34px rgba(15, 23, 42, 0.18)",
-                        color: "var(--text-primary)",
-                        boxSizing: "border-box",
-                      }}
-                    >
-                      <div
-                        ref={userSummaryListRef}
-                        style={{ display: "flex", flexDirection: "column", gap: "2px" }}
-                      >
-                        {userMessageSummaries.map((item) => {
-                          const isCurrent = item.index === currentUserMessageIndex;
-                          return (
-                            <button
-                              key={item.id}
-                              type="button"
-                              data-user-summary-index={item.index}
-                              onClick={() => scrollToUserMessageSummary(item.index)}
-                              style={{
-                                width: "100%",
-                                border: "none",
-                                background: isCurrent
-                                  ? "rgba(148, 163, 184, 0.22)"
-                                  : "transparent",
-                                display: "block",
-                                padding: "6px 8px",
-                                borderRadius: "6px",
-                                cursor: "pointer",
-                                textAlign: "left",
-                                color: "var(--text-primary)",
-                              }}
-                              onMouseEnter={(event) => {
-                                event.currentTarget.style.background = "var(--menu-active-bg)";
-                              }}
-                              onMouseLeave={(event) => {
-                                event.currentTarget.style.background = isCurrent
-                                  ? "rgba(148, 163, 184, 0.22)"
-                                  : "transparent";
-                              }}
-                            >
-                              <span
-                                title={item.summary}
-                                style={{
-                                  display: "block",
-                                  minWidth: 0,
-                                  fontSize: "12px",
-                                  lineHeight: "18px",
-                                  color: "var(--text-primary)",
-                                  overflow: "hidden",
-                                  textOverflow: "ellipsis",
-                                  whiteSpace: "nowrap",
-                                }}
-                              >
-                                {item.summary}
-                              </span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  </>
-                ) : null}
-                <button
-                  type="button"
-                  onClick={() => {
-                    refreshCurrentUserMessageIndex();
-                    setUserSummaryPinnedOpen((open) => {
-                      const nextOpen = !open;
-                      if (!nextOpen) {
-                        setUserSummaryHoverOpen(false);
-                      }
-                      return nextOpen;
-                    });
-                  }}
-                  aria-label={userSummaryOpen ? t("session.hideUserSummary") : t("session.showUserSummary")}
-                  title={userSummaryOpen ? t("session.hideUserSummary") : t("session.showUserSummary")}
-                  style={{
-                    position: "relative",
-                    width: "34px",
-                    height: "34px",
-                    border: "none",
-                    borderRadius: "8px",
-                    background: userSummaryOpen ? "var(--accent-color)" : "var(--menu-bg)",
-                    color: userSummaryOpen ? "#ffffff" : "var(--text-secondary)",
-                    boxShadow: "0 10px 24px rgba(15, 23, 42, 0.16)",
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    cursor: "pointer",
-                    fontSize: "18px",
-                  }}
-                >
-                  <UserMessageListIcon />
-                  <span
-                    aria-hidden="true"
-                    style={{
-                      position: "absolute",
-                      top: "-7px",
-                      right: "-7px",
-                      minWidth: "18px",
-                      height: "18px",
-                      padding: "0 5px",
-                      borderRadius: "999px",
-                      background: "#2563eb",
-                      color: "#ffffff",
-                      border: "2px solid var(--menu-bg)",
-                      fontSize: "10px",
-                      fontWeight: 800,
-                      lineHeight: "14px",
-                      display: "inline-flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      boxSizing: "border-box",
-                      fontVariantNumeric: "tabular-nums",
-                    }}
-                  >
-                    {userMessageSummaries.length > 99 ? "99+" : userMessageSummaries.length}
-                  </span>
-                </button>
-              </div>
-            ) : null}
+            {jumpToBottomButton}
           </div>
         ) : null}
+        </div>
+        <SessionTurnRail
+          areaRef={sessionAreaRef}
+          scrollRef={scrollRef}
+          items={turnRailItems}
+          activeIndex={currentUserMessageIndex}
+          busyIndex={turnRailBusyIndex}
+          composerInset={composerOverlayInset}
+          onSelect={scrollToUserMessageSummary}
+        />
       </div>
       <style>{`
         @keyframes pulse {
