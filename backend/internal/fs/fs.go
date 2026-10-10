@@ -28,6 +28,7 @@ const (
 	stateFileName       = "state.json"
 	defaultMaxReadBytes = 64 * 1024
 	maxFullReadBytes    = 128 << 20
+	maxWriteFileBytes   = 8 << 20
 )
 
 var (
@@ -905,6 +906,138 @@ func (r RootInfo) StatFile(pathRel string) (os.FileInfo, string, error) {
 		return nil, "", errors.New("path is a directory")
 	}
 	return info, relPath, nil
+}
+
+// WriteResult describes a file replaced through WriteFile.
+type WriteResult struct {
+	Path  string    `json:"path"`
+	Name  string    `json:"name"`
+	Size  int64     `json:"size"`
+	MTime time.Time `json:"mtime"`
+}
+
+// ErrWriteConflict reports that the file changed on disk since it was read, so
+// an unconditional overwrite would silently drop someone else's edits.
+var ErrWriteConflict = errors.New("file changed on disk")
+
+// WriteFile atomically replaces the content of pathRel inside this root.
+// The file is created when missing; existing permissions are preserved and the
+// write is refused when it would follow a symlink or leave the root.
+// A non-zero expectedMTime turns the write into a compare-and-swap: a mismatch
+// returns ErrWriteConflict instead of overwriting newer content.
+func (r RootInfo) WriteFile(pathRel string, data []byte, expectedMTime time.Time) (WriteResult, error) {
+	if len(data) > maxWriteFileBytes {
+		return WriteResult{}, errors.New("file is too large to write")
+	}
+	pathRel, err := r.NormalizePath(pathRel)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	resolved, err := r.ResolvePath(pathRel)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	mode := os.FileMode(0o644)
+	existing, statErr := os.Lstat(resolved)
+	switch {
+	case statErr == nil:
+		if existing.Mode()&os.ModeSymlink != 0 {
+			return WriteResult{}, errors.New("refusing to write through symlink")
+		}
+		if existing.IsDir() {
+			return WriteResult{}, errors.New("path is a directory")
+		}
+		if !expectedMTime.IsZero() && !existing.ModTime().UTC().Equal(expectedMTime.UTC()) {
+			return WriteResult{}, ErrWriteConflict
+		}
+		mode = existing.Mode().Perm()
+	case os.IsNotExist(statErr):
+		if !expectedMTime.IsZero() {
+			return WriteResult{}, ErrWriteConflict
+		}
+	default:
+		return WriteResult{}, apperr.Wrap("stat", resolved, statErr)
+	}
+	dir := filepath.Dir(resolved)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return WriteResult{}, apperr.Wrap("mkdir", dir, err)
+	}
+	if err := r.ensureWritableDir(dir); err != nil {
+		return WriteResult{}, err
+	}
+	if err := atomicWriteFile(resolved, data, mode); err != nil {
+		return WriteResult{}, apperr.Wrap("write", resolved, err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return WriteResult{}, apperr.Wrap("stat", resolved, err)
+	}
+	return WriteResult{
+		Path:  filepath.ToSlash(pathRel),
+		Name:  filepath.Base(resolved),
+		Size:  info.Size(),
+		MTime: info.ModTime().UTC(),
+	}, nil
+}
+
+// ensureWritableDir refuses a write whose resolved parent directory sits
+// outside both the root and (for home meta locations) the meta directory, so a
+// symlinked directory inside the root cannot be used to escape it.
+func (r RootInfo) ensureWritableDir(dir string) error {
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return apperr.Wrap("stat", dir, err)
+	}
+	bases := make([]string, 0, 2)
+	if root, err := r.rootDir(); err == nil {
+		bases = append(bases, root)
+	}
+	if metaDir := r.MetaDir(); metaDir != "" {
+		bases = append(bases, metaDir)
+	}
+	for _, base := range bases {
+		realBase, err := filepath.EvalSymlinks(base)
+		if err != nil {
+			continue
+		}
+		if rel, err := filepath.Rel(realBase, realDir); err == nil {
+			if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
+				return nil
+			}
+		}
+	}
+	return errors.New("path outside root")
+}
+
+// atomicWriteFile writes data to a temporary file in the destination directory
+// and renames it into place, so readers never observe a partial file.
+func atomicWriteFile(dest string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(dest)
+	tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(dest)+"-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		// Best-effort cleanup when the rename never happened.
+		_ = os.Remove(tmpName)
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		// Non-fatal on platforms without full mode support.
+		_ = err
+	}
+	return os.Rename(tmpName, dest)
 }
 
 // State captures cursor/position info for a managed directory.

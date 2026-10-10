@@ -1,5 +1,6 @@
 import { appURL } from "./base";
 import { e2eeService } from "./e2ee";
+import { protectedJSON } from "./api";
 
 export type ReadMode = "full" | "incremental";
 
@@ -626,6 +627,44 @@ export async function fetchFile(params: FetchFileParams): Promise<FilePayload | 
       window.clearTimeout(request.timer);
     }
   }
+}
+
+export type SavedFileResult = {
+  path: string;
+  name: string;
+  size: number;
+  mtime?: string;
+};
+
+/**
+ * Writes edited content back to a project file. `expectedMTime` is the mtime of
+ * the version the editor loaded; the server rejects the write with status 409
+ * when the file changed on disk in the meantime.
+ */
+export async function saveFileContent(params: {
+  rootId: string;
+  path: string;
+  content: string;
+  expectedMTime?: string;
+}): Promise<SavedFileResult> {
+  const data = await protectedJSON<{ file?: SavedFileResult }>(appURL("/api/file"), {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      root: params.rootId,
+      path: params.path,
+      content: params.content,
+      expected_mtime: params.expectedMTime || "",
+    }),
+  });
+  invalidateFileCache(params.rootId, params.path);
+  const saved = data?.file;
+  if (!saved) {
+    throw new Error("save file failed: empty response");
+  }
+  return saved;
 }
 
 export async function fetchProofProtectedBlob(params: {

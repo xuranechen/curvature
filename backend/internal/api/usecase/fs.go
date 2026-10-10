@@ -139,6 +139,38 @@ func (s *Service) GetFileInfo(_ context.Context, in GetFileInfoInput) (GetFileIn
 	}, nil
 }
 
+type SaveFileInput struct {
+	RootID        string
+	Path          string
+	Content       string
+	ExpectedMTime time.Time
+}
+
+type SaveFileOutput struct {
+	File fs.WriteResult
+}
+
+// SaveFile replaces a project file's content from the UI editor. Passing
+// ExpectedMTime makes the write conditional: when the file changed on disk
+// since it was read the write fails with fs.ErrWriteConflict.
+func (s *Service) SaveFile(_ context.Context, in SaveFileInput) (SaveFileOutput, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return SaveFileOutput{}, err
+	}
+	root, err := s.Registry.GetRoot(in.RootID)
+	if err != nil {
+		return SaveFileOutput{}, err
+	}
+	if strings.TrimSpace(in.Path) == "" {
+		return SaveFileOutput{}, errors.New("path required")
+	}
+	result, err := root.WriteFile(in.Path, []byte(in.Content), in.ExpectedMTime)
+	if err != nil {
+		return SaveFileOutput{}, err
+	}
+	return SaveFileOutput{File: result}, nil
+}
+
 type UploadFile struct {
 	Name        string
 	ContentType string

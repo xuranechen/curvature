@@ -57,6 +57,9 @@ type protectedResponseWriter struct {
 const (
 	maxUploadRequestBytes = 64 << 20
 	maxUploadFileCount    = 20
+	// maxFileWriteRequestBytes bounds the JSON envelope for an edited file; the
+	// fs layer enforces the tighter content limit.
+	maxFileWriteRequestBytes = 16 << 20
 	sessionListPageSize   = 50
 	multiRootSessionLimit = 6
 	childSessionPageSize  = 20
@@ -288,6 +291,7 @@ func (h *HTTPHandler) Routes() http.Handler {
 	// bypasses the browser session proof.
 	r.Post(mcpaskuser.EndpointPath, h.handleMCPAskUser)
 	r.Get("/api/file", h.handleFile)
+	r.Put("/api/file", h.protectedEndpoint(h.handleFileWrite))
 	r.Get("/api/git/status", h.protectedEndpoint(h.handleGitStatus))
 	r.Get("/api/git/diff", h.protectedEndpoint(h.handleGitDiff))
 	r.Get("/api/git/history", h.protectedEndpoint(h.handleGitHistory))
@@ -1957,6 +1961,61 @@ func (h *HTTPHandler) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respondJSON(w, http.StatusOK, payload)
+}
+
+type fileWriteRequest struct {
+	Root          string `json:"root"`
+	Path          string `json:"path"`
+	Content       string `json:"content"`
+	ExpectedMTime string `json:"expected_mtime"`
+}
+
+// handleFileWrite backs the manual editor: it replaces one project file's
+// content. When the client sends expected_mtime the write is a
+// compare-and-swap, so a file edited behind the editor's back (by an agent or
+// another editor) is reported as 409 instead of being silently overwritten.
+func (h *HTTPHandler) handleFileWrite(w http.ResponseWriter, r *http.Request) {
+	var req fileWriteRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxFileWriteRequestBytes)).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid payload"))
+		return
+	}
+	rootID := strings.TrimSpace(req.Root)
+	if rootID == "" {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("root required"))
+		return
+	}
+	if strings.TrimSpace(req.Path) == "" {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("path required"))
+		return
+	}
+	var expectedMTime time.Time
+	if raw := strings.TrimSpace(req.ExpectedMTime); raw != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, errInvalidRequest("expected_mtime must be RFC3339"))
+			return
+		}
+		expectedMTime = parsed.UTC()
+	}
+	out, err := h.service().SaveFile(r.Context(), usecase.SaveFileInput{
+		RootID:        rootID,
+		Path:          req.Path,
+		Content:       req.Content,
+		ExpectedMTime: expectedMTime,
+	})
+	if err != nil {
+		status := http.StatusBadRequest
+		switch {
+		case errors.Is(err, fs.ErrWriteConflict):
+			status = http.StatusConflict
+		case errors.Is(err, os.ErrNotExist):
+			status = http.StatusNotFound
+		}
+		respondError(w, status, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"file": out.File})
 }
 
 func (h *HTTPHandler) handleGitStatus(w http.ResponseWriter, r *http.Request) {

@@ -7,6 +7,8 @@ import { DocumentViewer } from "./DocumentViewer";
 import { getDocumentPreviewKind } from "../services/documentPreview";
 import { rootBadgeStyle } from "./rootBadgeStyle";
 import { downloadFile } from "../services/download";
+import { saveFileContent, type SavedFileResult } from "../services/file";
+import { ProtectedAPIError } from "../services/api";
 import { isNativeShellRuntime } from "../services/runtime";
 import { useI18n } from "../i18n";
 
@@ -19,6 +21,7 @@ type FilePayload = {
   size: number;
   ext?: string;
   mime?: string;
+  mtime?: string;
   root?: string;
   targetLine?: number;
   targetColumn?: number;
@@ -54,6 +57,8 @@ type FileViewerProps = {
   initialScrollTop?: number;
   onScrollTopChange?: (scrollTop: number) => void;
   isVisible?: boolean;
+  onFileSaved?: (saved: SavedFileResult) => void;
+  onRequestReload?: () => void;
 };
 
 function isSelectionInside(root: Node, range: Range): boolean {
@@ -131,7 +136,7 @@ function Breadcrumbs({ root, path, onPathClick }: { root?: string; path: string;
   );
 }
 
-export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onSelectionChange, initialScrollTop = 0, onScrollTopChange, isVisible = true }: FileViewerProps) {
+export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onSelectionChange, initialScrollTop = 0, onScrollTopChange, isVisible = true, onFileSaved, onRequestReload }: FileViewerProps) {
   const { t } = useI18n();
   const [isDownloading, setIsDownloading] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -291,6 +296,108 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
     }
   }, [file, isDownloading, showToast, t]);
 
+  const [isEditing, setIsEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
+  const [editError, setEditError] = useState("");
+
+  const canEditFile = !!file
+    && !!file.root
+    && !documentPreviewKind
+    && file.encoding !== "binary"
+    && !file.mime?.startsWith("image/")
+    && !file.truncated;
+
+  const isDirty = isEditing && !!file && draft !== file.content;
+
+  const startEditing = useCallback(() => {
+    if (!file || !canEditFile) return;
+    setDraft(file.content);
+    setEditError("");
+    setIsEditing(true);
+  }, [canEditFile, file]);
+
+  const cancelEditing = useCallback(() => {
+    setIsEditing(false);
+    setDraft("");
+    setEditError("");
+  }, []);
+
+  const handleSaveEdit = useCallback(async () => {
+    if (!file?.root || !file.path || isSaving) return;
+    setIsSaving(true);
+    setEditError("");
+    try {
+      const saved = await saveFileContent({
+        rootId: file.root,
+        path: file.path,
+        content: draft,
+        expectedMTime: file.mtime,
+      });
+      setIsEditing(false);
+      setDraft("");
+      showToast(t("fileViewer.saveSucceeded"), true);
+      onFileSaved?.(saved);
+    } catch (error) {
+      const conflict = error instanceof ProtectedAPIError && error.status === 409;
+      setEditError(
+        conflict
+          ? t("fileViewer.saveConflict")
+          : error instanceof Error
+            ? error.message
+            : t("fileViewer.saveFailed"),
+      );
+    } finally {
+      setIsSaving(false);
+    }
+  }, [draft, file, isSaving, onFileSaved, showToast, t]);
+
+  const handleReloadRequest = useCallback(() => {
+    setIsEditing(false);
+    setDraft("");
+    setEditError("");
+    onRequestReload?.();
+  }, [onRequestReload]);
+
+  const handleEditorKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (event.key !== "Tab") return;
+      event.preventDefault();
+      const target = event.currentTarget;
+      const start = target.selectionStart ?? 0;
+      const end = target.selectionEnd ?? 0;
+      setDraft(`${draft.slice(0, start)}  ${draft.slice(end)}`);
+      window.requestAnimationFrame(() => {
+        target.selectionStart = start + 2;
+        target.selectionEnd = start + 2;
+      });
+    },
+    [draft],
+  );
+
+  useEffect(() => {
+    if (!isEditing) return undefined;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        void handleSaveEdit();
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        cancelEditing();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [cancelEditing, handleSaveEdit, isEditing]);
+
+  useEffect(() => {
+    setIsEditing(false);
+    setDraft("");
+    setEditError("");
+  }, [fileScrollKey]);
+
   if (!file) {
     return (
       <div style={{ flex: 1, minHeight: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-secondary)", flexDirection: "column", gap: "12px" }}>
@@ -435,6 +542,83 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
             </div>
           )}
           <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "8px", minWidth: 0, flexShrink: 0 }}>
+            {isEditing ? (
+              <>
+                {isDirty && !isMobile ? (
+                  <span style={{ fontSize: "11px", color: "var(--accent-color)", flexShrink: 0 }}>
+                    {t("fileViewer.unsavedChanges")}
+                  </span>
+                ) : null}
+                {!isMobile ? (
+                  <span style={{ fontSize: "11px", color: "var(--text-secondary)", opacity: 0.7, flexShrink: 0 }}>
+                    {t("fileViewer.editHint")}
+                  </span>
+                ) : null}
+                <button
+                  type="button"
+                  onClick={() => { void handleSaveEdit(); }}
+                  disabled={isSaving}
+                  title={isSaving ? t("fileViewer.saving") : t("fileViewer.saveFile")}
+                  style={{
+                    border: "1px solid var(--border-color)",
+                    background: "var(--selection-bg)",
+                    color: "var(--accent-color)",
+                    borderRadius: 6,
+                    padding: "2px 10px",
+                    fontSize: "12px",
+                    cursor: isSaving ? "progress" : "pointer",
+                    flexShrink: 0,
+                  }}
+                >
+                  {isSaving ? t("fileViewer.saving") : t("fileViewer.saveFile")}
+                </button>
+                <button
+                  type="button"
+                  onClick={cancelEditing}
+                  disabled={isSaving}
+                  title={t("fileViewer.cancelEdit")}
+                  style={{
+                    border: "1px solid var(--border-color)",
+                    background: "transparent",
+                    color: "var(--text-secondary)",
+                    borderRadius: 6,
+                    padding: "2px 10px",
+                    fontSize: "12px",
+                    cursor: isSaving ? "not-allowed" : "pointer",
+                    flexShrink: 0,
+                  }}
+                >
+                  {t("fileViewer.cancelEdit")}
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={startEditing}
+                disabled={!canEditFile}
+                title={canEditFile ? t("fileViewer.editFile") : t("fileViewer.editUnavailable")}
+                aria-label={t("fileViewer.editFile")}
+                style={{
+                  border: "none",
+                  background: "transparent",
+                  borderRadius: 6,
+                  padding: 0,
+                  width: 20,
+                  height: 20,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  cursor: canEditFile ? "pointer" : "not-allowed",
+                  color: "var(--text-secondary)",
+                  opacity: canEditFile ? 1 : 0.4,
+                  flexShrink: 0,
+                }}
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path fill="currentColor" d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75zm17.71-10.21a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75z" />
+                </svg>
+              </button>
+            )}
             <div style={{ fontSize: "11px", color: "var(--text-secondary)", marginLeft: "6px", flexShrink: 0, opacity: 0.7 }}>{(file.size / 1024).toFixed(1)} KB</div>
             <button
               type="button"
@@ -466,9 +650,73 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
         </div>
       </header>
 
-      <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflow: documentPreviewKind === "powerpoint" ? "hidden" : "auto", position: "relative", WebkitOverflowScrolling: "touch" }}>
-        <div style={{ minWidth: "100%", height: documentPreviewKind === "powerpoint" ? "100%" : undefined, display: "block", background: "transparent" }}>
-          {documentPreviewKind ? (
+      {editError ? (
+        <div
+          style={{
+            padding: "8px 16px",
+            background: "rgba(239, 68, 68, 0.08)",
+            color: "#dc2626",
+            fontSize: "12px",
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+            borderBottom: "1px solid var(--border-color)",
+            flexShrink: 0,
+          }}
+        >
+          <span style={{ flex: 1 }}>{editError}</span>
+          {onRequestReload ? (
+            <button
+              type="button"
+              onClick={handleReloadRequest}
+              style={{
+                border: "1px solid var(--border-color)",
+                background: "transparent",
+                color: "inherit",
+                borderRadius: 6,
+                padding: "2px 10px",
+                fontSize: "12px",
+                cursor: "pointer",
+                flexShrink: 0,
+              }}
+            >
+              {t("fileViewer.reloadFile")}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
+      <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflow: isEditing ? "hidden" : documentPreviewKind === "powerpoint" ? "hidden" : "auto", position: "relative", WebkitOverflowScrolling: "touch" }}>
+        <div style={{ minWidth: "100%", height: isEditing ? "100%" : documentPreviewKind === "powerpoint" ? "100%" : undefined, display: "block", background: "transparent" }}>
+          {isEditing ? (
+            <textarea
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={handleEditorKeyDown}
+              spellCheck={false}
+              autoFocus
+              aria-label={t("fileViewer.editFile")}
+              style={{
+                width: "100%",
+                height: "100%",
+                minHeight: "100%",
+                boxSizing: "border-box",
+                border: "none",
+                outline: "none",
+                resize: "none",
+                margin: 0,
+                padding: "24px 16px",
+                fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+                fontSize: "13px",
+                lineHeight: "20px",
+                color: "var(--text-primary)",
+                background: "transparent",
+                whiteSpace: "pre",
+                overflow: "auto",
+                tabSize: 2,
+              }}
+            />
+          ) : documentPreviewKind ? (
             <DocumentViewer key={`${file.root || ""}:${file.path}`} path={file.path} root={file.root} kind={documentPreviewKind} />
           ) : file.mime?.startsWith("image/") || [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"].includes(ext.toLowerCase()) ? (
             <div style={{ padding: "24px 16px" }}><ImageViewer path={file.path} root={file.root} /></div>

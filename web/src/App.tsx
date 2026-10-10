@@ -13643,6 +13643,21 @@ export function App({ onGoHome }: AppProps) {
             }
             onPathClick={handleFileViewerPathClick}
             onFileClick={handleFileViewerFileClick}
+            onFileSaved={(saved) => {
+              const savedRoot = file?.root || currentRootIdRef.current || "";
+              if (savedRoot) {
+                invalidateFileCache(savedRoot, saved.path);
+                void refreshCurrentFileContent(savedRoot, saved.path);
+                void refreshGitStatus(savedRoot);
+              }
+            }}
+            onRequestReload={() => {
+              const reloadRoot = file?.root || currentRootIdRef.current || "";
+              if (reloadRoot && file?.path) {
+                invalidateFileCache(reloadRoot, file.path);
+                void refreshCurrentFileContent(reloadRoot, file.path);
+              }
+            }}
           />
         </div>
       );
