@@ -429,40 +429,109 @@ func (p *Pool) ReleaseInactiveSessionsDetailed(now time.Time) IdleReleaseResult 
 	return p.releaseSessionsDetailed(now, "manual", func(_ *sessionEntry) bool { return true })
 }
 
-func (p *Pool) releaseSessionsDetailed(now time.Time, reason string, eligible func(*sessionEntry) bool) IdleReleaseResult {
-	result := IdleReleaseResult{}
+// AgentReleaseResult reports the outcome of releasing one agent on demand.
+type AgentReleaseResult struct {
+	Agent            string `json:"agent"`
+	ReleasedSessions int    `json:"released_sessions"`
+	FailedSessions   int    `json:"failed_sessions"`
+	// ProcessReleased reports whether the agent's shared runtime process was
+	// recycled. Claude SDK sessions own their CLI process, so they report false;
+	// their process dies with the session and is already counted as released.
+	ProcessReleased bool `json:"process_released"`
+}
+
+// ReleaseAgentDetailed releases every inactive session of a single agent on
+// demand. Unlike the idle sweep it ignores the idle threshold, because an
+// explicit user action should not have to wait for one.
+//
+// When the agent is left with no sessions at all, its shared runtime process is
+// recycled too, so the release actually returns memory instead of only
+// bookkeeping. The next message lazily opens a fresh process and resumes the
+// stored agent session, so nothing is lost.
+func (p *Pool) ReleaseAgentDetailed(agentName string, now time.Time) (AgentReleaseResult, error) {
+	agentName = strings.TrimSpace(agentName)
+	result := AgentReleaseResult{Agent: agentName}
+	if agentName == "" {
+		return result, errors.New("agent required")
+	}
 	p.mu.Lock()
-	groups := make(map[runtimeGroup]struct{})
+	closed := p.closed
+	p.mu.Unlock()
+	if closed {
+		return result, errors.New("agent pool closed")
+	}
+	def, ok := p.cfg.GetAgent(agentName)
+	if !ok {
+		return result, errors.New("agent not configured: " + agentName)
+	}
+	protocol := def.Protocol
+	if protocol == "" {
+		protocol = DefaultProtocol(agentName)
+	}
+	group := runtimeGroup{agentName: agentName, protocol: protocol}
+	unlockRuntimes := p.lockRuntimeGroups([]runtimeGroup{group})
+	defer unlockRuntimes()
+
+	released, _ := p.releaseLocked(now, "agent="+agentName, func(entry *sessionEntry) bool {
+		return entry.agentName == agentName && entry.protocol == protocol
+	})
+	result.ReleasedSessions = released.ReleasedSessions
+	result.FailedSessions = released.FailedSessions
+	result.ProcessReleased = p.recycleRuntimeGroupLocked(group)
+	return result, nil
+}
+
+func (p *Pool) releaseSessionsDetailed(now time.Time, reason string, eligible func(*sessionEntry) bool) IdleReleaseResult {
+	groups := p.eligibleRuntimeGroups(eligible)
+	if len(groups) == 0 {
+		return IdleReleaseResult{}
+	}
+	unlockRuntimes := p.lockRuntimeGroups(groups)
+	defer unlockRuntimes()
+
+	result, touched := p.releaseLocked(now, reason, eligible)
+	// A release that leaves an agent with no sessions should also return the
+	// agent's process memory, not just its session bookkeeping.
+	p.recycleRuntimeGroupsLocked(touched)
+	return result
+}
+
+// eligibleRuntimeGroups lists the runtime groups holding at least one releasable
+// session, so the caller can lock exactly those groups.
+func (p *Pool) eligibleRuntimeGroups(eligible func(*sessionEntry) bool) []runtimeGroup {
+	seen := make(map[runtimeGroup]struct{})
+	p.mu.Lock()
 	for _, entry := range p.sessions {
 		if entry == nil || entry.closing || entry.activeUses > 0 || !eligible(entry) {
 			continue
 		}
-		groups[runtimeGroup{agentName: entry.agentName, protocol: entry.protocol}] = struct{}{}
+		seen[runtimeGroup{agentName: entry.agentName, protocol: entry.protocol}] = struct{}{}
 	}
 	p.mu.Unlock()
-	if len(groups) == 0 {
-		return result
+	groups := make([]runtimeGroup, 0, len(seen))
+	for group := range seen {
+		groups = append(groups, group)
 	}
-	groupList := make([]runtimeGroup, 0, len(groups))
-	for group := range groups {
-		groupList = append(groupList, group)
-	}
-	unlockRuntimes := p.lockRuntimeGroups(groupList)
-	defer unlockRuntimes()
+	return groups
+}
+
+// releaseLocked closes every releasable session matched by eligible. The caller
+// must hold the runtime lock for each group it can match and keep holding it
+// until any runtime process has been recycled.
+func (p *Pool) releaseLocked(now time.Time, reason string, eligible func(*sessionEntry) bool) (IdleReleaseResult, map[runtimeGroup]struct{}) {
+	result := IdleReleaseResult{}
+	touched := make(map[runtimeGroup]struct{})
 
 	p.mu.Lock()
 	entries := make([]*sessionEntry, 0)
 	for _, entry := range p.sessions {
-		group := runtimeGroup{}
-		if entry != nil {
-			group = runtimeGroup{agentName: entry.agentName, protocol: entry.protocol}
-		}
-		if _, selected := groups[group]; !selected || entry == nil || entry.closing || entry.activeUses > 0 || !eligible(entry) {
+		if entry == nil || entry.closing || entry.activeUses > 0 || !eligible(entry) {
 			continue
 		}
 		entry.closing = true
 		entry.closeDone = make(chan struct{})
 		entries = append(entries, entry)
+		touched[runtimeGroup{agentName: entry.agentName, protocol: entry.protocol}] = struct{}{}
 	}
 	p.mu.Unlock()
 
@@ -483,12 +552,72 @@ func (p *Pool) releaseSessionsDetailed(now time.Time, reason string, eligible fu
 		close(entry.closeDone)
 		p.mu.Unlock()
 		if err != nil {
-			log.Printf("[agent/pool] idle_release.error session=%s agent=%s protocol=%s err=%v", entry.sessionKey, entry.agentName, entry.protocol, err)
+			log.Printf("[agent/pool] idle_release.error session=%s agent=%s protocol=%s reason=%s err=%v", entry.sessionKey, entry.agentName, entry.protocol, reason, err)
 		} else {
 			log.Printf("[agent/pool] idle_release.done session=%s agent=%s protocol=%s reason=%s", entry.sessionKey, entry.agentName, entry.protocol, reason)
 		}
 	}
-	return result
+	return result, touched
+}
+
+// recycleRuntimeGroupsLocked closes the shared runtime process of every group
+// that has no sessions left. The caller must hold the runtime locks.
+func (p *Pool) recycleRuntimeGroupsLocked(groups map[runtimeGroup]struct{}) {
+	for group := range groups {
+		p.recycleRuntimeGroupLocked(group)
+	}
+}
+
+// recycleRuntimeGroupLocked recycles one agent's shared runtime process when
+// that agent has no sessions left. It reports whether a process was actually
+// closed.
+func (p *Pool) recycleRuntimeGroupLocked(group runtimeGroup) bool {
+	if p.agentHasSessions(group.agentName) {
+		return false
+	}
+	switch group.protocol {
+	case ProtocolACP:
+		if p.acp == nil {
+			return false
+		}
+		if _, running := p.acp.ProcessIDs()[group.agentName]; !running {
+			return false
+		}
+		if err := p.acp.Close(group.agentName); err != nil {
+			log.Printf("[agent/pool] runtime_release.error agent=%s protocol=%s err=%v", group.agentName, group.protocol, err)
+			return false
+		}
+	case ProtocolCodexSDK:
+		if p.codex == nil {
+			return false
+		}
+		if _, running := p.codex.ProcessIDs()[group.agentName]; !running {
+			return false
+		}
+		if err := p.codex.Close(group.agentName); err != nil {
+			log.Printf("[agent/pool] runtime_release.error agent=%s protocol=%s err=%v", group.agentName, group.protocol, err)
+			return false
+		}
+	default:
+		// Claude SDK sessions own their CLI process, so closing the session is
+		// already the release; there is no shared runtime process to recycle.
+		return false
+	}
+	log.Printf("[agent/pool] runtime_release.done agent=%s protocol=%s", group.agentName, group.protocol)
+	return true
+}
+
+// agentHasSessions reports whether any session, of any protocol, still belongs
+// to the agent.
+func (p *Pool) agentHasSessions(agentName string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, entry := range p.sessions {
+		if entry != nil && entry.agentName == agentName {
+			return true
+		}
+	}
+	return false
 }
 
 type runtimeGroup struct {

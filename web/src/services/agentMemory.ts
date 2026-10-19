@@ -20,6 +20,11 @@ export type AgentSessionReleaseResult = AgentMemorySnapshot & {
   failed_sessions: number;
 };
 
+export type AgentReleaseResult = AgentSessionReleaseResult & {
+  agent: string;
+  process_released: boolean;
+};
+
 export async function fetchAgentMemory(): Promise<AgentMemorySnapshot> {
   return protectedJSON<AgentMemorySnapshot>(appPath("/api/agents/memory"));
 }
@@ -27,5 +32,13 @@ export async function fetchAgentMemory(): Promise<AgentMemorySnapshot> {
 export async function releaseAgentSessions(): Promise<AgentSessionReleaseResult> {
   return protectedJSON<AgentSessionReleaseResult>(appPath("/api/agents/release-idle"), {
     method: "POST",
+  });
+}
+
+export async function releaseAgent(agent: string): Promise<AgentReleaseResult> {
+  return protectedJSON<AgentReleaseResult>(appPath("/api/agents/release"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ agent }),
   });
 }

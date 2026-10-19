@@ -281,6 +281,133 @@ func TestPoolReleaseIdleSessionsReleasesLastSharedRuntimeSession(t *testing.T) {
 	}
 }
 
+func TestPoolReleaseAgentOnlyReleasesTargetAgent(t *testing.T) {
+	pool := NewPool(loadPoolTestConfig(t))
+	defer pool.CloseAll()
+	now := time.Now()
+	target := &idleReleaseTestSession{}
+	other := &idleReleaseTestSession{}
+	pool.sessions["target"] = &sessionEntry{
+		agentName:  "codex",
+		sessionKey: "target",
+		protocol:   ProtocolCodexSDK,
+		session:    target,
+		lastUsedAt: now,
+	}
+	pool.sessions["other"] = &sessionEntry{
+		agentName:  "claude",
+		sessionKey: "other",
+		protocol:   ProtocolClaudeSDK,
+		session:    other,
+		lastUsedAt: now,
+	}
+
+	result, err := pool.ReleaseAgentDetailed("codex", now)
+	if err != nil {
+		t.Fatalf("ReleaseAgentDetailed: %v", err)
+	}
+	if result.ReleasedSessions != 1 || result.FailedSessions != 0 {
+		t.Fatalf("release = %#v, want 1 released", result)
+	}
+	if target.closeCount != 1 || other.closeCount != 0 {
+		t.Fatalf("target closes=%d other closes=%d, want 1/0", target.closeCount, other.closeCount)
+	}
+	if _, ok := pool.sessions["target"]; ok {
+		t.Fatal("released session remains in pool")
+	}
+	if pool.sessions["other"] == nil {
+		t.Fatal("unrelated agent session was removed")
+	}
+}
+
+func TestPoolReleaseAgentSkipsActiveUse(t *testing.T) {
+	pool := NewPool(loadPoolTestConfig(t))
+	defer pool.CloseAll()
+	now := time.Now()
+	sess := &idleReleaseTestSession{}
+	pool.sessions["busy"] = &sessionEntry{
+		agentName:  "codex",
+		sessionKey: "busy",
+		protocol:   ProtocolCodexSDK,
+		session:    sess,
+		lastUsedAt: now.Add(-100 * time.Hour),
+	}
+	finishUse := pool.BeginSessionUse("busy")
+	defer finishUse()
+
+	result, err := pool.ReleaseAgentDetailed("codex", now)
+	if err != nil {
+		t.Fatalf("ReleaseAgentDetailed: %v", err)
+	}
+	if result.ReleasedSessions != 0 || sess.closeCount != 0 {
+		t.Fatalf("release = %#v closes=%d, want active session kept", result, sess.closeCount)
+	}
+	if pool.sessions["busy"] == nil {
+		t.Fatal("active session was removed")
+	}
+}
+
+func TestPoolReleaseAgentRejectsUnknownAgent(t *testing.T) {
+	pool := NewPool(loadPoolTestConfig(t))
+	defer pool.CloseAll()
+	if _, err := pool.ReleaseAgentDetailed("nope", time.Now()); err == nil {
+		t.Fatal("expected error for unconfigured agent")
+	}
+	if _, err := pool.ReleaseAgentDetailed("   ", time.Now()); err == nil {
+		t.Fatal("expected error for empty agent")
+	}
+}
+
+func TestPoolReleaseAgentKeepsRuntimeWhileSessionsRemain(t *testing.T) {
+	pool := NewPool(loadPoolTestConfig(t))
+	defer pool.CloseAll()
+	now := time.Now()
+	released := &idleReleaseTestSession{}
+	active := &idleReleaseTestSession{}
+	pool.sessions["released"] = &sessionEntry{
+		agentName:  "codex",
+		sessionKey: "released",
+		protocol:   ProtocolCodexSDK,
+		session:    released,
+		lastUsedAt: now,
+	}
+	pool.sessions["active"] = &sessionEntry{
+		agentName:  "codex",
+		sessionKey: "active",
+		protocol:   ProtocolCodexSDK,
+		session:    active,
+		lastUsedAt: now,
+		activeUses: 1,
+	}
+
+	result, err := pool.ReleaseAgentDetailed("codex", now)
+	if err != nil {
+		t.Fatalf("ReleaseAgentDetailed: %v", err)
+	}
+	if result.ReleasedSessions != 1 || result.ProcessReleased {
+		t.Fatalf("release = %#v, want 1 released and process kept", result)
+	}
+}
+
+func TestPoolRecycleRuntimeKeepsProcessWhileAgentHasSessions(t *testing.T) {
+	pool := NewPool(loadPoolTestConfig(t))
+	defer pool.CloseAll()
+	pool.sessions["live"] = &sessionEntry{
+		agentName:  "gemini",
+		sessionKey: "live",
+		protocol:   ProtocolACP,
+		session:    &idleReleaseTestSession{},
+		lastUsedAt: time.Now(),
+	}
+	group := runtimeGroup{agentName: "gemini", protocol: ProtocolACP}
+	if pool.recycleRuntimeGroupLocked(group) {
+		t.Fatal("runtime was recycled while the agent still had a session")
+	}
+	if pool.sessions["live"] == nil {
+		t.Fatal("session was removed by the runtime recycle")
+	}
+}
+
 func TestPoolMemorySnapshotAddsSessionCounts(t *testing.T) {
 	pool := NewPool(loadPoolTestConfig(t))
 	defer pool.CloseAll()

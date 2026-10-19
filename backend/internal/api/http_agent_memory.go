@@ -1,6 +1,8 @@
 package api
 
 import (
+	"encoding/json"
+	"io"
 	"net/http"
 	"time"
 
@@ -17,6 +19,18 @@ type agentSessionReleaseResponse struct {
 	agentMemoryResponse
 	ReleasedSessions int `json:"released_sessions"`
 	FailedSessions   int `json:"failed_sessions"`
+}
+
+type agentReleaseRequest struct {
+	Agent string `json:"agent"`
+}
+
+type agentReleaseResponse struct {
+	agentMemoryResponse
+	Agent            string `json:"agent"`
+	ReleasedSessions int    `json:"released_sessions"`
+	FailedSessions   int    `json:"failed_sessions"`
+	ProcessReleased  bool   `json:"process_released"`
 }
 
 func (h *HTTPHandler) handleAgentMemoryGet(w http.ResponseWriter, _ *http.Request) {
@@ -45,6 +59,36 @@ func (h *HTTPHandler) handleAgentIdleRelease(w http.ResponseWriter, _ *http.Requ
 		},
 		ReleasedSessions: result.ReleasedSessions,
 		FailedSessions:   result.FailedSessions,
+	})
+}
+
+// handleAgentRelease releases a single agent on demand, without waiting for the
+// idle threshold. It closes that agent's inactive sessions and recycles its
+// shared runtime process once no session is left.
+func (h *HTTPHandler) handleAgentRelease(w http.ResponseWriter, r *http.Request) {
+	var req agentReleaseRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxUploadRequestBytes)).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid request body"))
+		return
+	}
+	pool, hours, ok := h.agentMemoryDependencies(w)
+	if !ok {
+		return
+	}
+	result, err := pool.ReleaseAgentDetailed(req.Agent, time.Now())
+	if err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest(err.Error()))
+		return
+	}
+	respondJSON(w, http.StatusOK, agentReleaseResponse{
+		agentMemoryResponse: agentMemoryResponse{
+			MemorySnapshot: pool.MemorySnapshot(true),
+			IdleHours:      hours,
+		},
+		Agent:            result.Agent,
+		ReleasedSessions: result.ReleasedSessions,
+		FailedSessions:   result.FailedSessions,
+		ProcessReleased:  result.ProcessReleased,
 	})
 }
 

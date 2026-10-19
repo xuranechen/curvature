@@ -5,6 +5,7 @@ import { protectedAPIReady } from "../services/api";
 import { bootstrapService } from "../services/bootstrap";
 import {
   fetchAgentMemory,
+  releaseAgent,
   releaseAgentSessions,
   type AgentMemorySnapshot,
 } from "../services/agentMemory";
@@ -28,6 +29,8 @@ export function AgentMemoryIndicator({ refreshToken = 0 }: Props) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [releasing, setReleasing] = useState(false);
+  const [releasingAgent, setReleasingAgent] = useState("");
+  const [agentResults, setAgentResults] = useState<Record<string, { released: number; failed: number; processReleased: boolean }>>({});
   const [error, setError] = useState("");
   const [releaseResult, setReleaseResult] = useState<{ released: number; failed: number } | null>(null);
   const [apiReady, setAPIReady] = useState(protectedAPIReady);
@@ -69,11 +72,11 @@ export function AgentMemoryIndicator({ refreshToken = 0 }: Props) {
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !releasing) setOpen(false);
+      if (event.key === "Escape" && !releasing && !releasingAgent) setOpen(false);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, releasing]);
+  }, [open, releasing, releasingAgent]);
 
   const agents = useMemo(
     () => (snapshot?.agents || []).filter((item) => item.process_count > 0 || item.session_count > 0),
@@ -84,14 +87,16 @@ export function AgentMemoryIndicator({ refreshToken = 0 }: Props) {
   const handleOpen = () => {
     setOpen(true);
     setReleaseResult(null);
+    setAgentResults({});
     void refresh();
   };
 
   const handleRelease = async () => {
-    if (releasing || sessionCount <= 0) return;
+    if (releasing || releasingAgent || sessionCount <= 0) return;
     setReleasing(true);
     setError("");
     setReleaseResult(null);
+    setAgentResults({});
     try {
       const result = await releaseAgentSessions();
       requestRef.current += 1;
@@ -104,11 +109,35 @@ export function AgentMemoryIndicator({ refreshToken = 0 }: Props) {
     }
   };
 
+  const handleReleaseAgent = async (agentName: string) => {
+    if (releasing || releasingAgent) return;
+    setReleasingAgent(agentName);
+    setError("");
+    setReleaseResult(null);
+    try {
+      const result = await releaseAgent(agentName);
+      requestRef.current += 1;
+      setSnapshot(result);
+      setAgentResults((prev) => ({
+        ...prev,
+        [agentName]: {
+          released: result.released_sessions,
+          failed: result.failed_sessions,
+          processReleased: result.process_released,
+        },
+      }));
+    } catch (err) {
+      setError(String((err as Error)?.message || t("agentMemory.releaseFailed")));
+    } finally {
+      setReleasingAgent("");
+    }
+  };
+
   const modal = open && typeof document !== "undefined" ? createPortal(
     <div
       role="presentation"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget && !releasing) setOpen(false);
+        if (event.target === event.currentTarget && !releasing && !releasingAgent) setOpen(false);
       }}
       style={{
         position: "fixed",
@@ -142,22 +171,34 @@ export function AgentMemoryIndicator({ refreshToken = 0 }: Props) {
         </h2>
 
         <div style={{ marginTop: "14px", border: "1px solid var(--border-color)", borderRadius: "10px", overflow: "hidden" }}>
-          <div style={{ display: "grid", gridTemplateColumns: "minmax(62px, 1fr) 48px 76px 58px", gap: "4px", padding: "8px 10px", background: "color-mix(in srgb, var(--panel-bg) 70%, var(--border-color))", color: "var(--text-secondary)", fontSize: "11px", fontWeight: 700 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(56px, 1fr) 44px 70px 52px 66px", gap: "4px", padding: "8px 10px", background: "color-mix(in srgb, var(--panel-bg) 70%, var(--border-color))", color: "var(--text-secondary)", fontSize: "11px", fontWeight: 700 }}>
             <span>{t("agentMemory.agent")}</span>
             <span style={{ textAlign: "right" }}>{t("agentMemory.processes")}</span>
             <span style={{ textAlign: "right" }}>{t("agentMemory.memory")}</span>
             <span style={{ textAlign: "right" }}>{t("agentMemory.sessions")}</span>
+            <span style={{ textAlign: "right" }}>{t("agentMemory.releaseColumn")}</span>
           </div>
           {loading && !snapshot ? (
             <div style={{ padding: "18px 10px", textAlign: "center", color: "var(--text-secondary)", fontSize: "12px" }}>{t("agentMemory.loading")}</div>
           ) : agents.length === 0 ? (
             <div style={{ padding: "18px 10px", textAlign: "center", color: "var(--text-secondary)", fontSize: "12px" }}>{t("agentMemory.noAgents")}</div>
           ) : agents.map((item, index) => (
-            <div key={item.name} style={{ display: "grid", gridTemplateColumns: "minmax(62px, 1fr) 48px 76px 58px", gap: "4px", padding: "10px", borderTop: index === 0 ? "none" : "1px solid var(--border-color)", color: "var(--text-primary)", fontSize: "12px", alignItems: "center" }}>
+            <div key={item.name} style={{ display: "grid", gridTemplateColumns: "minmax(56px, 1fr) 44px 70px 52px 66px", gap: "4px", padding: "10px", borderTop: index === 0 ? "none" : "1px solid var(--border-color)", color: "var(--text-primary)", fontSize: "12px", alignItems: "center" }}>
               <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 650 }} title={item.name}>{item.name}</span>
               <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{item.process_count}</span>
               <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{formatBytes(item.memory_bytes)}</span>
               <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{item.session_count}</span>
+              <span style={{ textAlign: "right" }}>
+                <button
+                  type="button"
+                  onClick={() => void handleReleaseAgent(item.name)}
+                  disabled={releasing || releasingAgent !== ""}
+                  title={t("agentMemory.releaseAgentTitle", { name: item.name })}
+                  style={{ height: "24px", padding: "0 8px", borderRadius: "7px", border: "1px solid var(--panel-border)", background: "transparent", color: "var(--text-primary)", cursor: releasing || releasingAgent !== "" ? "not-allowed" : "pointer", fontSize: "11px", fontWeight: 650, opacity: releasing || releasingAgent !== "" ? 0.55 : 1 }}
+                >
+                  {releasingAgent === item.name ? t("agentMemory.releasing") : t("agentMemory.releaseAgent")}
+                </button>
+              </span>
             </div>
           ))}
         </div>
@@ -172,11 +213,22 @@ export function AgentMemoryIndicator({ refreshToken = 0 }: Props) {
               : t("agentMemory.releaseDone", { count: releaseResult.released })}
           </div>
         ) : null}
+        {Object.keys(agentResults).length > 0 ? (
+          <div style={{ marginTop: "10px", padding: "9px 11px", borderRadius: "9px", background: "rgba(22, 163, 74, 0.10)", color: "#15803d", fontSize: "12px", lineHeight: 1.7 }}>
+            {Object.entries(agentResults).map(([name, result]) => (
+              <div key={name}>
+                {t("agentMemory.agentReleaseDone", { name, count: result.released })}
+                {result.processReleased ? t("agentMemory.agentReleaseProcess") : ""}
+                {result.failed > 0 ? t("agentMemory.agentReleaseFailed", { count: result.failed }) : ""}
+              </div>
+            ))}
+          </div>
+        ) : null}
         {error ? <div style={{ marginTop: "10px", padding: "9px 11px", borderRadius: "9px", background: "rgba(220, 38, 38, 0.09)", color: "#dc2626", fontSize: "12px", overflowWrap: "anywhere" }}>{error}</div> : null}
 
         <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "18px" }}>
-          <button type="button" onClick={() => setOpen(false)} disabled={releasing} style={{ height: "34px", padding: "0 14px", borderRadius: "9px", border: "1px solid var(--panel-border)", background: "transparent", color: "var(--text-primary)", cursor: releasing ? "not-allowed" : "pointer", fontWeight: 650 }}>{t("common.cancel")}</button>
-          <button type="button" onClick={() => void handleRelease()} disabled={releasing || loading || sessionCount <= 0} style={{ height: "34px", padding: "0 14px", borderRadius: "9px", border: "none", background: "var(--accent-color)", color: "#fff", cursor: releasing ? "wait" : "pointer", fontWeight: 750, opacity: releasing || loading || sessionCount <= 0 ? 0.55 : 1 }}>
+          <button type="button" onClick={() => setOpen(false)} disabled={releasing || releasingAgent !== ""} style={{ height: "34px", padding: "0 14px", borderRadius: "9px", border: "1px solid var(--panel-border)", background: "transparent", color: "var(--text-primary)", cursor: releasing || releasingAgent !== "" ? "not-allowed" : "pointer", fontWeight: 650 }}>{t("common.cancel")}</button>
+          <button type="button" onClick={() => void handleRelease()} disabled={releasing || releasingAgent !== "" || loading || sessionCount <= 0} style={{ height: "34px", padding: "0 14px", borderRadius: "9px", border: "none", background: "var(--accent-color)", color: "#fff", cursor: releasing ? "wait" : "pointer", fontWeight: 750, opacity: releasing || releasingAgent !== "" || loading || sessionCount <= 0 ? 0.55 : 1 }}>
             {releasing ? t("agentMemory.releasing") : t("agentMemory.releaseNow")}
           </button>
         </div>
