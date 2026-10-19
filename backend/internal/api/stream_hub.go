@@ -820,8 +820,12 @@ func (h *StreamHub) ReplayPending(rootID, clientID, sessionKey, eventCursor stri
 }
 
 func (h *StreamHub) HasReplayClients(rootID, sessionKey string) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.hasReplayClientsLocked(sessionKey)
+}
+
+func (h *StreamHub) hasReplayClientsLocked(sessionKey string) bool {
 	for _, replayKey := range h.getReplayKeyListLocked(sessionKey, "") {
 		replay := h.replayStates[replayKey]
 		if replay != nil && replay.Status == ClientStreamStatusReplay {
@@ -831,25 +835,62 @@ func (h *StreamHub) HasReplayClients(rootID, sessionKey string) bool {
 	return false
 }
 
+// pendingReplayCleanupTimeout bounds how long a completed turn keeps its replay
+// buffer for clients that are still reconnecting. It must never block the turn:
+// a stale client otherwise keeps the session marked as replying forever and all
+// later messages are queued behind a turn that already finished.
+const pendingReplayCleanupTimeout = 2 * time.Minute
+
 func (h *StreamHub) ClearSessionPending(sessionKey string) {
 	if blank(sessionKey) {
 		return
 	}
-	for h.HasReplayClients("", sessionKey) {
-		time.Sleep(10 * time.Millisecond)
+	h.mu.Lock()
+	state := h.pendingSessions[sessionKey]
+	if state == nil {
+		h.mu.Unlock()
+		return
+	}
+	// Mark the turn finished before touching the replay buffer. IsSessionReplying
+	// only reads Active, so a slow or dead replay client can no longer make the
+	// session look busy.
+	state.Active = false
+	state.User = nil
+	state.Summary = ""
+	state.UpdatedAt = time.Now().UTC()
+	hasReplay := h.hasReplayClientsLocked(sessionKey)
+	if !hasReplay {
+		state.ReplyingList = nil
+	}
+	if len(state.Queue) == 0 && !hasReplay {
+		delete(h.pendingSessions, sessionKey)
+		h.clearReplayStatesForSessionLocked(sessionKey)
+	}
+	h.mu.Unlock()
+
+	if hasReplay {
+		go h.clearPendingAfterReplay(sessionKey)
+	}
+}
+
+// clearPendingAfterReplay drops the buffer once the reconnecting clients have
+// caught up. It runs in the background so a stuck client cannot pin the session
+// in the replying state or block the next queued message.
+func (h *StreamHub) clearPendingAfterReplay(sessionKey string) {
+	deadline := time.Now().Add(pendingReplayCleanupTimeout)
+	for time.Now().Before(deadline) {
+		if !h.HasReplayClients("", sessionKey) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	state := h.pendingSessions[sessionKey]
-	if state != nil && len(state.Queue) > 0 {
-		state.Active = false
-		state.User = nil
-		state.ReplyingList = nil
-		state.Summary = ""
-		state.UpdatedAt = time.Now().UTC()
-	} else {
-		delete(h.pendingSessions, sessionKey)
+	if state == nil || state.Active || len(state.Queue) > 0 {
+		return
 	}
+	delete(h.pendingSessions, sessionKey)
 	h.clearReplayStatesForSessionLocked(sessionKey)
 }
 
@@ -890,8 +931,11 @@ func (h *StreamHub) BroadcastSessionDone(rootID, sessionKey, requestID string) {
 		Completed: time.Now().UTC(),
 	}
 	h.mu.Unlock()
+	// Replay clients receive their completion from replayCompletionToClient once
+	// they catch up. Sending it here as well would duplicate session.done for a
+	// client that is still replaying when the turn finishes.
 	resp := buildSessionDoneResponse(rootID, sessionKey, requestID, false)
-	for _, clientID := range h.GetSessionClientIDs(sessionKey, false) {
+	for _, clientID := range h.GetSessionClientIDs(sessionKey, true) {
 		h.SendToClient(clientID, resp)
 	}
 }

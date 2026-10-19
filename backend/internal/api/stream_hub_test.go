@@ -118,6 +118,93 @@ func TestReplayPendingReplaysWholeTurnWhenBaseExchangeSeqRepeats(t *testing.T) {
 	}
 }
 
+func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not met before timeout")
+}
+
+// A replay client that never reaches live must not keep the session marked as
+// replying, otherwise every later message is queued behind a turn that has
+// already finished.
+func TestClearSessionPendingDoesNotBlockOnStaleReplayClient(t *testing.T) {
+	hub := NewStreamHub(nil)
+	startTurn(hub, "sess", 0)
+	turnEvents(hub, "sess", 3)
+	hub.mu.Lock()
+	hub.replayStates[pendingClientKey("stale-client", "sess")] = &ClientReplayState{
+		Status: ClientStreamStatusReplay,
+	}
+	hub.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		hub.ClearSessionPending("sess")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("ClearSessionPending blocked on a stale replay client")
+	}
+
+	if hub.IsSessionReplying("sess") {
+		t.Fatal("session still reports replying after the turn finished")
+	}
+	hub.mu.RLock()
+	state := hub.pendingSessions["sess"]
+	hub.mu.RUnlock()
+	if state == nil || len(state.ReplyingList) != 3 {
+		t.Fatalf("replay buffer was not preserved for the reconnecting client: %#v", state)
+	}
+
+	hub.mu.Lock()
+	delete(hub.replayStates, pendingClientKey("stale-client", "sess"))
+	hub.mu.Unlock()
+	waitForCondition(t, time.Second, func() bool {
+		hub.mu.RLock()
+		defer hub.mu.RUnlock()
+		_, ok := hub.pendingSessions["sess"]
+		return !ok
+	})
+}
+
+// A completed turn with a queued message stays available for the queue but is
+// no longer considered replying, so the queued message can start immediately.
+func TestClearSessionPendingReleasesReplyStateWithQueuedMessage(t *testing.T) {
+	hub := NewStreamHub(nil)
+	startTurn(hub, "sess", 0)
+	turnEvents(hub, "sess", 2)
+	hub.EnqueueSessionMessage("root", "sess", "title", QueuedUserMessage{
+		ID: "queued-1",
+		PendingUserMessage: PendingUserMessage{
+			Agent:   "codex",
+			Content: "next",
+		},
+	})
+
+	hub.ClearSessionPending("sess")
+
+	if hub.IsSessionReplying("sess") {
+		t.Fatal("session still reports replying with a queued message")
+	}
+	hub.mu.RLock()
+	state := hub.pendingSessions["sess"]
+	hub.mu.RUnlock()
+	if state == nil || state.Active || len(state.Queue) != 1 {
+		t.Fatalf("queued state = %#v, want inactive with one queued message", state)
+	}
+	if len(state.ReplyingList) != 0 {
+		t.Fatalf("replay buffer kept without a replay client: %d events", len(state.ReplyingList))
+	}
+}
+
 // An unknown session has nothing to replay and must go straight to live.
 func TestReplayPendingWithoutPendingStateGoesLive(t *testing.T) {
 	hub := NewStreamHub(nil)
