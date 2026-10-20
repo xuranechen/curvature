@@ -418,6 +418,11 @@ func TestSharedFileWatcherShouldIgnoreLargeGeneratedDirectories(t *testing.T) {
 		{filepath.Join(rootDir, ".curvature"), true},
 		{filepath.Join(rootDir, ".curvature", "state.json"), true},
 		{filepath.Join(rootDir, ".curvature2"), false},
+		{filepath.Join(rootDir, ".toolchain", "flutter", "bin"), true},
+		{filepath.Join(rootDir, ".dart_tool"), true},
+		{filepath.Join(rootDir, ".tmp"), true},
+		{filepath.Join(rootDir, ".npm-cache"), true},
+		{filepath.Join(rootDir, ".toolchain2"), false},
 		{filepath.Join(rootDir, "src"), false},
 		{filepath.Join(rootDir, "tmpfile"), false},
 	}

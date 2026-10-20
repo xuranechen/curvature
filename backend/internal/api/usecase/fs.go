@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	stdmime "mime"
 	"os"
 	"path/filepath"
@@ -1011,20 +1012,35 @@ func (s *Service) RenameManagedDir(_ context.Context, in RenameManagedDirInput) 
 	return RenameManagedDirOutput{OldRootID: rootID, Dir: dir}, nil
 }
 
+// ensureFileWatcher is best effort: every caller discards the result and only
+// wants the directory watched. It runs off the request's goroutine because the
+// watcher is the one dependency on this path that can block for a long time (see
+// SharedFileWatcher.WatchDir) — a listing or a read must never wait on it.
+// Before this, one stuck watch made every /api/tree and /api/file request for
+// that root hang forever, with nothing written to the request log.
 func (s *Service) ensureFileWatcher(rootID, dir string) {
 	if strings.TrimSpace(rootID) == "" {
 		return
 	}
-	manager, err := s.Registry.GetSessionManager(rootID)
-	if err != nil || manager == nil {
-		return
-	}
-	watcher, err := s.Registry.GetFileWatcher(rootID, manager)
-	if err != nil || watcher == nil {
-		return
-	}
-	if strings.TrimSpace(dir) == "" {
-		dir = "."
-	}
-	_ = watcher.WatchDir(dir)
+	go func() {
+		// A panic here would take the whole server down, and net/http is no
+		// longer there to recover it.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[fs/watcher] ensure.panic root=%s dir=%s err=%v", rootID, dir, r)
+			}
+		}()
+		manager, err := s.Registry.GetSessionManager(rootID)
+		if err != nil || manager == nil {
+			return
+		}
+		watcher, err := s.Registry.GetFileWatcher(rootID, manager)
+		if err != nil || watcher == nil {
+			return
+		}
+		if strings.TrimSpace(dir) == "" {
+			dir = "."
+		}
+		_ = watcher.WatchDir(dir)
+	}()
 }

@@ -22,7 +22,7 @@ var ignoredWatchNames = map[string]struct{}{
 	".cache":        {},
 	".git":          {},
 	".gradle":       {},
-	".curvature":       {},
+	".curvature":    {},
 	".mypy_cache":   {},
 	".next":         {},
 	".nuxt":         {},
@@ -44,6 +44,17 @@ var ignoredWatchNames = map[string]struct{}{
 	"tmp":           {},
 	"vendor":        {},
 	"venv":          {},
+	// Scratch and toolchain trees. A project can carry tens of thousands of
+	// directories under these names (a checked-out Flutter SDK, a package cache),
+	// and every one of them would otherwise be a candidate watch — against a cap
+	// of maxWatchDirs, on a tree that is only ever rewritten by tooling.
+	".dart_tool":  {},
+	".npm-cache":  {},
+	".pnpm-store": {},
+	".publish":    {},
+	".shots":      {},
+	".tmp":        {},
+	".toolchain":  {},
 }
 
 // SharedFileWatcher manages file watching for one root shared by multiple sessions.
@@ -52,6 +63,11 @@ type SharedFileWatcher struct {
 	watcher      *fsnotify.Watcher
 	sessionStore SessionFileRecorder
 
+	// addMu serializes the calls that talk to fsnotify. It is deliberately not
+	// sw.mu: adding a watch is the one operation here that can block for a long
+	// time (an unresponsive volume, a handle the OS will not hand out), and sw.mu
+	// is on the path of every directory listing and every file read.
+	addMu             sync.Mutex
 	mu                sync.RWMutex
 	sessions          map[string]*sessionInfo
 	watchedDirs       map[string]struct{}
@@ -393,7 +409,11 @@ func (sw *SharedFileWatcher) run() {
 					Op:     event.Op.String(),
 					IsDir:  true,
 				})
-				_ = sw.WatchDir(rel)
+				// Off the event loop: a stuck Add must not stop this loop from
+				// draining fsnotify, which is the only way changes are reported.
+				go func(dir string) {
+					_ = sw.WatchDir(dir)
+				}(rel)
 				continue
 			}
 			sw.emitFileChange(FileChangeEvent{
@@ -557,23 +577,39 @@ func (sw *SharedFileWatcher) WatchDir(dirRel string) error {
 		return nil
 	}
 	clean := filepath.Clean(dirAbs)
+
+	// Adding a watch is the one call in this file that can block indefinitely, so
+	// it runs under its own mutex and never under sw.mu. Holding sw.mu across
+	// fsnotify.Add meant a single stuck Add froze every later WatchDir call for
+	// that root, and with it every directory listing and every file read — the
+	// project's file tree simply stopped loading until the process was restarted.
+	sw.addMu.Lock()
+	defer sw.addMu.Unlock()
+
 	sw.mu.Lock()
-	defer sw.mu.Unlock()
 	select {
 	case <-sw.done:
+		sw.mu.Unlock()
 		return nil
 	default:
 	}
 	if _, ok := sw.watchedDirs[clean]; ok {
+		sw.mu.Unlock()
 		return nil
 	}
 	if len(sw.watchedDirs) >= maxWatchDirs {
+		sw.mu.Unlock()
 		return nil
 	}
+	sw.mu.Unlock()
+
 	if err := sw.watcher.Add(clean); err != nil {
 		return err
 	}
+
+	sw.mu.Lock()
 	sw.watchedDirs[clean] = struct{}{}
+	sw.mu.Unlock()
 	return nil
 }
 
