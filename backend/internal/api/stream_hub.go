@@ -2,7 +2,9 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,11 +26,34 @@ type StreamHub struct {
 	e2eeManager     *e2ee.Manager
 	clients         map[string]*websocket.Conn
 	connLocks       map[*websocket.Conn]*sync.Mutex
+	writers         map[string]*clientWriter
 	sessionClients  map[string]map[string]struct{}
 	pendingSessions map[string]*SessionPendingState
 	replayStates    map[string]*ClientReplayState
 	completed       map[string]*CompletedSessionState
 	nextTurnID      uint64
+}
+
+// clientSendQueue bounds how many frames may wait for one client's socket.
+//
+// Every data frame for one browser is handed to that browser's own writer
+// goroutine instead of being written by the goroutine that produced it. That
+// producer can be the ACP notification loop, and an ACP client does not see a
+// response until every notification delivered before it has been handled
+// (acp-go-sdk: waitNotificationsUpTo). Writing the socket inline therefore let a
+// slow or half-dead browser pace — and in practice wedge — the end of a turn:
+// session.done was only emitted after the agent prompt returned, so the session
+// stayed "replying" and every later message queued behind it forever.
+const clientSendQueue = 512
+
+// clientWriter serializes one client's data frames on its own goroutine.
+type clientWriter struct {
+	id   string
+	conn *websocket.Conn
+	out  chan any
+	quit chan struct{}
+	done chan struct{}
+	once sync.Once
 }
 
 type PendingUserMessage struct {
@@ -115,6 +140,7 @@ func NewStreamHub(e2eeManager *e2ee.Manager) *StreamHub {
 		e2eeManager:     e2eeManager,
 		clients:         make(map[string]*websocket.Conn),
 		connLocks:       make(map[*websocket.Conn]*sync.Mutex),
+		writers:         make(map[string]*clientWriter),
 		sessionClients:  make(map[string]map[string]struct{}),
 		pendingSessions: make(map[string]*SessionPendingState),
 		replayStates:    make(map[string]*ClientReplayState),
@@ -273,11 +299,27 @@ func (h *StreamHub) RegisterClient(clientID string, conn *websocket.Conn) {
 		return
 	}
 	h.mu.Lock()
+	previous := h.writers[clientID]
 	h.clients[clientID] = conn
 	if _, ok := h.connLocks[conn]; !ok {
 		h.connLocks[conn] = &sync.Mutex{}
 	}
+	writer := &clientWriter{
+		id:   clientID,
+		conn: conn,
+		out:  make(chan any, clientSendQueue),
+		quit: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+	h.writers[clientID] = writer
 	h.mu.Unlock()
+
+	// A client id that reconnects before its previous socket was torn down keeps
+	// the newest connection and retires the old writer.
+	if previous != nil && previous != writer {
+		previous.stop()
+	}
+	go h.runClientWriter(writer)
 }
 
 func (h *StreamHub) UnregisterClient(clientID string, conn *websocket.Conn) {
@@ -285,13 +327,14 @@ func (h *StreamHub) UnregisterClient(clientID string, conn *websocket.Conn) {
 		return
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	existing := h.clients[clientID]
 	if existing != conn {
+		h.mu.Unlock()
 		return
 	}
+	writer := h.writers[clientID]
+	delete(h.writers, clientID)
 	delete(h.clients, clientID)
-	delete(h.connLocks, conn)
 	for sessionKey, clientSet := range h.sessionClients {
 		delete(clientSet, clientID)
 		if len(clientSet) == 0 {
@@ -301,7 +344,85 @@ func (h *StreamHub) UnregisterClient(clientID string, conn *websocket.Conn) {
 	for _, replayKey := range h.getReplayKeyListLocked("", clientID) {
 		delete(h.replayStates, replayKey)
 	}
+	h.mu.Unlock()
+
+	if writer != nil {
+		writer.stop()
+		// Wait for the writer to leave writeJSONOnConn before dropping the
+		// connection lock, so an in-flight write cannot re-create the entry this
+		// teardown removes (that would pin the dead connection in memory).
+		select {
+		case <-writer.done:
+		case <-time.After(wsWriteWait + time.Second):
+			log.Printf("[ws] write.drain_timeout client=%s", clientID)
+		}
+	}
+	h.mu.Lock()
+	delete(h.connLocks, conn)
+	h.mu.Unlock()
 }
+
+// runClientWriter drains one client's queue, in order, on its own goroutine.
+func (h *StreamHub) runClientWriter(writer *clientWriter) {
+	defer close(writer.done)
+	for {
+		select {
+		case <-writer.quit:
+			return
+		case value := <-writer.out:
+			if err := h.writeJSONOnConn(writer.id, writer.conn, value); err != nil {
+				// writeJSONOnConn already closed the socket; retire the writer so
+				// later frames fail fast instead of queueing behind a dead peer.
+				writer.stop()
+				return
+			}
+		}
+	}
+}
+
+// enqueue hands one frame to the writer without ever blocking the caller.
+func (writer *clientWriter) enqueue(value any) error {
+	if writer == nil {
+		return nil
+	}
+	select {
+	case <-writer.quit:
+		return errClientGone
+	default:
+	}
+	select {
+	case writer.out <- value:
+		return nil
+	case <-writer.quit:
+		return errClientGone
+	default:
+		// The client cannot keep up with what the turn is producing. Dropping the
+		// connection is deliberate: the alternative is letting this browser set
+		// the pace of the agent, which is exactly what deadlocked turn endings.
+		log.Printf("[ws] write.overflow client=%s queue=%d action=close_slow_client", writer.id, clientSendQueue)
+		writer.stop()
+		return errClientBackpressure
+	}
+}
+
+// stop retires the writer and closes its socket. Safe to call repeatedly and
+// from the writer's own goroutine.
+func (writer *clientWriter) stop() {
+	if writer == nil {
+		return
+	}
+	writer.once.Do(func() {
+		close(writer.quit)
+		if writer.conn != nil {
+			_ = writer.conn.Close()
+		}
+	})
+}
+
+var (
+	errClientGone         = errors.New("client gone")
+	errClientBackpressure = errors.New("client backpressure")
+)
 
 func (h *StreamHub) BindSessionClient(sessionKey, clientID string) {
 	if blank(sessionKey) || blank(clientID) {
@@ -1008,12 +1129,41 @@ func (h *StreamHub) WriteJSON(clientID string, conn *websocket.Conn, value any) 
 	if conn == nil {
 		return nil
 	}
+	if writer := h.clientWriterFor(clientID, conn); writer != nil {
+		return writer.enqueue(value)
+	}
+	// An unregistered connection writes inline: nothing else can be waiting on it,
+	// so it cannot pace a turn.
+	return h.writeJSONOnConn(clientID, conn, value)
+}
+
+// clientWriterFor returns the queued writer owning this exact connection, or nil
+// when the connection is not (or no longer) the registered one.
+func (h *StreamHub) clientWriterFor(clientID string, conn *websocket.Conn) *clientWriter {
+	if blank(clientID) {
+		return nil
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	writer := h.writers[clientID]
+	if writer == nil || writer.conn != conn {
+		return nil
+	}
+	return writer
+}
+
+// writeJSONOnConn writes exactly one frame now: it takes the connection lock,
+// applies the E2EE envelope, and bounds the write so a dead peer cannot hold it
+// longer than wsWriteWait. It is only reached from that client's writer
+// goroutine, or for a connection that was never registered, so it can no longer
+// pace an agent turn.
+func (h *StreamHub) writeJSONOnConn(clientID string, conn *websocket.Conn, value any) error {
 	lock := h.getConnLock(conn)
 	lock.Lock()
 	defer lock.Unlock()
 	if h.e2eeManager != nil && h.e2eeManager.Enabled() {
 		if resp, ok := value.(WSResponse); ok && resp.Type == "e2ee.error" {
-			return conn.WriteJSON(resp)
+			return h.writeFrame(clientID, conn, resp)
 		}
 		sess, err := h.e2eeManager.SessionForClient(clientID)
 		if err != nil {
@@ -1027,9 +1177,21 @@ func (h *StreamHub) WriteJSON(clientID string, conn *websocket.Conn, value any) 
 		if err != nil {
 			return err
 		}
-		return conn.WriteJSON(envelope)
+		return h.writeFrame(clientID, conn, envelope)
 	}
-	return conn.WriteJSON(value)
+	return h.writeFrame(clientID, conn, value)
+}
+
+func (h *StreamHub) writeFrame(clientID string, conn *websocket.Conn, value any) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+	err := conn.WriteJSON(value)
+	if err != nil {
+		log.Printf("[ws] write.error client=%s err=%v", clientID, err)
+		_ = conn.Close()
+		return err
+	}
+	_ = conn.SetWriteDeadline(time.Time{})
+	return nil
 }
 
 func (h *StreamHub) getConnLock(conn *websocket.Conn) *sync.Mutex {

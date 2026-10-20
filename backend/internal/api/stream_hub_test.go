@@ -1,8 +1,15 @@
 package api
 
 import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // turnEvents simulates a running turn by appending n message_chunk events and
@@ -258,5 +265,92 @@ func TestReplayPendingCompletedTurnCursorDoesNotResumeNextTurn(t *testing.T) {
 		if event.EventCursor != want[i] {
 			t.Fatalf("replayed[%d] = %q, want %q", i, event.EventCursor, want[i])
 		}
+	}
+}
+
+// The regression behind stuck turn endings: the goroutine that produces a frame
+// (the ACP notification loop, which also gates session.done) must never wait on
+// one browser's socket. A client that cannot keep up is retired instead.
+func TestClientWriterEnqueueNeverBlocksAndDropsSlowClient(t *testing.T) {
+	writer := &clientWriter{
+		id:   "slow",
+		out:  make(chan any, 2),
+		quit: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+	if err := writer.enqueue("a"); err != nil {
+		t.Fatalf("first enqueue: %v", err)
+	}
+	if err := writer.enqueue("b"); err != nil {
+		t.Fatalf("second enqueue: %v", err)
+	}
+
+	start := time.Now()
+	err := writer.enqueue("c")
+	elapsed := time.Since(start)
+	if !errors.Is(err, errClientBackpressure) {
+		t.Fatalf("err = %v, want errClientBackpressure", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("enqueue blocked for %s; a full queue must fail fast", elapsed)
+	}
+	select {
+	case <-writer.quit:
+	default:
+		t.Fatal("a client that cannot keep up was not retired")
+	}
+	if err := writer.enqueue("d"); !errors.Is(err, errClientGone) {
+		t.Fatalf("err = %v after retirement, want errClientGone", err)
+	}
+}
+
+// End-to-end form of the same regression: a browser that stops reading must not
+// be able to pace the goroutine that produced the frame. Before the per-client
+// writer, this call blocked inside conn.WriteJSON, and because the ACP client
+// gates session/prompt on handling every notification first, the turn could
+// never finish.
+func TestSendToClientDoesNotBlockOnStalledClient(t *testing.T) {
+	hub := NewStreamHub(nil)
+	registered := make(chan struct{})
+	var once sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		hub.RegisterClient("stalled", conn)
+		once.Do(func() { close(registered) })
+		// Hold the connection open without ever reading from it.
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	dialer := websocket.DefaultDialer
+	client, _, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	<-registered
+	waitForCondition(t, time.Second, func() bool {
+		hub.mu.RLock()
+		defer hub.mu.RUnlock()
+		return hub.writers["stalled"] != nil
+	})
+
+	// One large frame so the socket buffers fill quickly, then far more frames
+	// than any peer could absorb.
+	payload := WSResponse{Type: "session_stream", Payload: map[string]any{"text": strings.Repeat("x", 1<<20)}}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < clientSendQueue+200; i++ {
+			hub.SendToClient("stalled", payload)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SendToClient blocked on a client that stopped reading; the turn would never finish")
 	}
 }

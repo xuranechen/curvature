@@ -2,10 +2,12 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -416,5 +418,75 @@ func TestWSProofPathExcludesProofQueryParams(t *testing.T) {
 
 	if got, want := wsProofPath(req), "/ws?client_id=web-test"; got != want {
 		t.Fatalf("wsProofPath() = %q, want %q", got, want)
+	}
+}
+
+// withShortTurnWatchdog shortens the turn watchdog for the duration of one test.
+func withShortTurnWatchdog(t *testing.T, idle, interval time.Duration) {
+	t.Helper()
+	previousIdle, previousInterval := sessionTurnIdleTimeout, sessionTurnWatchInterval
+	sessionTurnIdleTimeout, sessionTurnWatchInterval = idle, interval
+	t.Cleanup(func() {
+		sessionTurnIdleTimeout, sessionTurnWatchInterval = previousIdle, previousInterval
+	})
+}
+
+// An agent call that never returns used to keep the session marked as replying
+// forever, so every later message queued behind a turn that would never finish.
+// The turn must be declared stalled, and its context cancelled so the prompt
+// unwinds and the per-session send lock is released.
+func TestAwaitSessionTurnAbortsStalledTurn(t *testing.T) {
+	withShortTurnWatchdog(t, 30*time.Millisecond, 5*time.Millisecond)
+
+	handler := &WSHandler{}
+	turnResult := make(chan error, 1) // never receives: the agent call is wedged
+	activity := &atomic.Int64{}
+	activity.Store(time.Now().Add(-time.Hour).UnixNano())
+	cancelCalls := make(chan struct{}, 1)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- handler.awaitSessionTurn(context.Background(), turnResult, activity, "root", "sess", "req", func() {
+			select {
+			case cancelCalls <- struct{}{}:
+			default:
+			}
+		})
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errSessionTurnStalled) {
+			t.Fatalf("err = %v, want errSessionTurnStalled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("awaitSessionTurn never reported the wedged turn as stalled")
+	}
+
+	select {
+	case <-cancelCalls:
+	case <-time.After(time.Second):
+		t.Fatal("a stalled turn must cancel its context, or the prompt never unwinds")
+	}
+}
+
+// A turn that keeps producing updates must never be declared stalled.
+func TestAwaitSessionTurnReturnsAgentResult(t *testing.T) {
+	withShortTurnWatchdog(t, time.Hour, 5*time.Millisecond)
+
+	handler := &WSHandler{}
+	turnResult := make(chan error, 1)
+	activity := &atomic.Int64{}
+	activity.Store(time.Now().UnixNano())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		turnResult <- nil
+	}()
+
+	err := handler.awaitSessionTurn(context.Background(), turnResult, activity, "root", "sess", "req", func() {
+		t.Error("a completing turn must not be cancelled")
+	})
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
 	}
 }

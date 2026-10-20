@@ -851,16 +851,6 @@ class SessionService {
       branch?: string;
     },
   ): Promise<boolean> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      console.warn("[session/send] blocked", {
-        requestId,
-        rootId,
-        sessionKey: sessionKey || null,
-        readyState: this.ws?.readyState ?? null,
-      });
-      return false;
-    }
-
     if (sessionKey) {
       this.eventCursors.delete(this.eventCursorKey(rootId, sessionKey));
     }
@@ -887,7 +877,23 @@ class SessionService {
       },
     };
 
+    // Record it before looking at the socket: a send attempted while the socket is
+    // reconnecting must be replayed by resendPendingMessages() when it opens, not
+    // dropped. Dropping it here left the optimistic user bubble on screen with no
+    // turn behind it, which is indistinguishable from "the agent is stuck".
+    // Replaying is safe because the backend reserves request ids
+    // (WSHandler.reserveClientRequest), so a duplicate delivery is a no-op.
     this.pendingMessages.set(requestId, { id: requestId, message: msg });
+
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      console.warn("[session/send] queued_offline", {
+        requestId,
+        rootId,
+        sessionKey: sessionKey || null,
+        readyState: this.ws?.readyState ?? null,
+      });
+      return true;
+    }
     return this.sendWSMessage(msg);
   }
 

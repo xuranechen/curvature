@@ -1,6 +1,7 @@
 package versioning
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -1047,5 +1048,49 @@ func TestInfoReportsStoreShape(t *testing.T) {
 	}
 	if !status.Initialized || !status.Clean {
 		t.Fatalf("Status = %+v, want initialized and clean", status)
+	}
+}
+
+// A store whose config.json was damaged outside this process must still open: the
+// failure the user saw was "operation failed: versioning: corrupt object:
+// config.json", raised before anything could be recovered. The damaged bytes are
+// kept beside the original and the store continues from defaults.
+func TestLoadConfigResetsADamagedConfig(t *testing.T) {
+	store, _ := newTestStore(t)
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	damaged := "{\n  \"format\": c,\n  \"max_file_bytes\": c67772c6\n}\n"
+	if err := os.WriteFile(store.configPath(), []byte(damaged), 0o644); err != nil {
+		t.Fatalf("write damaged config: %v", err)
+	}
+
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig on a damaged config: %v", err)
+	}
+	if cfg.Format != StoreFormatVersion || cfg.MaxFileBytes != defaultMaxFileBytes || cfg.MaxFiles != defaultMaxFiles {
+		t.Fatalf("config = %+v, want store defaults", cfg)
+	}
+
+	backup, err := os.ReadFile(store.configPath() + ".corrupt")
+	if err != nil {
+		t.Fatalf("damaged config was not preserved: %v", err)
+	}
+	if string(backup) != damaged {
+		t.Fatalf("backup = %q, want the original damaged bytes", backup)
+	}
+
+	rewritten, err := os.ReadFile(store.configPath())
+	if err != nil {
+		t.Fatalf("read rewritten config: %v", err)
+	}
+	var parsed storeConfig
+	if err := json.Unmarshal(rewritten, &parsed); err != nil {
+		t.Fatalf("config was not rewritten as valid JSON: %v (%s)", err, rewritten)
+	}
+	if parsed.Format != StoreFormatVersion {
+		t.Fatalf("rewritten format = %v, want %v", parsed.Format, StoreFormatVersion)
 	}
 }

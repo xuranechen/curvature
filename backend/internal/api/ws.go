@@ -3,12 +3,14 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"curvature/backend/internal/agent"
@@ -27,12 +29,26 @@ import (
 const (
 	wsPingInterval = 30 * time.Second
 	wsPongWait     = 2 * time.Minute
+	wsWriteWait    = 10 * time.Second
 	wsProofQuery   = "e2ee_proof"
 	wsTSQuery      = "e2ee_ts"
 
 	sessionDoneSettleWindow = 50 * time.Millisecond
 	sessionDoneMaxWait      = 2 * time.Second
 )
+
+// A turn is declared stalled once it has produced no update at all for
+// sessionTurnIdleTimeout. A healthy turn streams updates continuously, so only a
+// wedged agent or a pipe that stopped draining can reach it. Both are variables
+// so tests can shorten them.
+var (
+	sessionTurnIdleTimeout   = 10 * time.Minute
+	sessionTurnWatchInterval = 15 * time.Second
+)
+
+// errSessionTurnStalled reports a turn that stopped producing updates and was
+// aborted so the session could be released.
+var errSessionTurnStalled = errors.New("session turn stalled")
 
 var upgrader = websocket.Upgrader{}
 
@@ -572,6 +588,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 		h.sendWSError(conn, clientID, req.ID, "invalid_request", "content, type and agent required")
 		return
 	}
+	log.Printf("[ws] session.message.in root=%s session=%q request=%s type=%s agent=%s content_len=%d", rootID, key, requestID, sessionType, agentName, len(content))
 
 	uc := &usecase.Service{Registry: h.AppContext}
 	streamHub := h.AppContext.GetSessionStreamHub()
@@ -726,6 +743,7 @@ func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Co
 	if queue, changed := streamHub.UnfreezeQueuedSessionMessages(key); changed {
 		streamHub.BroadcastSessionQueueUpdated(rootID, key, queue)
 	}
+	log.Printf("[ws] session.message.run root=%s session=%s request=%s", rootID, key, requestID)
 	h.runSessionMessage(job)
 }
 
@@ -878,6 +896,11 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 	msgCtx, cancel := h.sessionMessageContext()
 	defer cancel()
 	updateTracker := newTurnUpdateTracker()
+	// turnActivity is the watchdog's only input: any update, tool call or
+	// sub-session event counts as the turn being alive.
+	turnActivity := &atomic.Int64{}
+	touchTurn := func() { turnActivity.Store(time.Now().UnixNano()) }
+	touchTurn()
 	subTrackers := map[string]*turnUpdateTracker{}
 	var subTrackersMu sync.Mutex
 	subTrackerFor := func(sessionKey string) *turnUpdateTracker {
@@ -891,62 +914,76 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 		return tracker
 	}
 
-	err := uc.SendMessage(msgCtx, usecase.SendMessageInput{
-		RootID:          rootID,
-		RuntimeRootPath: job.RuntimeRootPath,
-		Key:             key,
-		Agent:           job.User.Agent,
-		Model:           job.User.Model,
-		Mode:            job.User.Mode,
-		Effort:          job.User.Effort,
-		FastService:     job.User.FastService,
-		PlanMode:        &job.User.PlanMode,
-		Shell:           job.Shell,
-		TerminalCols:    job.TerminalCols,
-		Content:         job.User.Content,
-		UserTimestamp:   job.User.Timestamp,
-		ClientCtx:       job.ClientCtx,
-		OnStart: func(start usecase.MessageStart) {
-			h.AppContext.ClearTaskAuxFlagsForSession(rootID, key)
-			streamHub.BroadcastSessionUserMessageAt(rootID, key, job.SessionType, job.SessionName, job.User.Agent, start.Model, start.Mode, start.Effort, start.FastService, job.User.PlanMode, job.User.Content, job.User.Timestamp, job.ExcludeClientID, job.Queued, start.BaseExchangeSeq)
-		},
-		OnUpdate: func(update agenttypes.Event) {
-			updateTracker.Begin()
-			defer updateTracker.End()
-			if updateToEvent(update) == nil {
-				return
-			}
-			h.AppContext.BroadcastSessionUpdate(rootID, key, update)
-		},
-		OnAgentDefaultsChanged: func(agentName string) {
-			h.AppContext.BroadcastAgentStatusChanged(agentName)
-		},
-		OnSubSessionCreated: func(created *session.Session) {
-			h.broadcastSessionMetaUpdated(rootID, created)
-			if created != nil {
-				streamHub.SetPendingReply(rootID, created.Key, created.Name)
-			}
-		},
-		OnSubSessionUpdate: func(sessionKey string, update agenttypes.Event) {
-			tracker := subTrackerFor(sessionKey)
-			tracker.Begin()
-			if updateToEvent(update) == nil {
-				tracker.End()
-				return
-			}
-			h.AppContext.BroadcastSessionUpdate(rootID, sessionKey, update)
-			if update.Type == agenttypes.EventTypeMessageDone {
-				tracker.End()
-				if ok := tracker.WaitIdle(msgCtx, sessionDoneSettleWindow, sessionDoneMaxWait); !ok {
-					log.Printf("[ws] sub-session.done.wait_timeout root=%s session=%s", rootID, sessionKey)
+	// The turn runs in its own goroutine so the watchdog can release the session
+	// even when the agent call never returns. Its result arrives on a buffered
+	// channel, so an abandoned call can still finish without blocking.
+	turnResult := make(chan error, 1)
+	go func() {
+		turnResult <- uc.SendMessage(msgCtx, usecase.SendMessageInput{
+			RootID:          rootID,
+			RuntimeRootPath: job.RuntimeRootPath,
+			Key:             key,
+			Agent:           job.User.Agent,
+			Model:           job.User.Model,
+			Mode:            job.User.Mode,
+			Effort:          job.User.Effort,
+			FastService:     job.User.FastService,
+			PlanMode:        &job.User.PlanMode,
+			Shell:           job.Shell,
+			TerminalCols:    job.TerminalCols,
+			Content:         job.User.Content,
+			UserTimestamp:   job.User.Timestamp,
+			ClientCtx:       job.ClientCtx,
+			OnStart: func(start usecase.MessageStart) {
+				touchTurn()
+				h.AppContext.ClearTaskAuxFlagsForSession(rootID, key)
+				streamHub.BroadcastSessionUserMessageAt(rootID, key, job.SessionType, job.SessionName, job.User.Agent, start.Model, start.Mode, start.Effort, start.FastService, job.User.PlanMode, job.User.Content, job.User.Timestamp, job.ExcludeClientID, job.Queued, start.BaseExchangeSeq)
+			},
+			OnUpdate: func(update agenttypes.Event) {
+				touchTurn()
+				updateTracker.Begin()
+				defer updateTracker.End()
+				if updateToEvent(update) == nil {
+					return
 				}
-				h.AppContext.BroadcastSessionDone(rootID, sessionKey, "")
-				return
-			}
-			tracker.End()
-		},
-	})
-	if err != nil {
+				h.AppContext.BroadcastSessionUpdate(rootID, key, update)
+			},
+			OnAgentDefaultsChanged: func(agentName string) {
+				h.AppContext.BroadcastAgentStatusChanged(agentName)
+			},
+			OnSubSessionCreated: func(created *session.Session) {
+				touchTurn()
+				h.broadcastSessionMetaUpdated(rootID, created)
+				if created != nil {
+					streamHub.SetPendingReply(rootID, created.Key, created.Name)
+				}
+			},
+			OnSubSessionUpdate: func(sessionKey string, update agenttypes.Event) {
+				touchTurn()
+				tracker := subTrackerFor(sessionKey)
+				tracker.Begin()
+				if updateToEvent(update) == nil {
+					tracker.End()
+					return
+				}
+				h.AppContext.BroadcastSessionUpdate(rootID, sessionKey, update)
+				if update.Type == agenttypes.EventTypeMessageDone {
+					tracker.End()
+					if ok := tracker.WaitIdle(msgCtx, sessionDoneSettleWindow, sessionDoneMaxWait); !ok {
+						log.Printf("[ws] sub-session.done.wait_timeout root=%s session=%s", rootID, sessionKey)
+					}
+					h.AppContext.BroadcastSessionDone(rootID, sessionKey, "")
+					return
+				}
+				tracker.End()
+			},
+		})
+	}()
+	err := h.awaitSessionTurn(msgCtx, turnResult, turnActivity, rootID, key, requestID, cancel)
+	switch {
+	case errors.Is(err, errSessionTurnStalled):
+		h.AppContext.BroadcastSessionError(rootID, key, "该回合长时间没有任何响应，已强制结束。可以重新发送消息继续。")
+	case err != nil:
 		log.Printf("[ws] session.message.error root=%s session=%s request=%s err=%v", rootID, key, requestID, err)
 		h.AppContext.BroadcastSessionError(rootID, key, err.Error())
 	}
@@ -956,6 +993,37 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 	log.Printf("[ws] session.done root=%s session=%s request=%s", rootID, key, requestID)
 	h.AppContext.BroadcastSessionDone(rootID, key, requestID)
 	h.startNextQueuedSessionMessage(rootID, key)
+}
+
+// awaitSessionTurn waits for one agent turn while watching for a turn that has
+// stopped producing updates.
+//
+// An ACP prompt carries no deadline of its own: when the agent wedges, or the
+// pipe to it stops draining, the prompt never returns, and session.done is only
+// emitted after it returns. The session then stays "replying" and every later
+// message queues behind a turn that will never finish. Declaring the turn
+// stalled cancels it and lets the normal completion path release the session, so
+// a wedged agent costs one stalled turn instead of a dead session.
+func (h *WSHandler) awaitSessionTurn(ctx context.Context, turnResult <-chan error, turnActivity *atomic.Int64, rootID, key, requestID string, cancel context.CancelFunc) error {
+	ticker := time.NewTicker(sessionTurnWatchInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-turnResult:
+			return err
+		case <-ticker.C:
+			idle := time.Since(time.Unix(0, turnActivity.Load()))
+			if idle < sessionTurnIdleTimeout {
+				continue
+			}
+			log.Printf("[ws] session.turn.stalled root=%s session=%s request=%s idle=%s action=abort_turn", rootID, key, requestID, idle.Round(time.Second))
+			// Cancelling the turn context unblocks the prompt; the abandoned
+			// SendMessage call finishes into turnResult and releases the per-session
+			// send lock, so the next queued message can still run.
+			cancel()
+			return errSessionTurnStalled
+		}
+	}
 }
 
 func (h *WSHandler) startNextQueuedSessionMessage(rootID, key string) {

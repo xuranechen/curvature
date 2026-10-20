@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -138,6 +139,13 @@ func (s *Store) statCachePath() string {
 }
 
 // LoadConfig reads the store configuration, falling back to defaults.
+//
+// A config file that no longer parses means the store was damaged outside this
+// process (a mangled copy, a bad archive restore, a dying disk). That must not
+// brick the feature: the damaged bytes are kept next to the original for
+// forensics and the store continues from defaults, which this call writes back so
+// the next open is clean. Individual objects still verify their own addresses, so
+// real content damage is reported per read instead of as an unopenable store.
 func (s *Store) LoadConfig() (storeConfig, error) {
 	data, ok, err := readFileIfExists(s.configPath())
 	if err != nil {
@@ -148,7 +156,16 @@ func (s *Store) LoadConfig() (storeConfig, error) {
 	}
 	cfg := defaultConfig()
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return storeConfig{}, fmt.Errorf("%w: config.json: %v", errCorruptObject, err)
+		backup := s.configPath() + ".corrupt"
+		if backupErr := atomicWriteFile(backup, data, 0o644); backupErr != nil {
+			log.Printf("[versioning] config.backup.error path=%s err=%v", backup, backupErr)
+		}
+		log.Printf("[versioning] config.corrupt path=%s backup=%s err=%v action=reset_to_defaults", s.configPath(), backup, err)
+		reset := defaultConfig()
+		if saveErr := s.saveConfig(reset); saveErr != nil {
+			return storeConfig{}, saveErr
+		}
+		return reset, nil
 	}
 	if cfg.MaxFileBytes <= 0 {
 		cfg.MaxFileBytes = defaultMaxFileBytes

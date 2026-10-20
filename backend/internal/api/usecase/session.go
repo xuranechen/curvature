@@ -2076,7 +2076,11 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	}
 	userTimestamp := sendMessageUserTimestamp(in, time.Now().UTC())
 	sendLock := getSessionSendLock(in.Key)
+	// One line per turn boundary: without these, a turn that never reached the
+	// agent was indistinguishable from one the agent answered with nothing.
+	log.Printf("[session] turn.send.wait_lock root=%s session=%s agent=%s", in.RootID, in.Key, in.Agent)
 	sendLock.Lock()
+	log.Printf("[session] turn.send.lock_acquired root=%s session=%s agent=%s", in.RootID, in.Key, in.Agent)
 	defer sendLock.Unlock()
 	turnCtx, turnCancel := context.WithCancel(ctx)
 	registerActiveTurn(in.RootID, in.Key, turnCancel)
@@ -2090,6 +2094,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	if err != nil {
 		return err
 	}
+	log.Printf("[session] turn.send.session_loaded root=%s session=%s", in.RootID, current.Key)
 	if in.PlanMode != nil && current.PlanMode != *in.PlanMode {
 		if err := manager.UpdatePlanMode(ctx, current, *in.PlanMode); err != nil {
 			return err
@@ -2106,6 +2111,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 			BaseExchangeSeq: len(current.Exchanges),
 		})
 	}
+	log.Printf("[session] turn.send.on_start root=%s session=%s", in.RootID, current.Key)
 	if current.Type == session.TypeCommand {
 		return s.sendCommandMessage(turnCtx, in, manager, current)
 	}
@@ -2113,6 +2119,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		log.Printf("[session/model] validate.error root=%s session=%s agent=%s model=%q err=%v", in.RootID, in.Key, strings.TrimSpace(in.Agent), strings.TrimSpace(in.Model), err)
 		return err
 	}
+	log.Printf("[session] turn.send.model_validated root=%s session=%s", in.RootID, current.Key)
 	isInitial := len(current.Exchanges) == 0
 	agentPool := s.Registry.GetAgentPool()
 	if agentPool == nil {
@@ -2123,6 +2130,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		watcher.RegisterSession(current.Key)
 		watcher.MarkSessionActive(current.Key)
 	}
+	log.Printf("[session] turn.send.watcher_registered root=%s session=%s watcher=%t", in.RootID, current.Key, watcher != nil)
 	root := manager.Root()
 	managedRootAbs, _ := root.RootDir()
 	rootAbs := managedRootAbs
@@ -2137,10 +2145,13 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		developerInstructions = replyTips
 		includeReplyTipsInUserMessage = false
 	}
+	log.Printf("[session] turn.send.agent_open root=%s session=%s agent=%s model=%q", in.RootID, current.Key, in.Agent, in.Model)
 	sess, agentCtxSeq, err := s.ensureAgentSession(turnCtx, agentPool, manager, current, in.Agent, in.Model, in.Mode, in.Effort, in.FastService, rootAbs, developerInstructions)
 	if err != nil {
+		log.Printf("[session] turn.send.agent_open.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, err)
 		return err
 	}
+	log.Printf("[session] turn.send.agent_ready root=%s session=%s agent=%s", in.RootID, current.Key, in.Agent)
 	setActiveTurnSession(in.RootID, current.Key, sess)
 
 	prompt := s.BuildPrompt(BuildPromptInput{
@@ -2319,6 +2330,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		defer finishUse()
 		return runtime.SendMessage(turnCtx, content)
 	}
+	log.Printf("[session] turn.send.dispatch root=%s session=%s agent=%s prompt_len=%d", in.RootID, current.Key, in.Agent, len(prompt))
 	sendErr := sendWithAttachedUpdates(sess, prompt)
 	if sendErr != nil && !isCanceledTurnError(sendErr) {
 		if isNonRecoverableAgentError(sendErr) {
