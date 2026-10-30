@@ -13,6 +13,8 @@ export type ErrorCode =
   | "session.pin_failed"
   | "session.sync_failed"
   | "session.slash_command_failed"
+  | "session.edit_failed"
+  | "session.delete_last_failed"
   | "app.init_failed"
   // Root/project errors
   | "root.create_failed"
@@ -167,6 +169,16 @@ class ErrorService {
       },
       "session.slash_command_failed": {
         messageKey: "error.session.slashCommandFailed",
+        severity: "error",
+        recoverable: true,
+      },
+      "session.edit_failed": {
+        messageKey: "error.session.editFailed",
+        severity: "error",
+        recoverable: true,
+      },
+      "session.delete_last_failed": {
+        messageKey: "error.session.deleteLastFailed",
         severity: "error",
         recoverable: true,
       },

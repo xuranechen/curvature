@@ -86,6 +86,7 @@ type ActionBarProps = {
   editDraftRequest?: {
     id: number;
     content: string;
+    mode?: "replace" | "append";
   } | null;
   queuedMessages?: QueuedMessageInfo[];
   inputHistory?: string[];
@@ -439,6 +440,7 @@ export function ActionBar({
   const [shells, setShells] = useState<ShellStatus[]>([]);
   const [shell, setShell] = useState("");
   const [serializedInput, setSerializedInput] = useState("");
+  const lastEditDraftRequestIdRef = useRef(0);
   const [inputHistoryIndex, setInputHistoryIndex] = useState<number | null>(null);
   const [activeToken, setActiveToken] = useState<{ type: "file" | "slash" | "prompt" | "command"; query: string } | null>(null);
   const [dragX, setDragX] = useState(0);
@@ -608,7 +610,8 @@ export function ActionBar({
   useEffect(() => {
     if (currentSession || agents.length === 0) return;
     if (agents.some((a) => a.name === agent)) return;
-    const preferred = agents.find((a) => a.available) ?? agents[0];
+    const preferred = agents.find((a) => a.last_used && a.available)
+      ?? agents.find((a) => a.available) ?? agents[0];
     if (!preferred) {
       return;
     }
@@ -795,14 +798,21 @@ export function ActionBar({
     if (!editDraftRequest) {
       return;
     }
-    const nextText = editDraftRequest.content || "";
+    if (lastEditDraftRequestIdRef.current === editDraftRequest.id) {
+      return;
+    }
+    lastEditDraftRequestIdRef.current = editDraftRequest.id;
+    const incoming = editDraftRequest.content || "";
+    const nextText = editDraftRequest.mode === "append" && serializedInput.trim()
+      ? `${serializedInput.trimEnd()}\n\n${incoming}`
+      : incoming;
     editorRef.current?.setText(nextText);
     setSerializedInput(nextText);
     setActiveToken(null);
     setCandidates([]);
     setActiveCandidateIndex(0);
     requestAnimationFrame(syncEditorHeight);
-  }, [editDraftRequest, syncEditorHeight]);
+  }, [editDraftRequest, serializedInput, syncEditorHeight]);
 
   const appendPendingAttachments = useCallback((files: File[]) => {
     if (files.length === 0) {

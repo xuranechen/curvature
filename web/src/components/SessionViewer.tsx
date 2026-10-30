@@ -1,6 +1,6 @@
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSessionStream, type TimelineItem } from "../hooks/useSessionStream";
-import type { TodoUpdate } from "../services/session";
+import { sessionService, type TodoUpdate } from "../services/session";
 import { ThinkingBlock } from "./stream/ThinkingBlock";
 import { ToolCallCard, renderToolIcon } from "./stream/ToolCallCard";
 import { AgentIcon } from "./AgentIcon";
@@ -94,6 +94,7 @@ type SessionViewerProps = {
     answers: Record<string, string>;
   }) => void | Promise<void>;
   onEditUserMessage?: (content: string) => void;
+  onDeleteLastMessage?: (target: { seq: number; content: string; timestamp: string }) => void | Promise<void>;
   onForkAgentMessage?: (seq: number) => void | Promise<void>;
   targetSeqRequestKey?: string | number;
   agents?: AgentStatus[];
@@ -1088,6 +1089,7 @@ function SessionViewerInner({
   onRemoveRelatedFile,
   onAskUserAnswer,
   onEditUserMessage,
+  onDeleteLastMessage,
   onForkAgentMessage,
   agents,
   composerOverlayInset = 0,
@@ -1123,12 +1125,42 @@ function SessionViewerInner({
     isAwaiting,
   );
   const shouldStickToBottomRef = useRef(true);
+  const latestUserIndex = timeline.reduce((last, item, index) => item.type === "user_text" ? index : last, -1);
   const lastSessionKeyRef = useRef<string | null>(null);
   const targetSeqScrollKeyRef = useRef("");
   const targetSeqFrameRef = useRef<number | null>(null);
   const targetSeqTimerRefs = useRef<number[]>([]);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [currentUserMessageIndex, setCurrentUserMessageIndex] = useState(0);
+  const [editingMessage, setEditingMessage] = useState<{ seq: number; original: string; timestamp: string; content: string } | null>(null);
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [editError, setEditError] = useState("");
+  const editSubmitting = useRef(false);
+  const editVersion = useRef(0);
+  const editComposing = useRef(false);
+  useEffect(() => {
+    ++editVersion.current;
+    editSubmitting.current = false;
+    editComposing.current = false;
+    setSavingEdit(false);
+    return () => { ++editVersion.current; };
+  }, [rootId, sessionKey]);
+  const submitEdit = async () => {
+    if (!rootId || !sessionKey || !editingMessage?.content.trim() || editSubmitting.current) return;
+    const version = editVersion.current;
+    editSubmitting.current = true;
+    setSavingEdit(true);
+    setEditError("");
+    try {
+      await sessionService.editMessage(rootId, sessionKey, editingMessage.seq, editingMessage.content, editingMessage.original, editingMessage.timestamp);
+      if (version === editVersion.current) setEditingMessage(null);
+    } catch (error) {
+      if (version === editVersion.current) setEditError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (version === editVersion.current) { editSubmitting.current = false; setSavingEdit(false); }
+    }
+  };
+  useEffect(() => { setEditingMessage(null); setEditError(""); }, [rootId, sessionKey]);
   const viewportStickFrameRef = useRef<number | null>(null);
 
   const cancelTargetSeqScroll = () => {
@@ -1660,6 +1692,30 @@ function SessionViewerInner({
     borderRadius: "6px",
     flexShrink: 0,
   };
+  // The editor's actions are real buttons, not the 10px meta row: the old
+  // mini-buttons were the reason "save & regenerate" was hard to hit.
+  const editButtonStyle = (
+    variant: "primary" | "ghost" | "danger",
+    disabled = false,
+  ): React.CSSProperties => {
+    const base: React.CSSProperties = {
+      flexShrink: 0,
+      padding: "6px 14px",
+      fontSize: 13,
+      lineHeight: "18px",
+      borderRadius: 8,
+      cursor: disabled ? "not-allowed" : "pointer",
+      opacity: disabled ? 0.5 : 1,
+      fontWeight: 500,
+    };
+    if (variant === "primary") {
+      return { ...base, border: "1px solid transparent", background: "#2563eb", color: "#fff" };
+    }
+    if (variant === "danger") {
+      return { ...base, border: "1px solid rgba(220,38,38,0.45)", background: "transparent", color: "#dc2626" };
+    }
+    return { ...base, border: "1px solid var(--border-color, #d1d5db)", background: "transparent", color: "var(--text-primary)" };
+  };
 
   const makePromptKey = (
     item: Extract<TimelineItem, { type: "user_text" | "assistant_text" }>,
@@ -1750,6 +1806,10 @@ function SessionViewerInner({
       );
     }
     const isUser = item.type === "user_text";
+    // Everything from this message to the end of the timeline goes away when it
+    // is edited or deleted; showing the count makes that consequence visible
+    // before the click instead of after.
+    const removeCount = isUser && idx === latestUserIndex ? timeline.length - 1 - idx : 0;
     const userMessageIndex = isUser
       ? timeline.slice(0, idx + 1).filter((timelineItem) => timelineItem.type === "user_text").length
       : undefined;
@@ -1787,6 +1847,20 @@ function SessionViewerInner({
       ? formatSessionDuration(previousUserTimestamp(timeline, idx), item.timestamp)
       : "";
     const canForkAgentMessage = !isUser && Number(item.seq || 0) > 0 && !!onForkAgentMessage;
+    const canEditInPlace = isUser && idx === latestUserIndex && !(item as any).pendingAck && !!item.timestamp && session?.type === "chat" && !(session as any)?.closed_at;
+    // Matched by timestamp and sequence, never by text: an edit or a streamed
+    // update of the same message must not make the open editor vanish.
+    const isEditing =
+      isUser &&
+      editingMessage !== null &&
+      editingMessage.timestamp === item.timestamp &&
+      (editingMessage.seq > 0
+        ? editingMessage.seq === Number(item.seq || 0)
+        : editingMessage.original === item.content);
+    // Switching an in-place editor into "copy to composer" mode would silently
+    // change what the visible textarea does, so the open editor always stays.
+    const useInPlaceEditor =
+      isUser && (isEditing || (canEditInPlace && !editingMessage));
     return (
       <div
         key={timelineItemKey}
@@ -1795,8 +1869,8 @@ function SessionViewerInner({
         style={{
           marginTop: spacing,
           alignSelf: isUser ? "flex-end" : "flex-start",
-          width: isUser ? userMessageWidth : "100%",
-          maxWidth: isUser ? "80%" : "100%",
+          width: useInPlaceEditor ? "min(560px, 100%)" : isUser ? userMessageWidth : "100%",
+          maxWidth: useInPlaceEditor ? "100%" : isUser ? "80%" : "100%",
           minWidth: 0,
           position: "relative",
           display: "flex",
@@ -1890,7 +1964,7 @@ function SessionViewerInner({
                 ) : null}
               </div>
             ) : null}
-            {!hasRichUserAttachments && displayContent ? (
+            {!useInPlaceEditor && !hasRichUserAttachments && displayContent ? (
               <div
                 style={{
                   padding: "10px 16px",
@@ -1915,13 +1989,54 @@ function SessionViewerInner({
                 />
               </div>
             ) : null}
+            {isEditing && editingMessage ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <textarea autoFocus aria-label={t("session.editMessage")} value={editingMessage.content} disabled={savingEdit}
+                  onChange={(event) => setEditingMessage({ ...editingMessage, content: event.target.value })}
+                  onCompositionStart={() => { editComposing.current = true; }}
+                  onCompositionEnd={() => { editComposing.current = false; }}
+                  onKeyDown={(event) => {
+                    if (editComposing.current || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+                    if (event.key === "Escape" && !editSubmitting.current) { event.preventDefault(); setEditingMessage(null); }
+                    if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submitEdit(); }
+                  }}
+                  rows={3} style={{ width: "100%", boxSizing: "border-box", resize: "vertical", padding: "10px 16px", border: "1px solid var(--border-color, #d1d5db)", borderRadius: "18px 18px 4px 18px", font: "inherit", fontSize: 14, lineHeight: 1.5, color: "var(--text-primary)", background: "rgba(148,163,184,0.14)" }} />
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <span style={{ fontSize: 12, lineHeight: 1.5, color: "var(--text-secondary, #64748b)" }}>
+                    {removeCount > 0 ? t("session.editHint", { count: removeCount }) : t("session.editHintOnly")}
+                  </span>
+                  <span style={{ fontSize: 11, lineHeight: 1.5, color: "var(--text-secondary, #64748b)", opacity: 0.8 }}>{t("session.editNotice")}</span>
+                </div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", justifyContent: "flex-end", flexWrap: "wrap" }}>
+                  <button type="button" disabled={savingEdit} style={editButtonStyle("ghost")} onClick={() => setEditingMessage(null)}>{t("common.cancel")}</button>
+                  {onDeleteLastMessage && !(item as any).pendingAck ? (
+                    <button
+                      type="button"
+                      disabled={savingEdit}
+                      style={editButtonStyle("danger")}
+                      title={t("session.deleteLastConfirm")}
+                      onClick={() => {
+                        if (savingEdit) return;
+                        if (!window.confirm(t("session.deleteLastConfirm"))) return;
+                        setEditingMessage(null);
+                        void onDeleteLastMessage({ seq: Number(item.seq || 0), content: item.content || "", timestamp: item.timestamp || "" });
+                      }}
+                    >
+                      {t("session.deleteLast")}
+                    </button>
+                  ) : null}
+                  <button type="button" disabled={savingEdit || !editingMessage.content.trim()} style={editButtonStyle("primary", savingEdit || !editingMessage.content.trim())} onClick={() => void submitEdit()}>{t(savingEdit ? "session.editSaving" : "session.editRegenerate")}</button>
+                </div>
+                {editError && <span role="alert" style={{ fontSize: 12, color: "var(--text-danger, #dc2626)" }}>{editError}</span>}
+              </div>
+            ) : null}
             <span
               style={{
                 fontSize: "10px",
                 color: "var(--text-secondary)",
                 opacity: 0.5,
                 alignSelf: "flex-end",
-                display: "inline-flex",
+                display: useInPlaceEditor ? "none" : "inline-flex",
                 alignItems: "center",
                 gap: "4px",
               }}
@@ -1944,11 +2059,17 @@ function SessionViewerInner({
               <button
                 type="button"
                 onClick={() => {
-                  onEditUserMessage?.(item.content || "");
+                  if (useInPlaceEditor) {
+                    setEditError("");
+                    setEditingMessage({ seq: Number(item.seq || 0), original: item.content || "", timestamp: item.timestamp!, content: item.content || "" });
+                  } else {
+                    onEditUserMessage?.(item.content || "");
+                  }
                 }}
                 style={userMetaButtonStyle}
-                aria-label={t("session.editMessage")}
-                title={t("session.editMessage")}
+                disabled={savingEdit}
+                aria-label={t(useInPlaceEditor ? "session.editMessage" : "session.copyToComposer")}
+                title={t(useInPlaceEditor ? "session.editMessage" : "session.copyToComposer")}
               >
                 {renderToolIcon("edit")}
               </button>

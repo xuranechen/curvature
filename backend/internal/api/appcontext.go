@@ -406,6 +406,51 @@ func (s *AppContext) GetFileWatcher(rootID string, manager *session.Manager) (*f
 	return watcher, nil
 }
 
+// SyncFileWatchers reconciles every live root watcher with the filesystem and
+// returns the events it found: paths that appeared, disappeared or were
+// modified since the watcher last looked. It runs on WebSocket (re)connect,
+// because events emitted while the client was away are lost — and so are
+// changes fsnotify dropped while its buffer overflowed (a build, a big
+// checkout). Without this pass a stale tree or file only went away when the
+// server was restarted.
+func (s *AppContext) SyncFileWatchers() []fs.FileChangeEvent {
+	s.mu.RLock()
+	rootCtxs := make([]*RootContext, 0, len(s.roots))
+	for _, rootCtx := range s.roots {
+		rootCtxs = append(rootCtxs, rootCtx)
+	}
+	s.mu.RUnlock()
+
+	var events []fs.FileChangeEvent
+	for _, rootCtx := range rootCtxs {
+		if rootCtx == nil || rootCtx.Watcher == nil {
+			continue
+		}
+		// A Rescan can take a while on a huge tree; it must not hold up the
+		// caller, and a stuck one must not hold up the next reconnect either.
+		done := make(chan []fs.FileChangeEvent, 1)
+		go func(watcher *fs.SharedFileWatcher) {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[fs/watcher] rescan.panic err=%v", r)
+					done <- nil
+				}
+			}()
+			done <- watcher.Rescan()
+		}(rootCtx.Watcher)
+		select {
+		case found := <-done:
+			events = append(events, found...)
+		case <-time.After(3 * time.Second):
+			log.Printf("[fs/watcher] rescan.timeout root=%s", rootCtx.Root.ID)
+		}
+		// One line per reconnect: "fresh but the scan saw nothing" and "scan
+		// saw N entries" are the two halves of any stale-tree report.
+		log.Printf("[fs/watcher] rescan root=%s %s", rootCtx.Root.ID, rootCtx.Watcher.RescanDiagnostics())
+	}
+	return events
+}
+
 func resolveRelatedWorktree(ctx context.Context, root fs.RootInfo, filePath string) (fs.RelatedWorktreeMatch, bool) {
 	cleanPath := cleanToolFilePath(filePath)
 	if cleanPath == "" {

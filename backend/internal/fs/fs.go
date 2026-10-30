@@ -980,6 +980,31 @@ func (r RootInfo) WriteFile(pathRel string, data []byte, expectedMTime time.Time
 	}, nil
 }
 
+// CreateFile creates an empty file at pathRel without replacing an existing
+// entry. It returns os.ErrExist when the target is already present.
+func (r RootInfo) CreateFile(pathRel string) (string, error) {
+	pathRel, err := r.NormalizePath(pathRel)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := r.ResolvePath(pathRel)
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Dir(resolved)
+	if err := r.ensureWritableDir(dir); err != nil {
+		return "", err
+	}
+	handle, err := os.OpenFile(resolved, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return "", err
+	}
+	if err := handle.Close(); err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(pathRel), nil
+}
+
 // ensureWritableDir refuses a write whose resolved parent directory sits
 // outside both the root and (for home meta locations) the meta directory, so a
 // symlinked directory inside the root cannot be used to escape it.

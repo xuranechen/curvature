@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,7 +47,7 @@ var ignoredWatchNames = map[string]struct{}{
 	"venv":          {},
 	// Scratch and toolchain trees. A project can carry tens of thousands of
 	// directories under these names (a checked-out Flutter SDK, a package cache),
-	// and every one of them would otherwise be a candidate watch — against a cap
+	// and every one of them would otherwise be a candidate watch 闂?against a cap
 	// of maxWatchDirs, on a tree that is only ever rewritten by tooling.
 	".dart_tool":  {},
 	".npm-cache":  {},
@@ -67,10 +68,15 @@ type SharedFileWatcher struct {
 	// sw.mu: adding a watch is the one operation here that can block for a long
 	// time (an unresponsive volume, a handle the OS will not hand out), and sw.mu
 	// is on the path of every directory listing and every file read.
+	//
+	// watchedDirList mirrors watchedDirs in insertion order. Rescan walks it,
+	// and keeping the order stable means the directories known first are
+	// checked first.
 	addMu             sync.Mutex
 	mu                sync.RWMutex
 	sessions          map[string]*sessionInfo
 	watchedDirs       map[string]struct{}
+	watchedDirList    []string
 	pendingWrites     map[string]string
 	pendingChanges    map[string]FileChangeEvent
 	pendingChangeDirs map[string]struct{}
@@ -80,6 +86,12 @@ type SharedFileWatcher struct {
 	onFileChangeBatch func(FileChangeBatchEvent)
 	onRelatedFile     func(RelatedFileEvent)
 	worktreeResolver  WorktreeResolver
+
+	// rescanMu serializes Rescan passes and owns scanSnapshot; both are only
+	// touched from Rescan. lastRescan rate limits them.
+	rescanMu     sync.Mutex
+	scanSnapshot map[string]scanEntry
+	lastRescan   time.Time
 
 	done chan struct{}
 }
@@ -153,6 +165,7 @@ func NewSharedFileWatcher(root RootInfo, sessions SessionFileRecorder, worktreeR
 		pendingWrites:     make(map[string]string),
 		pendingChanges:    make(map[string]FileChangeEvent),
 		pendingChangeDirs: make(map[string]struct{}),
+		scanSnapshot:      make(map[string]scanEntry),
 		done:              make(chan struct{}),
 	}
 	if err := sw.WatchDir("."); err != nil {
@@ -581,7 +594,7 @@ func (sw *SharedFileWatcher) WatchDir(dirRel string) error {
 	// Adding a watch is the one call in this file that can block indefinitely, so
 	// it runs under its own mutex and never under sw.mu. Holding sw.mu across
 	// fsnotify.Add meant a single stuck Add froze every later WatchDir call for
-	// that root, and with it every directory listing and every file read — the
+	// that root, and with it every directory listing and every file read 闂?the
 	// project's file tree simply stopped loading until the process was restarted.
 	sw.addMu.Lock()
 	defer sw.addMu.Unlock()
@@ -608,7 +621,10 @@ func (sw *SharedFileWatcher) WatchDir(dirRel string) error {
 	}
 
 	sw.mu.Lock()
-	sw.watchedDirs[clean] = struct{}{}
+	if _, ok := sw.watchedDirs[clean]; !ok {
+		sw.watchedDirs[clean] = struct{}{}
+		sw.watchedDirList = append(sw.watchedDirList, clean)
+	}
 	sw.mu.Unlock()
 	return nil
 }
@@ -628,6 +644,277 @@ func (sw *SharedFileWatcher) watchNearestExistingDir(dirRel string) {
 		}
 		dirRel = next
 	}
+}
+
+const (
+	rescanMinInterval = 2 * time.Second
+	rescanMaxEntries  = 200000
+	rescanMaxReported = 2000
+)
+
+type dirEntrySignature struct {
+	isDir bool
+	size  int64
+	mtime int64
+	// Directories only: how many children the listing returned and the newest
+	// child mtime. Together they move on create/delete/rename/modify inside the
+	// directory even when the changed entry's own timestamp does not.
+	children int64
+	maxMTime int64
+}
+
+// invalidateDir lets the session store drop any per-directory state it keeps
+// for dirAbs. Listings are read from disk on every request, so the store is the
+// only place that could hold a stale snapshot.
+func (sw *SharedFileWatcher) invalidateDir(dirAbs string) {
+	if sw.sessionStore == nil {
+		return
+	}
+	if invalidator, ok := sw.sessionStore.(interface{ InvalidateDir(absPath string) }); ok {
+		invalidator.InvalidateDir(dirAbs)
+	}
+}
+
+func (sw *SharedFileWatcher) isWatchedDir(dirAbs string) bool {
+	sw.mu.RLock()
+	defer sw.mu.RUnlock()
+	_, ok := sw.watchedDirs[filepath.Clean(dirAbs)]
+	return ok
+}
+
+func (sw *SharedFileWatcher) watchedDirsFull() bool {
+	sw.mu.RLock()
+	defer sw.mu.RUnlock()
+	return len(sw.watchedDirs) >= maxWatchDirs
+}
+
+func (sw *SharedFileWatcher) forgetDir(dirAbs string) {
+	clean := filepath.Clean(dirAbs)
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	delete(sw.watchedDirs, clean)
+	for i := len(sw.watchedDirList) - 1; i >= 0; i-- {
+		if sw.watchedDirList[i] == clean {
+			sw.watchedDirList = append(sw.watchedDirList[:i], sw.watchedDirList[i+1:]...)
+			break
+		}
+	}
+}
+
+type scanEntry struct {
+	isDir    bool
+	size     int64
+	mtime    int64
+	children int64
+	maxMTime int64
+	// Included for the directories Rescan walks: their non-ignored children.
+	// Reported alongside the directory so a client re-lists it.
+	childPaths []string
+}
+
+func signatureOf(entry scanEntry) dirEntrySignature {
+	return dirEntrySignature{isDir: entry.isDir, size: entry.size, mtime: entry.mtime, children: entry.children, maxMTime: entry.maxMTime}
+}
+
+// RescanDiagnostics describes what the last Rescan pass saw. It is logged on
+// reconnect so "the tree is stale" can be told apart from "the scan found
+// nothing", which otherwise takes a debugger.
+func (sw *SharedFileWatcher) RescanDiagnostics() string {
+	sw.rescanMu.Lock()
+	defer sw.rescanMu.Unlock()
+	if sw.lastRescan.IsZero() {
+		return "rescan=never"
+	}
+	total, files := 0, 0
+	for _, entry := range sw.scanSnapshot {
+		total++
+		if !entry.isDir {
+			files++
+		}
+	}
+	return "rescan.last=" + sw.lastRescan.Format(time.RFC3339) + " entries=" + strconv.Itoa(total) + " files=" + strconv.Itoa(files)
+}
+
+// buildScanSnapshot returns every watched directory's listing (plus the watched
+// directories themselves) keyed by absolute path. It runs under rescanMu, which
+// Rescan also holds for the comparison pass, so a concurrent Rescan cannot
+// observe or replace a half-built snapshot.
+func (sw *SharedFileWatcher) buildScanSnapshot() map[string]scanEntry {
+	snapshot := make(map[string]scanEntry)
+	sw.mu.RLock()
+	dirs := append([]string(nil), sw.watchedDirList...)
+	sw.mu.RUnlock()
+	seenEntries := 0
+	var walk func(dirAbs string) bool
+	walk = func(dirAbs string) bool {
+		entries, err := os.ReadDir(dirAbs)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// The directory is gone and its watch went with it; drop the
+				// bookkeeping so a recreated path gets watched again.
+				sw.forgetDir(dirAbs)
+			}
+			return true
+		}
+		seenEntries += len(entries)
+		if seenEntries > rescanMaxEntries {
+			return false
+		}
+		dir := scanEntry{isDir: true, childPaths: make([]string, 0, len(entries))}
+		subdirs := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			abs := filepath.Join(dirAbs, entry.Name())
+			if sw.shouldIgnore(abs) {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			clean := filepath.Clean(abs)
+			snapshot[clean] = scanEntry{
+				isDir: info.IsDir(),
+				size:  info.Size(),
+				mtime: info.ModTime().UnixNano(),
+			}
+			dir.childPaths = append(dir.childPaths, clean)
+			if mtime := info.ModTime().UnixNano(); mtime > dir.maxMTime {
+				dir.maxMTime = mtime
+			}
+			if info.IsDir() {
+				subdirs = append(subdirs, abs)
+			}
+		}
+		dir.children = int64(len(dir.childPaths))
+		snapshot[filepath.Clean(dirAbs)] = mergeScanEntry(snapshot[filepath.Clean(dirAbs)], dir)
+		for _, sub := range subdirs {
+			sw.mu.RLock()
+			_, watched := sw.watchedDirs[sub]
+			sw.mu.RUnlock()
+			if !watched {
+				continue
+			}
+			if !walk(sub) {
+				return false
+			}
+		}
+		return true
+	}
+	for _, dirAbs := range dirs {
+		if sw.shouldIgnore(dirAbs) {
+			continue
+		}
+		if !walk(dirAbs) {
+			break
+		}
+	}
+	return snapshot
+}
+
+// mergeScanEntry keeps the per-entry signature when a directory is also listed
+// by its parent and replaces the listing fields with the deeper walk's.
+func mergeScanEntry(existing, walked scanEntry) scanEntry {
+	walked.size = existing.size
+	walked.mtime = existing.mtime
+	return walked
+}
+
+// Rescan compares the watched tree against the filesystem and emits a change
+// event for everything that appeared, disappeared or was modified since the
+// previous pass.
+//
+// fsnotify is not reliable as the only source of change events. A watch can
+// silently stop delivering and the kernel/FileSystemWatcher buffers overflow
+// under bursts (a build, a checkout, a formatter writing many files); on
+// Windows fsnotify then drops events without telling the watcher. Nothing
+// reached the UI, so the file tree and the open file kept showing stale
+// content until the server was restarted.
+//
+// To survive timestamps that do not strictly increase (Windows rounds some
+// mtimes to whole seconds, so a same-second rewrite can compare equal), files
+// are not compared one by one: per directory, a change to any child's entry, to
+// the child count, or to the newest child mtime reports every child of that
+// directory. The client re-validates each file through its own mtime check.
+func (sw *SharedFileWatcher) Rescan() []FileChangeEvent {
+	sw.rescanMu.Lock()
+	defer sw.rescanMu.Unlock()
+	if time.Since(sw.lastRescan) < rescanMinInterval {
+		return nil
+	}
+	defer func() { sw.lastRescan = time.Now() }()
+
+	sw.mu.RLock()
+	select {
+	case <-sw.done:
+		sw.mu.RUnlock()
+		return nil
+	default:
+	}
+	sw.mu.RUnlock()
+
+	previous := sw.scanSnapshot
+	current := sw.buildScanSnapshot()
+
+	changes := make([]FileChangeEvent, 0)
+	dirtyDirs := make(map[string]struct{})
+	record := func(abs string, isDir bool) {
+		rel, err := sw.root.relativeFromAbsolute(abs)
+		if err != nil {
+			return
+		}
+		if parent, err := sw.root.relativeFromAbsolute(filepath.Dir(abs)); err == nil {
+			dirtyDirs[parent] = struct{}{}
+		}
+		if isDir {
+			// The directory's own contents may have changed too.
+			dirtyDirs[rel] = struct{}{}
+		}
+		if len(changes) < rescanMaxReported {
+			changes = append(changes, FileChangeEvent{
+				RootID: sw.root.ID,
+				Path:   rel,
+				Op:     "RESCAN",
+				IsDir:  isDir,
+			})
+		}
+	}
+	for abs, entry := range current {
+		prev, known := previous[abs]
+		if known && signatureOf(prev) == signatureOf(entry) && prev.children == entry.children && prev.maxMTime == entry.maxMTime {
+			continue
+		}
+		if !entry.isDir {
+			record(abs, false)
+			continue
+		}
+		// A changed parent means something inside it changed; report the whole
+		// listing so nothing in it can hide behind an unchanged-looking stat.
+		record(abs, true)
+		for _, child := range entry.childPaths {
+			record(child, current[child].isDir)
+		}
+		if !sw.isWatchedDir(abs) && !sw.watchedDirsFull() {
+			// Pick up the new directory so later changes arrive as events.
+			if rel, err := sw.root.relativeFromAbsolute(abs); err == nil {
+				if err := sw.WatchDir(rel); err == nil {
+					dirtyDirs[rel] = struct{}{}
+				}
+			}
+		}
+	}
+	for abs, prev := range previous {
+		if _, ok := current[abs]; !ok {
+			record(abs, prev.isDir)
+		}
+	}
+	sw.scanSnapshot = current
+	for dir := range dirtyDirs {
+		sw.invalidateDir(dir)
+	}
+	for _, change := range changes {
+		sw.emitFileChange(change)
+	}
+	return changes
 }
 
 func (sw *SharedFileWatcher) shouldIgnore(path string) bool {

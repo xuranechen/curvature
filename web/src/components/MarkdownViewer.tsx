@@ -1,4 +1,4 @@
-import React, { memo, useEffect, useMemo, useRef, useState } from "react";
+import React, { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -11,6 +11,10 @@ import { fetchProofProtectedBlob } from "../services/file";
 import { openExternalURL } from "../services/platformNavigation";
 import { useI18n } from "../i18n";
 import { buildDiffCodeRows, type DiffCodeRow } from "./gitDiffModel";
+import { extractMarkdownOutline } from "./markdownOutline";
+
+const EMPTY_OUTLINE: ReturnType<typeof extractMarkdownOutline> = [];
+import { DiagramPreview } from "./DiagramPreview";
 import "prismjs/themes/prism.css";
 import "katex/dist/katex.min.css";
 // Reuse the language imports from global Prism context (since they are imported in CodeViewer, they might be available if loaded, 
@@ -74,6 +78,10 @@ function makeMermaidSafe(source: string): string {
 }
 
 function MermaidBlock({ chart }: { chart: string }) {
+  const { t } = useI18n();
+  const [expanded, setExpanded] = useState(false);
+  const blockRef = useRef<HTMLDivElement>(null);
+  const [previewHeight, setPreviewHeight] = useState(0);
   const [svg, setSvg] = useState("");
   const [error, setError] = useState("");
 
@@ -139,8 +147,11 @@ function MermaidBlock({ chart }: { chart: string }) {
 
   return (
     <div
+      ref={blockRef}
       style={{
+        position: "relative",
         width: "100%",
+        minHeight: expanded ? previewHeight : undefined,
         boxSizing: "border-box",
         background: "rgba(0,0,0,0.02)",
         padding: "16px",
@@ -151,10 +162,23 @@ function MermaidBlock({ chart }: { chart: string }) {
       }}
     >
       {svg ? (
-        <div
-          dangerouslySetInnerHTML={{ __html: svg }}
-          style={{ minWidth: "fit-content" }}
-        />
+        <>
+          <button type="button" className="diagram-expand" aria-label={t("diagram.expand")} title={t("diagram.expand")} onClick={() => {
+            setPreviewHeight(blockRef.current?.getBoundingClientRect().height || 0);
+            setExpanded(true);
+          }}>
+            <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M8 3H3v5M16 3h5v5M21 16v5h-5M3 16v5h5" />
+              <path d="m3 3 6 6m12-6-6 6m6 12-6-6M3 21l6-6" />
+            </svg>
+          </button>
+          {expanded ? <DiagramPreview svg={svg} onClose={() => setExpanded(false)} /> : (
+            <div
+              dangerouslySetInnerHTML={{ __html: svg }}
+              style={{ minWidth: "fit-content" }}
+            />
+          )}
+        </>
       ) : (
         <div style={{ color: "var(--text-secondary)", fontSize: "14px" }}>Rendering Mermaid diagram...</div>
       )}
@@ -588,6 +612,10 @@ function MarkdownViewerInner({
   onFileClick,
   targetLine,
   contentRef,
+  scrollContainerRef,
+  isVisible = true,
+  compactOutline = false,
+  showOutline = false,
 }: {
   content: string;
   currentPath?: string;
@@ -595,7 +623,12 @@ function MarkdownViewerInner({
   onFileClick?: (path: string) => void;
   targetLine?: number;
   contentRef?: React.RefObject<HTMLDivElement | null>;
+  scrollContainerRef?: React.RefObject<HTMLDivElement | null>;
+  isVisible?: boolean;
+  compactOutline?: boolean;
+  showOutline?: boolean;
 }) {
+  const { t } = useI18n();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const onFileClickRef = useRef(onFileClick);
   const sourceLineSelector = useMemo(() => {
@@ -603,16 +636,45 @@ function MarkdownViewerInner({
     return "[data-source-line]";
   }, [targetLine]);
   const normalizedContent = useMemo(() => normalizeMarkdownMathDelimiters(content), [content]);
+  const outline = useMemo(
+    () => (showOutline ? extractMarkdownOutline(normalizedContent) : EMPTY_OUTLINE),
+    [normalizedContent, showOutline],
+  );
+  const headingsByLine = useMemo(
+    () => new Map(outline.map((item) => [item.sourceLine, item])),
+    [outline],
+  );
+  const [activeHeadingId, setActiveHeadingId] = useState("");
+  const [isOutlineCollapsed, setIsOutlineCollapsed] = useState(compactOutline);
+  const forcedActiveHeadingRef = useRef<string | null>(null);
 
   useEffect(() => {
     onFileClickRef.current = onFileClick;
   }, [onFileClick]);
 
   useEffect(() => {
+    if (compactOutline) setIsOutlineCollapsed(true);
+  }, [compactOutline]);
+
+  useEffect(() => {
+    if (!compactOutline || isOutlineCollapsed) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setIsOutlineCollapsed(true);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [compactOutline, isOutlineCollapsed]);
+
+  // Hand the live container to the caller on mount. Depending on `content` here
+  // meant the ref kept pointing at a detached <div> whenever content changed
+  // without the node being replaced (React updates children in place): callers
+  // that read the ref — text selection in FileViewer — then measured a node
+  // outside the document and stopped seeing the rendered text.
+  useLayoutEffect(() => {
     if (contentRef) {
       contentRef.current = containerRef.current;
     }
-  }, [contentRef, content]);
+  }, [contentRef]);
 
   useEffect(() => {
     if (!targetLine || targetLine < 1 || !containerRef.current || !sourceLineSelector) {
@@ -633,13 +695,89 @@ function MarkdownViewerInner({
     (target || elements[0]).scrollIntoView({ block: "center", behavior: "auto" });
   }, [content, sourceLineSelector, targetLine]);
 
+  useEffect(() => {
+    if (!isVisible || !showOutline || outline.length === 0 || !containerRef.current) {
+      setActiveHeadingId("");
+      return;
+    }
+    const container = containerRef.current;
+    if (!container.querySelector("[data-markdown-heading]")) return;
+
+    let scrollParent: HTMLElement | Window = scrollContainerRef?.current || window;
+    if (!scrollContainerRef?.current) {
+      let parent = container.parentElement;
+      while (parent) {
+        const overflowY = window.getComputedStyle(parent).overflowY;
+        if (overflowY === "auto" || overflowY === "scroll") {
+          scrollParent = parent;
+          break;
+        }
+        parent = parent.parentElement;
+      }
+    }
+
+    let frame = 0;
+    const updateActiveHeading = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        // ReactMarkdown may replace heading nodes after this effect is installed,
+        // so always read the live DOM instead of retaining a stale NodeList.
+        const headingElements = Array.from(container.querySelectorAll<HTMLElement>("[data-markdown-heading]"));
+        if (headingElements.length === 0) return;
+        const forcedActive = forcedActiveHeadingRef.current;
+        if (forcedActive) {
+          setActiveHeadingId(forcedActive);
+          return;
+        }
+        const top = (scrollParent instanceof Window ? 24 : scrollParent.getBoundingClientRect().top + 24) + 2;
+        let active = headingElements[0];
+        for (const heading of headingElements) {
+          if (heading.getBoundingClientRect().top <= top) active = heading;
+          else break;
+        }
+        setActiveHeadingId(active.id);
+      });
+    };
+    updateActiveHeading();
+    const resizeObserver = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(updateActiveHeading);
+    resizeObserver?.observe(container);
+    const resumeScrollTracking = () => {
+      forcedActiveHeadingRef.current = null;
+    };
+    scrollParent.addEventListener("wheel", resumeScrollTracking, { passive: true });
+    scrollParent.addEventListener("touchstart", resumeScrollTracking, { passive: true });
+    scrollParent.addEventListener("pointerdown", resumeScrollTracking, { passive: true });
+    scrollParent.addEventListener("scroll", updateActiveHeading, { passive: true });
+    window.addEventListener("resize", updateActiveHeading);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      resizeObserver?.disconnect();
+      scrollParent.removeEventListener("wheel", resumeScrollTracking);
+      scrollParent.removeEventListener("touchstart", resumeScrollTracking);
+      scrollParent.removeEventListener("pointerdown", resumeScrollTracking);
+      scrollParent.removeEventListener("scroll", updateActiveHeading);
+      window.removeEventListener("resize", updateActiveHeading);
+    };
+  }, [isVisible, outline, scrollContainerRef, showOutline]);
+
   const getSourceLineProps = (node: any): Record<string, string> => {
     const line = node?.position?.start?.line;
     if (!Number.isFinite(line)) return {};
     return { "data-source-line": String(line) };
   };
 
-  return (
+  const getHeadingProps = (node: any): Record<string, string> => {
+    const sourceProps = getSourceLineProps(node);
+    const sourceLine = Number.parseInt(sourceProps["data-source-line"] || "", 10);
+    const item = headingsByLine.get(sourceLine);
+    return item
+      ? { ...sourceProps, id: item.id, "data-markdown-heading": "true" }
+      : sourceProps;
+  };
+
+  const viewer = (
     <div
       ref={containerRef}
       className="markdown-viewer"
@@ -651,19 +789,22 @@ function MarkdownViewerInner({
       }}
     >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
+        remarkPlugins={[[remarkGfm, { singleTilde: false }], remarkMath]}
         remarkRehypeOptions={{ allowDangerousHtml: true }}
         rehypePlugins={[rehypeRaw, [rehypeSanitize, markdownSanitizeSchema], rehypeKatex]}
         components={{
           h1: ({ node, ...props }: any) => (
-            <h1 style={{ fontSize: "24px", marginTop: 0 }} {...getSourceLineProps(node)} {...props} />
+            <h1 style={{ fontSize: "24px", marginTop: 0 }} {...getHeadingProps(node)} {...props} />
           ),
           h2: ({ node, ...props }: any) => (
-            <h2 style={{ fontSize: "20px" }} {...getSourceLineProps(node)} {...props} />
+            <h2 style={{ fontSize: "20px" }} {...getHeadingProps(node)} {...props} />
           ),
           h3: ({ node, ...props }: any) => (
-            <h3 style={{ fontSize: "17px", marginTop: "1.25em" }} {...getSourceLineProps(node)} {...props} />
+            <h3 style={{ fontSize: "17px", marginTop: "1.25em" }} {...getHeadingProps(node)} {...props} />
           ),
+          h4: ({ node, ...props }: any) => <h4 {...getHeadingProps(node)} {...props} />,
+          h5: ({ node, ...props }: any) => <h5 {...getHeadingProps(node)} {...props} />,
+          h6: ({ node, ...props }: any) => <h6 {...getHeadingProps(node)} {...props} />,
           p: ({ node, ...props }: any) => (
             <p style={{ margin: "0 0 1em", whiteSpace: "pre-wrap" }} {...getSourceLineProps(node)} {...props} />
           ),
@@ -847,11 +988,77 @@ function MarkdownViewerInner({
       </ReactMarkdown>
     </div>
   );
+
+  if (!showOutline || outline.length === 0) return viewer;
+
+  return (
+    <div className={`markdown-document-layout${isOutlineCollapsed ? " is-outline-collapsed" : ""}${compactOutline ? " is-mobile-outline" : ""}`}>
+      {compactOutline && !isOutlineCollapsed && (
+        <button
+          type="button"
+          className="markdown-outline-backdrop"
+          aria-label={t("markdown.collapseOutline")}
+          onClick={() => setIsOutlineCollapsed(true)}
+        />
+      )}
+      <aside className={`markdown-outline${isOutlineCollapsed ? " is-collapsed" : ""}`} aria-label={t("markdown.outline")}>
+        <button
+          type="button"
+          className="markdown-outline-toggle"
+          aria-label={t(isOutlineCollapsed ? "markdown.expandOutline" : "markdown.collapseOutline")}
+          title={t(isOutlineCollapsed ? "markdown.expandOutline" : "markdown.collapseOutline")}
+          aria-expanded={!isOutlineCollapsed}
+          onClick={() => setIsOutlineCollapsed((collapsed) => !collapsed)}
+        >
+          {isOutlineCollapsed && (
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m10 3-5 5 5 5" /></svg>
+          )}
+          <span>{t("markdown.outline")}</span>
+          {!isOutlineCollapsed && (
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5" /></svg>
+          )}
+        </button>
+        <nav>
+          {outline.map((item) => (
+            <button
+              type="button"
+              key={item.id}
+              className={`markdown-outline-item${activeHeadingId === item.id ? " is-active" : ""}`}
+              style={{ "--outline-level": item.level } as React.CSSProperties}
+              title={item.title}
+              onClick={() => {
+                const heading = document.getElementById(item.id);
+                const scrollContainer = scrollContainerRef?.current;
+                forcedActiveHeadingRef.current = item.id;
+                if (heading && scrollContainer) {
+                  const nextScrollTop = scrollContainer.scrollTop
+                    + heading.getBoundingClientRect().top
+                    - scrollContainer.getBoundingClientRect().top
+                    - 24;
+                  scrollContainer.scrollTop = Math.max(0, nextScrollTop);
+                } else {
+                  heading?.scrollIntoView({ behavior: "auto", block: "start" });
+                }
+                setActiveHeadingId(item.id);
+                if (compactOutline) setIsOutlineCollapsed(true);
+              }}
+            >
+              {item.title}
+            </button>
+          ))}
+        </nav>
+      </aside>
+      {viewer}
+    </div>
+  );
 }
 
 export const MarkdownViewer = memo(MarkdownViewerInner, (prev, next) => (
   prev.content === next.content &&
   prev.currentPath === next.currentPath &&
   prev.root === next.root &&
-  prev.targetLine === next.targetLine
+  prev.targetLine === next.targetLine &&
+  prev.isVisible === next.isVisible &&
+  prev.compactOutline === next.compactOutline &&
+  prev.showOutline === next.showOutline
 ));

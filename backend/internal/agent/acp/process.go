@@ -36,6 +36,8 @@ type Process struct {
 	conn      *acp.ClientSideConnection
 	client    *curvatureClient
 	waitCh    chan error
+	tree      processTree
+	closeMu   sync.Mutex
 
 	mu            sync.RWMutex
 	sessions      map[string]*sessionState // sessionKey -> state
@@ -50,6 +52,13 @@ type Process struct {
 	// Sessions of this process advertise their own MCP servers; see
 	// mcpServerList. Nothing about that is stored on the process, because a
 	// process is shared by sessions that must not see each other's servers.
+}
+
+// processTree owns platform resources for one ACP process and its descendants.
+// Kill and Close must be safe to call concurrently with context cancellation.
+type processTree interface {
+	Kill() error
+	Close() error
 }
 
 // MCPServerSpec describes an MCP server the client hands to the agent for a
@@ -515,7 +524,18 @@ func Start(ctx context.Context, agentName, command string, args []string, cwd st
 		return nil, err
 	}
 
-	if err := cmd.Start(); err != nil {
+	tree, err := startProcessCommand(cmd)
+	if err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		_ = stderr.Close()
+		// Platform setup can fail before cmd.Start gets a chance to close the
+		// child ends of the pipes it owns.
+		for _, stream := range []any{cmd.Stdin, cmd.Stdout, cmd.Stderr} {
+			if closer, ok := stream.(io.Closer); ok {
+				_ = closer.Close()
+			}
+		}
 		return nil, err
 	}
 
@@ -525,11 +545,20 @@ func Start(ctx context.Context, agentName, command string, args []string, cwd st
 		sessions:     make(map[string]*sessionState),
 		sessionsByID: make(map[string]*sessionState),
 		waitCh:       make(chan error, 1),
+		tree:         tree,
 	}
 	proc.client = &curvatureClient{proc: proc}
 	go streamProcessStderr(proc, stderr)
+	waitCh := proc.waitCh
 	go func() {
-		proc.waitCh <- cmd.Wait()
+		err := cmd.Wait()
+		// A wrapper may exit before its descendants. Release the job even when
+		// nobody explicitly closes the ACP connection after that exit.
+		if closeErr := tree.Close(); closeErr != nil {
+			log.Printf("[agent/acp] process.cleanup_error agent=%s err=%v", agentName, closeErr)
+		}
+		waitCh <- err
+		close(waitCh)
 	}()
 
 	proc.conn = acp.NewClientSideConnection(proc.client, stdin, stdout)
@@ -769,12 +798,13 @@ func (p *Process) CloseSession(ctx context.Context, sessionKey string) error {
 
 // Close terminates the process.
 func (p *Process) Close() error {
-	p.mu.Lock()
+	p.closeMu.Lock()
+	defer p.closeMu.Unlock()
+	p.mu.RLock()
 	cmd := p.cmd
 	waitCh := p.waitCh
-	p.cmd = nil
-	p.waitCh = nil
-	p.mu.Unlock()
+	tree := p.tree
+	p.mu.RUnlock()
 
 	if cmd == nil || cmd.Process == nil {
 		return nil
@@ -782,14 +812,24 @@ func (p *Process) Close() error {
 
 	pid := cmd.Process.Pid
 	log.Printf("[agent/acp] process.close.begin agent=%s pid=%d", p.agentLabel(), pid)
-	if err := killProcess(cmd.Process); err != nil && !strings.Contains(strings.ToLower(err.Error()), "process already finished") {
+	if err := tree.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		log.Printf("[agent/acp] process.close.kill_error agent=%s pid=%d err=%v", p.agentLabel(), pid, err)
 		return err
 	}
 
 	select {
 	case err := <-waitCh:
-		if err != nil && !strings.Contains(strings.ToLower(err.Error()), "signal: killed") {
+		if closeErr := tree.Close(); closeErr != nil {
+			return closeErr
+		}
+		p.mu.Lock()
+		p.cmd = nil
+		p.waitCh = nil
+		p.tree = nil
+		p.mu.Unlock()
+		// Forced termination is expected on both Unix and Windows.
+		var exitErr *exec.ExitError
+		if err != nil && !errors.As(err, &exitErr) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			log.Printf("[agent/acp] process.close.wait_error agent=%s pid=%d err=%v", p.agentLabel(), pid, err)
 			return err
 		}
@@ -818,13 +858,6 @@ func processDiagnostic(pid int) string {
 	}
 	parts = append(parts, platformProcessDiagnostic(pid))
 	return strings.Join(parts, " ")
-}
-
-func killProcess(proc *os.Process) error {
-	if proc == nil {
-		return nil
-	}
-	return killProcessTree(proc)
 }
 
 // SessionID returns the ACP session ID for a Curvature session key.

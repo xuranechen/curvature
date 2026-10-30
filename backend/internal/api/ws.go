@@ -62,6 +62,9 @@ type WSHandler struct {
 	githubOnce      sync.Once
 	requestMu       sync.Mutex
 	requests        map[string]time.Time
+	// lastWSClientID is the client of the previous /ws connection; seeing it
+	// again identifies a reconnect rather than a newly opened page.
+	lastWSClientID atomic.Value
 }
 
 type StreamEvent struct {
@@ -196,6 +199,13 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.AppContext.GetSessionStreamHub().RegisterClient(clientID, conn)
 		h.pushInitialAppUpdate(clientID)
 		h.pushInitialGitHubImports(clientID)
+		// The reconcile pass walks every watched directory of every project.
+		// A second tab opening does not need that, and its result would land
+		// in a page that is already fresh; only a genuine reconnect does.
+		if h.lastWSClientID.Load() == clientID {
+			h.pushFileChangesAfterReconnect(clientID)
+		}
+		h.lastWSClientID.Store(clientID)
 	}
 	defer func() {
 		if h.AppContext != nil {
@@ -353,6 +363,76 @@ func (h *WSHandler) broadcastFileChangeBatch(change fs.FileChangeBatchEvent) {
 		},
 	}
 	h.broadcastWS(resp)
+}
+
+// pushFileChangesAfterReconnect reconciles the file watchers with the disk and
+// sends the result to the reconnecting client only.
+//
+// Change events are not replayed, so anything that happened while the socket
+// was down — including changes fsnotify silently dropped while its buffer
+// overflowed — never reached this client before. That is how an open file or a
+// tree could stay stale no matter how often the page was reloaded; this pass
+// makes the reconnect itself repair the view.
+func (h *WSHandler) pushFileChangesAfterReconnect(clientID string) {
+	syncEvents := h.AppContext.SyncFileWatchers()
+	if len(syncEvents) == 0 {
+		return
+	}
+	byRoot := make(map[string][]fs.FileChangeEvent)
+	order := make([]string, 0, 1)
+	for _, event := range syncEvents {
+		if _, seen := byRoot[event.RootID]; !seen {
+			order = append(order, event.RootID)
+		}
+		byRoot[event.RootID] = append(byRoot[event.RootID], event)
+	}
+	for _, rootID := range order {
+		events := byRoot[rootID]
+		paths := make([]string, 0, len(events))
+		dirs := make([]string, 0, len(events))
+		seenDir := make(map[string]struct{})
+		addDir := func(dir string) {
+			if dir == "" {
+				dir = "."
+			}
+			if _, ok := seenDir[dir]; ok {
+				return
+			}
+			seenDir[dir] = struct{}{}
+			dirs = append(dirs, dir)
+		}
+		payloadEvents := make([]map[string]any, 0, len(events))
+		for _, event := range events {
+			paths = append(paths, event.Path)
+			parent := event.Path
+			if idx := strings.LastIndex(parent, "/"); idx > 0 {
+				parent = parent[:idx]
+			} else {
+				parent = "."
+			}
+			addDir(parent)
+			if event.IsDir {
+				// A directory whose own contents changed: list it again too,
+				// so a collapsed directory is fresh when it is opened.
+				addDir(event.Path)
+			}
+			payloadEvents = append(payloadEvents, map[string]any{
+				"path":   event.Path,
+				"op":     event.Op,
+				"is_dir": event.IsDir,
+			})
+		}
+		h.AppContext.GetSessionStreamHub().SendToClient(clientID, WSResponse{
+			Type: "file.changed.batch",
+			Payload: map[string]any{
+				"root_id": rootID,
+				"paths":   paths,
+				"dirs":    dirs,
+				"events":  payloadEvents,
+			},
+		})
+	}
+	log.Printf("[fs/watcher] reconnect.sync client=%s events=%d", clientID, len(syncEvents))
 }
 
 func (h *WSHandler) broadcastRelatedFileChange(change fs.RelatedFileEvent) {
@@ -888,6 +968,8 @@ func (h *WSHandler) switchSessionRuntimePlanMode(ctx context.Context, key string
 }
 
 func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
+	h.AppContext.GetSessionStreamHub().trackSessionJob(job.Key, 1)
+	defer h.AppContext.GetSessionStreamHub().trackSessionJob(job.Key, -1)
 	rootID := job.RootID
 	key := job.Key
 	requestID := strings.TrimSpace(job.RequestID)

@@ -29,6 +29,7 @@ func main() {
 	configFlag := flag.String("config", "", "curvature startup config file; command-line flags override file values")
 	agentConfigFlag := flag.String("agent-config", "", "extra agents.json file")
 	notifyScriptFlag := flag.String("notify-script", "", "executable script for notification events; receives JSON payload on stdin")
+	uiTitle := flag.String("title", "Curvature", "browser tab title for the web UI; useful to tell multiple instances apart (e.g. Curvature-TX)")
 	flag.Parse()
 	explicitFlags := visitedFlags(flag.CommandLine)
 	startupCfg, err := loadStartupConfig(*configFlag)
@@ -36,7 +37,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
-	applyStartupConfig(startupCfg, explicitFlags, addr, noRelayer, webPushFlag, agentConfigFlag, notifyScriptFlag)
+	applyStartupConfig(startupCfg, explicitFlags, addr, noRelayer, webPushFlag, agentConfigFlag, notifyScriptFlag, uiTitle)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -48,6 +49,7 @@ func main() {
 		AgentConfigPath: *agentConfigFlag,
 		WebPushEnabled:  *webPushFlag,
 		NotifyScript:    *notifyScriptFlag,
+		UITitle:         *uiTitle,
 	}); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
@@ -62,6 +64,7 @@ type startupConfig struct {
 	WebPushFlag   *bool   `json:"web-push"`
 	AgentConfig   *string `json:"agent-config"`
 	NotifyScript  *string `json:"notify-script"`
+	Title         *string `json:"title"`
 }
 
 func loadStartupConfig(path string) (startupConfig, error) {
@@ -88,7 +91,7 @@ func visitedFlags(flags *flag.FlagSet) map[string]bool {
 	return visited
 }
 
-func applyStartupConfig(cfg startupConfig, explicit map[string]bool, addr *string, noRelayer *bool, webPush *bool, agentConfig *string, notifyScript *string) {
+func applyStartupConfig(cfg startupConfig, explicit map[string]bool, addr *string, noRelayer *bool, webPush *bool, agentConfig *string, notifyScript *string, uiTitle *string) {
 	if cfg.Addr != nil && !explicit["addr"] {
 		*addr = strings.TrimSpace(*cfg.Addr)
 	}
@@ -103,6 +106,9 @@ func applyStartupConfig(cfg startupConfig, explicit map[string]bool, addr *strin
 	}
 	if cfg.NotifyScript != nil && !explicit["notify-script"] {
 		*notifyScript = strings.TrimSpace(*cfg.NotifyScript)
+	}
+	if cfg.Title != nil && !explicit["title"] {
+		*uiTitle = strings.TrimSpace(*cfg.Title)
 	}
 }
 

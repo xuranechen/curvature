@@ -1,10 +1,12 @@
-import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { MarkdownViewer } from "./MarkdownViewer";
 import { CodeViewer, supportsLineSelection } from "./CodeViewer";
 import { ImageViewer } from "./ImageViewer";
 import { BinaryViewer } from "./BinaryViewer";
 import { DocumentViewer } from "./DocumentViewer";
 import { getDocumentPreviewKind } from "../services/documentPreview";
+import { isMarkdownOutlineEnabled, subscribeMarkdownOutline } from "./markdownOutline";
+import { FileActionsButton, type FileActionOutcome } from "./FileOperations";
 import { rootBadgeStyle } from "./rootBadgeStyle";
 import { downloadFile } from "../services/download";
 import { saveFileContent, type SavedFileResult } from "../services/file";
@@ -59,6 +61,9 @@ type FileViewerProps = {
   isVisible?: boolean;
   onFileSaved?: (saved: SavedFileResult) => void;
   onRequestReload?: () => void;
+  onFileActionComplete?: (outcome: FileActionOutcome) => void | Promise<void>;
+  /** Re-reads root:path from disk, so the viewer shows what is actually on disk. */
+  onRefreshFile?: (root: string, path: string) => Promise<void> | void;
 };
 
 function isSelectionInside(root: Node, range: Range): boolean {
@@ -136,10 +141,18 @@ function Breadcrumbs({ root, path, onPathClick }: { root?: string; path: string;
   );
 }
 
-export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onSelectionChange, initialScrollTop = 0, onScrollTopChange, isVisible = true, onFileSaved, onRequestReload }: FileViewerProps) {
+export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onSelectionChange, initialScrollTop = 0, onScrollTopChange, isVisible = true, onFileSaved, onRequestReload, onFileActionComplete, onRefreshFile }: FileViewerProps) {
   const { t } = useI18n();
+  const showOutline = useSyncExternalStore(subscribeMarkdownOutline, isMarkdownOutlineEnabled, () => true);
   const [isDownloading, setIsDownloading] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  // The freshest file from props, for async handlers (Ctrl+S, startEditing):
+  // a callback captured in a key listener must not save a pre-refresh snapshot
+  // and get rejected with a 409.
+  const fileRef = useRef(file);
+  useEffect(() => {
+    fileRef.current = file;
+  }, [file]);
   const restoredScrollKeyRef = useRef("");
   const contentRootRef = useRef<HTMLDivElement | null>(null);
   const codeContentRef = useRef<HTMLElement | null>(null);
@@ -310,12 +323,27 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
 
   const isDirty = isEditing && !!file && draft !== file.content;
 
-  const startEditing = useCallback(() => {
+  // From the editor `file.content` looked current while the rendered preview
+  // did not, so the editor seeds its draft from a fresh read of the disk first
+  // and only opens after that read (any failure falls back to what is shown).
+  const startEditing = useCallback(async () => {
     if (!file || !canEditFile) return;
-    setDraft(file.content);
+    let content = file.content;
+    if (onRefreshFile && file.root) {
+      try {
+        await onRefreshFile(file.root, file.path);
+        const latest = fileRef.current;
+        if (latest && latest.path === file.path && (latest.root || "") === (file.root || "")) {
+          content = latest.content;
+        }
+      } catch {
+        // Keep the content already on screen.
+      }
+    }
+    setDraft(content);
     setEditError("");
     setIsEditing(true);
-  }, [canEditFile, file]);
+  }, [canEditFile, file, onRefreshFile]);
 
   const cancelEditing = useCallback(() => {
     setIsEditing(false);
@@ -324,15 +352,16 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
   }, []);
 
   const handleSaveEdit = useCallback(async () => {
-    if (!file?.root || !file.path || isSaving) return;
+    const current = fileRef.current;
+    if (!current?.root || !current.path || isSaving) return;
     setIsSaving(true);
     setEditError("");
     try {
       const saved = await saveFileContent({
-        rootId: file.root,
-        path: file.path,
+        rootId: current.root,
+        path: current.path,
         content: draft,
-        expectedMTime: file.mtime,
+        expectedMTime: current.mtime,
       });
       setIsEditing(false);
       setDraft("");
@@ -350,7 +379,7 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
     } finally {
       setIsSaving(false);
     }
-  }, [draft, file, isSaving, onFileSaved, showToast, t]);
+  }, [draft, isSaving, onFileSaved, showToast, t]);
 
   const handleReloadRequest = useCallback(() => {
     setIsEditing(false);
@@ -594,7 +623,7 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
             ) : (
               <button
                 type="button"
-                onClick={startEditing}
+                onClick={() => { void startEditing(); }}
                 disabled={!canEditFile}
                 title={canEditFile ? t("fileViewer.editFile") : t("fileViewer.editUnavailable")}
                 aria-label={t("fileViewer.editFile")}
@@ -619,6 +648,13 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
                 </svg>
               </button>
             )}
+            {!isEditing && file.root && onFileActionComplete ? (
+              <FileActionsButton
+                root={file.root}
+                path={file.path}
+                onComplete={onFileActionComplete}
+              />
+            ) : null}
             <div style={{ fontSize: "11px", color: "var(--text-secondary)", marginLeft: "6px", flexShrink: 0, opacity: 0.7 }}>{(file.size / 1024).toFixed(1)} KB</div>
             <button
               type="button"
@@ -668,7 +704,7 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
           {onRequestReload ? (
             <button
               type="button"
-              onClick={handleReloadRequest}
+              onClick={() => { void handleReloadRequest(); }}
               style={{
                 border: "1px solid var(--border-color)",
                 background: "transparent",
@@ -723,7 +759,7 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
           ) : file.encoding === "binary" ? (
             <div style={{ padding: "24px 16px" }}><BinaryViewer /></div>
           ) : usesMarkdownViewer ? (
-            <div ref={contentRootRef} style={{ padding: "24px 16px" }}>
+            <div ref={contentRootRef} className="markdown-document-shell" style={{ padding: "24px 16px" }}>
               <MarkdownViewer
                 content={file.content}
                 currentPath={file.path}
@@ -731,6 +767,10 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
                 onFileClick={onFileClick}
                 targetLine={file.targetLine}
                 contentRef={contentRootRef}
+                scrollContainerRef={scrollRef}
+                isVisible={isVisible}
+                compactOutline={isMobile}
+                showOutline={showOutline}
               />
             </div>
           ) : (

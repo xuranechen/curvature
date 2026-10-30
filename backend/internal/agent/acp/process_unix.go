@@ -17,6 +17,21 @@ func platformProcessDiagnostic(pid int) string {
 	return fmt.Sprintf("pgid=%d", pgid)
 }
 
+type unixProcessTree struct {
+	proc *os.Process
+}
+
+func startProcessCommand(cmd *exec.Cmd) (processTree, error) {
+	cmd.Cancel = func() error { return killProcessTree(cmd.Process) }
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return &unixProcessTree{proc: cmd.Process}, nil
+}
+
+func (t *unixProcessTree) Kill() error  { return killProcessTree(t.proc) }
+func (t *unixProcessTree) Close() error { return nil }
+
 func killProcessTree(proc *os.Process) error {
 	if proc == nil {
 		return nil

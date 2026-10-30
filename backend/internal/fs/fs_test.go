@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
 )
@@ -507,6 +508,129 @@ func TestSharedFileWatcherConcurrentWatchDirAndEvents(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestSharedFileWatcherRescanReportsMissedChanges covers the recovery path used
+// when fsnotify drops events (buffer overflow) or a client reconnects: a scan
+// must report what changed on disk even though no watch event arrived.
+func TestSharedFileWatcherRescanReportsMissedChanges(t *testing.T) {
+	rootDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rootDir, "src", "nested"), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	owned := filepath.Join(rootDir, "src", "main.go")
+	if err := os.WriteFile(owned, []byte("package main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	root := NewRootInfo("curvature", "curvature", rootDir)
+	watcher, err := NewSharedFileWatcher(root, nil)
+	if err != nil {
+		t.Fatalf("NewSharedFileWatcher returned error: %v", err)
+	}
+	defer watcher.Close()
+	if err := watcher.WatchDir("src"); err != nil {
+		t.Fatalf("WatchDir returned error: %v", err)
+	}
+
+	changes := watcher.Rescan()
+	for _, path := range []string{"src", "src/main.go", "src/nested"} {
+		if !containsChangePath(changes, path) {
+			t.Fatalf("first Rescan = %#v, want %q", changes, path)
+		}
+	}
+	if again := watcher.Rescan(); len(again) != 0 {
+		t.Fatalf("second Rescan = %#v, want no changes", again)
+	}
+
+	// Bypass the min interval that keeps reconnects from re-stating the tree.
+	watcher.lastRescan = time.Time{}
+	if err := os.WriteFile(owned, []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	added := filepath.Join(rootDir, "src", "util.go")
+	if err := os.WriteFile(added, []byte("package main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	changes = watcher.Rescan()
+	if !containsChangePath(changes, "src/main.go") || !containsChangePath(changes, "src/util.go") {
+		t.Fatalf("Rescan after edit = %#v, want src/main.go and src/util.go", changes)
+	}
+
+	if err := os.Remove(added); err != nil {
+		t.Fatalf("Remove returned error: %v", err)
+	}
+	watcher.lastRescan = time.Time{}
+	changes = watcher.Rescan()
+	if !containsChangePath(changes, "src/util.go") {
+		t.Fatalf("Rescan after remove = %#v, want src/util.go", changes)
+	}
+}
+
+// TestSharedFileWatcherRescanReportsSameSecondRewrite pins the behaviour that
+// matters for Windows, where some timestamps only move once per second: a file
+// rewritten without a visibly new mtime must still be reported, because a
+// rewrite hides by leaving the directory's listing looking identical.
+func TestSharedFileWatcherRescanReportsSameSecondRewrite(t *testing.T) {
+	rootDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rootDir, "docs"), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	note := filepath.Join(rootDir, "docs", "note.md")
+	if err := os.WriteFile(note, []byte("# one"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	root := NewRootInfo("curvature", "curvature", rootDir)
+	watcher, err := NewSharedFileWatcher(root, nil)
+	if err != nil {
+		t.Fatalf("NewSharedFileWatcher returned error: %v", err)
+	}
+	defer watcher.Close()
+	if err := watcher.WatchDir("docs"); err != nil {
+		t.Fatalf("WatchDir returned error: %v", err)
+	}
+	watcher.Rescan()
+
+	// Pin the file's timestamp to what the previous listing recorded, as a
+	// same-tick Windows rewrite does.
+	before, err := os.Stat(note)
+	if err != nil {
+		t.Fatalf("Stat returned error: %v", err)
+	}
+	if err := os.WriteFile(note, []byte("# one\n\nchanged"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	if err := os.Chtimes(note, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatalf("Chtimes returned error: %v", err)
+	}
+	watcher.lastRescan = time.Time{}
+	changes := watcher.Rescan()
+	if !containsChangePath(changes, "docs/note.md") {
+		t.Fatalf("Rescan = %#v, want docs/note.md reported for an unchanged-looking rewrite", changes)
+	}
+}
+
+func TestSharedFileWatcherRescanRespectsMinInterval(t *testing.T) {
+	rootDir := t.TempDir()
+	root := NewRootInfo("curvature", "curvature", rootDir)
+	watcher, err := NewSharedFileWatcher(root, nil)
+	if err != nil {
+		t.Fatalf("NewSharedFileWatcher returned error: %v", err)
+	}
+	defer watcher.Close()
+	watcher.Rescan()
+	if changes := watcher.Rescan(); len(changes) != 0 {
+		t.Fatalf("Rescan within min interval = %#v, want no changes", changes)
+	}
+}
+
+func containsChangePath(changes []FileChangeEvent, path string) bool {
+	for _, change := range changes {
+		if change.Path == path {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRootInfoReadFileDecodesGB18030CodeFile(t *testing.T) {

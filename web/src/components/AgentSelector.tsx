@@ -5,10 +5,13 @@ import React, {
   useLayoutEffect,
   useCallback,
   useMemo,
+  useSyncExternalStore,
 } from "react";
 import { createPortal } from "react-dom";
 import { AgentIcon } from "./AgentIcon";
+import { PinIcon } from "./PinIcon";
 import type { AgentStatus } from "../services/agents";
+import { getModelPins, getModelPinsRevision, setModelPinned, subscribeModelPins } from "../services/preferences";
 import { useI18n } from "../i18n";
 
 type AgentSelectorProps = {
@@ -170,6 +173,11 @@ export function AgentSelector({
     useState(false);
   const [restartingAgent, setRestartingAgent] = useState<string | null>(null);
   const [menuBodyHeight, setMenuBodyHeight] = useState<number | null>(null);
+  useSyncExternalStore(subscribeModelPins, getModelPinsRevision, getModelPinsRevision);
+  const [pinsSaving, setPinsSaving] = useState(false);
+  const [pinsError, setPinsError] = useState(false);
+  const pinVersionRef = useRef(0);
+  const pinsSavingRef = useRef(false);
   const [menuHorizontalOffset, setMenuHorizontalOffset] = useState(0);
   const [viewportMenuPosition, setViewportMenuPosition] = useState<{
     top: number;
@@ -190,6 +198,38 @@ export function AgentSelector({
     () => submenuAgentStatus?.models ?? [],
     [submenuAgentStatus],
   );
+  const pinnedModelIDs = getModelPins(submenuAgent || "", submenuAgentStatus?.pinned_models);
+  const orderedSubmenuModels = useMemo(() => {
+    const ids = new Set(pinnedModelIDs);
+    return [
+      ...submenuModels.filter((item) => ids.has(item.id)),
+      ...submenuModels.filter((item) => !ids.has(item.id)),
+    ];
+  }, [submenuModels, pinnedModelIDs]);
+  useEffect(() => {
+    ++pinVersionRef.current;
+    pinsSavingRef.current = false;
+    setPinsSaving(false);
+    setPinsError(false);
+    return () => { pinVersionRef.current++; };
+  }, [submenuAgent]);
+  const toggleModelPin = async (id: string) => {
+    if (!submenuAgent || pinsSavingRef.current) return;
+    const version = pinVersionRef.current;
+    pinsSavingRef.current = true;
+    setPinsSaving(true);
+    setPinsError(false);
+    try {
+      await setModelPinned(submenuAgent, id, !pinnedModelIDs.includes(id));
+    } catch {
+      if (version === pinVersionRef.current) setPinsError(true);
+    } finally {
+      if (version === pinVersionRef.current) {
+        pinsSavingRef.current = false;
+        setPinsSaving(false);
+      }
+    }
+  };
   const submenuSelectedModel = useMemo(() => {
     if (!submenuAgentStatus) return null;
     const fallbackModel =
@@ -951,51 +991,75 @@ export function AgentSelector({
                         </span>
                       </button>
                     ) : null}
-                    {submenuModels.map((item, index) => {
+                    {pinsError ? (
+                      <div role="alert" style={{ padding: "8px 12px", fontSize: 12, color: "var(--text-secondary)" }}>
+                        {t("agent.modelPinsSaveFailed")}
+                      </div>
+                    ) : null}
+                    {orderedSubmenuModels.map((item, index) => {
                       const isSelected =
                         submenuAgentStatus.name === agent &&
                         !!model &&
                         item.id === (submenuSelectedModel?.id || "");
+                      const pinned = pinnedModelIDs.includes(item.id);
+                      const pinLabel = `${t(pinned ? "agent.unpinModel" : "agent.pinModel")} ${item.name || item.id}`;
                       return (
-                        <button
+                        <div
                           key={item.id}
-                          type="button"
-                          onClick={() =>
-                            handleAgentSelect(submenuAgentStatus.name, item.id)
-                          }
-                          style={sectionItemStyle(
-                            isSelected,
-                            allowDefaultModel || index > 0,
-                            item.hidden ? 0.66 : 1,
-                          )}
-                          title={item.description || item.id}
+                          style={{
+                            display: "flex",
+                            alignItems: "flex-start",
+                            borderTop: allowDefaultModel || index > 0 ? "1px solid var(--menu-divider)" : undefined,
+                            background: isSelected ? "rgba(59, 130, 246, 0.08)" : "transparent",
+                            opacity: item.hidden ? 0.66 : 1,
+                          }}
                         >
-                          <span style={{ fontSize: "13px", fontWeight: 500 }}>
-                            {item.name || item.id}
-                          </span>
-                          {item.description ? (
-                            <span
-                              style={{
-                                fontSize: "11px",
-                                color: "var(--text-secondary)",
-                                whiteSpace: "normal",
-                                overflowWrap: "anywhere",
-                                wordBreak: "break-word",
-                              }}
-                            >
-                              {item.description}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleAgentSelect(submenuAgentStatus.name, item.id)
+                            }
+                            style={{ ...sectionItemStyle(isSelected), flex: "1 1 auto", background: "transparent", paddingRight: 4 }}
+                            title={item.description || item.id}
+                          >
+                            <span style={{ fontSize: "13px", fontWeight: 500 }}>
+                              {item.name || item.id}
                             </span>
-                          ) : item.hidden ? (
-                            <span
-                              style={{
-                                fontSize: "11px",
-                                color: "var(--text-secondary)",
-                              }}
-                            >
-                              hidden
-                            </span>
-                          ) : null}
-                        </button>
+                            {item.description ? (
+                              <span
+                                style={{
+                                  fontSize: "11px",
+                                  color: "var(--text-secondary)",
+                                  whiteSpace: "normal",
+                                  overflowWrap: "anywhere",
+                                  wordBreak: "break-word",
+                                }}
+                              >
+                                {item.description}
+                              </span>
+                            ) : item.hidden ? (
+                              <span
+                                style={{
+                                  fontSize: "11px",
+                                  color: "var(--text-secondary)",
+                                }}
+                              >
+                                hidden
+                              </span>
+                            ) : null}
+                          </button>
+                          <button
+                            type="button"
+                            aria-label={pinLabel}
+                            title={pinLabel}
+                            aria-pressed={pinned}
+                            disabled={pinsSaving}
+                            onClick={(event) => { event.stopPropagation(); void toggleModelPin(item.id); }}
+                            style={{ flex: "0 0 auto", display: "inline-flex", alignItems: "center", justifyContent: "center", width: 32, height: 32, margin: "4px 6px 0 0", padding: 6, border: 0, borderRadius: 6, background: "transparent", color: pinned ? "var(--accent-color, #3b82f6)" : "var(--text-secondary)", cursor: pinsSaving ? "default" : "pointer", opacity: pinsSaving ? 0.5 : 1 }}
+                          >
+                            <span style={{ display: "inline-flex", fontSize: 12 }}><PinIcon pinned={pinned} /></span>
+                          </button>
+                        </div>
                       );
                     })}
                   </>

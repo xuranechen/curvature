@@ -3,6 +3,9 @@ import { AgentIcon } from "./AgentIcon";
 import { ModeIcon } from "./ModeIcon";
 import { rootBadgeButtonStyle, rootBadgeStyle } from "./rootBadgeStyle";
 import { useI18n, type Locale } from "../i18n";
+import { copyText } from "../services/clipboard";
+import { sessionService } from "../services/session";
+import { reportError } from "../services/error";
 
 export type SessionType = "chat" | "plugin" | "command";
 
@@ -49,6 +52,7 @@ type SessionListProps = {
   onPin?: (session: SessionItem, pinned: boolean) => Promise<boolean> | boolean;
   onRename?: (session: SessionItem, nextName: string) => Promise<boolean> | boolean;
   onDelete?: (session: SessionItem) => void;
+  onHandoffPack?: (session: SessionItem) => void;
   onLoadChildren?: (
     session: SessionItem,
     options?: { beforeTime?: string },
@@ -96,6 +100,7 @@ type ProjectSessionListProps = {
   onPin?: (session: SessionItem, pinned: boolean) => Promise<boolean> | boolean;
   onRename?: (session: SessionItem, nextName: string) => Promise<boolean> | boolean;
   onDelete?: (session: SessionItem) => void;
+  onHandoffPack?: (session: SessionItem) => void;
   onProjectClick?: (rootId: string) => void;
   onLoadMoreProject?: (group: ProjectSessionGroup) => Promise<void> | void;
   onLoadChildren?: (
@@ -311,6 +316,7 @@ export function SessionList({
   onPin,
   onRename,
   onDelete,
+  onHandoffPack,
   onLoadChildren,
   onLoadOlder,
   loadingOlder = false,
@@ -692,6 +698,7 @@ export function SessionList({
                   onPin={onPin}
                   onRename={onRename}
                   onDelete={onDelete}
+                  onHandoffPack={onHandoffPack}
                 />
               );
             })}
@@ -745,6 +752,7 @@ export function MultiProjectSessionList({
   onPin,
   onRename,
   onDelete,
+  onHandoffPack,
   onProjectClick,
   onLoadMoreProject,
   onLoadChildren,
@@ -1166,6 +1174,7 @@ export function MultiProjectSessionList({
                           onPin={onPin}
                           onRename={onRename}
                           onDelete={onDelete}
+                          onHandoffPack={onHandoffPack}
                         />
                       );
                     })}
@@ -1222,6 +1231,7 @@ function SessionCard({
   onPin,
   onRename,
   onDelete,
+  onHandoffPack,
 }: {
   session: SessionItem;
   sessionByKey: Map<string, SessionItem>;
@@ -1235,6 +1245,7 @@ function SessionCard({
   onPin?: (session: SessionItem, pinned: boolean) => Promise<boolean> | boolean;
   onRename?: (session: SessionItem, nextName: string) => Promise<boolean> | boolean;
   onDelete?: (session: SessionItem) => void;
+  onHandoffPack?: (session: SessionItem) => void;
 }) {
   const { locale, t } = useI18n();
   const isClosed = !!session.closed_at;
@@ -1261,6 +1272,41 @@ function SessionCard({
   const inputRef = useRef<HTMLInputElement | null>(null);
   const composingRef = useRef(false);
   const submittingRef = useRef(false);
+  const copyInFlightRef = useRef(false);
+  const [copyingPath, setCopyingPath] = useState(false);
+  const [copyFeedback, setCopyFeedback] = useState(false);
+
+  useEffect(() => {
+    if (!copyFeedback) return undefined;
+    const timer = window.setTimeout(() => setCopyFeedback(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [copyFeedback]);
+
+  const copyValue = async (value: string) => {
+    setMenuOpen(false);
+    try {
+      await copyText(value);
+      setCopyFeedback(true);
+    } catch (err) {
+      reportError("clipboard.write_failed", err instanceof Error ? err.message : t("session.copyFailed"));
+    }
+  };
+
+  const copySessionPath = async () => {
+    const rootId = session.root_id || "";
+    if (!rootId || copyInFlightRef.current) return;
+    copyInFlightRef.current = true;
+    setCopyingPath(true);
+    try {
+      const { path } = await sessionService.getSessionLogPath(rootId, session.session_key || session.key);
+      await copyValue(path);
+    } catch (err) {
+      reportError("clipboard.write_failed", err instanceof Error ? err.message : t("session.copyFailed"));
+    } finally {
+      copyInFlightRef.current = false;
+      setCopyingPath(false);
+    }
+  };
 
   useEffect(() => {
     if (!editing) {
@@ -1783,6 +1829,26 @@ function SessionCard({
             </span>
           ) : null}
         </button>
+        {copyFeedback ? (
+          <span
+            role="status"
+            style={{
+              position: "absolute",
+              right: 0,
+              top: "100%",
+              zIndex: 25,
+              padding: "3px 7px",
+              borderRadius: 6,
+              background: "var(--menu-bg)",
+              border: "1px solid var(--border-color)",
+              color: "var(--text-secondary)",
+              fontSize: 11,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {t("sessionList.copied")}
+          </span>
+        ) : null}
         {menuOpen ? (
           <div
             style={{
@@ -1844,6 +1910,61 @@ function SessionCard({
               </svg>
               {t("sessionList.sync")}
             </button>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                void copyValue(session.session_key || session.key);
+              }}
+              style={{ ...menuItemStyle, color: "var(--text-primary)" }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <rect x="9" y="9" width="12" height="12" rx="2" />
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+              </svg>
+              {t("sessionList.copyId")}
+            </button>
+            <button
+              type="button"
+              disabled={copyingPath || !session.root_id || session.pending}
+              onClick={(e) => {
+                e.stopPropagation();
+                void copySessionPath();
+              }}
+              style={{
+                ...menuItemStyle,
+                color: "var(--text-primary)",
+                opacity: copyingPath || !session.root_id || session.pending ? 0.55 : 1,
+                cursor: copyingPath || !session.root_id || session.pending ? "default" : "pointer",
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M14 2H6v20h14V8zM14 2v6h6M8 13h8M8 17h8" />
+              </svg>
+              {t("sessionList.copyPath")}
+            </button>
+            {onHandoffPack ? (
+              <button
+                type="button"
+                disabled={!session.root_id || session.pending}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setMenuOpen(false);
+                  onHandoffPack(session);
+                }}
+                style={{
+                  ...menuItemStyle,
+                  color: "var(--text-primary)",
+                  opacity: !session.root_id || session.pending ? 0.55 : 1,
+                  cursor: !session.root_id || session.pending ? "default" : "pointer",
+                }}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M15 3h6v18h-6M10 17l5-5-5-5M15 12H3" />
+                </svg>
+                {t("sessionList.handoffPack")}
+              </button>
+            ) : null}
             <button
               type="button"
               onClick={(e) => {

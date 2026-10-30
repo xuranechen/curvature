@@ -23,6 +23,7 @@ import {
   type RelatedFile,
   type RelatedWorktree,
   type Session,
+  truncateSessionHistory,
   type TokenUsage,
   type QueuedUserMessage,
 } from "./services/session";
@@ -124,6 +125,7 @@ import {
   type ProjectTreeTab,
 } from "./components/FileTree";
 import { FileViewer } from "./components/FileViewer";
+import type { FileActionOutcome } from "./components/FileOperations";
 import { GitDiffViewer } from "./components/GitDiffViewer";
 import { GitHistoryPanel } from "./components/GitHistoryPanel";
 import { TimeMachinePanel, type HistoricalFilePreview } from "./components/TimeMachinePanel";
@@ -131,6 +133,7 @@ import { GitStatusPanel } from "./components/GitStatusPanel";
 import { SessionViewer } from "./components/SessionViewer";
 import { DefaultListView, type MainContentViewMode } from "./components/DefaultListView";
 import { MultiProjectSessionList, SessionList, type ProjectSessionGroup } from "./components/SessionList";
+import { HandoffPackDialog } from "./components/HandoffPackDialog";
 import { ExternalSessionList } from "./components/ExternalSessionList";
 import { InlineTokenText } from "./components/InlineTokenText";
 import { AgentIcon } from "./components/AgentIcon";
@@ -628,6 +631,8 @@ function relatedFileSelectionKey(file: RelatedFileClickTarget | null | undefined
 type URLState = {
   root: string;
   file: string;
+  /** Directory view deep link (path relative to root); undefined/"."/"" = not in directory view. */
+  dir?: string;
   session: string;
   cursor: number;
   pluginQuery: Record<string, string>;
@@ -971,6 +976,7 @@ function readURLState(): URLState {
   return {
     root: params.get("root") || "",
     file: params.get("file") || "",
+    dir: params.get("dir") || "",
     session: params.get("session") || "",
     cursor: parseCursor(params.get("cursor")),
     pluginQuery: parsePluginQuery(window.location.search),
@@ -981,6 +987,7 @@ function buildURLSearch(next: URLState): string {
   const params = new URLSearchParams();
   if (next.root) params.set("root", next.root);
   if (next.file) params.set("file", next.file);
+  if (next.dir && next.dir !== ".") params.set("dir", next.dir);
   if (next.session) params.set("session", next.session);
   if (next.cursor > 0) params.set("cursor", String(next.cursor));
   Object.entries(next.pluginQuery).forEach(([key, value]) => {
@@ -2383,7 +2390,9 @@ export function App({ onGoHome }: AppProps) {
   const [editDraftRequest, setEditDraftRequest] = useState<{
     id: number;
     content: string;
+    mode?: "replace" | "append";
   } | null>(null);
+  const [handoffPackSession, setHandoffPackSession] = useState<SessionItem | null>(null);
   const [entriesByPath, setEntriesByPath] = useState<
     Record<string, FileEntry[]>
   >({});
@@ -4539,19 +4548,22 @@ export function App({ onGoHome }: AppProps) {
     [normalizeTreeResponse, treeCacheKey],
   );
 
-  const refreshCurrentFileContent = useCallback(
-    async (rootID: string, changedPath: string) => {
+  // Re-reads one file from disk and installs it as the open file. `initialLoad`
+  // marks the no-cache load that opens a file; a refresh already on screen keeps
+  // the cursor, the plugin query and the line target the user is looking at.
+  const loadFileForPath = useCallback(
+    async (rootID: string, targetPath: string, options?: { initialLoad?: boolean }) => {
       const currentFile = fileRef.current;
-      if (!currentFile) return;
-      const currentRoot = currentFile.root || currentRootIdRef.current || "";
-      if (currentRoot !== rootID || currentFile.path !== changedPath) return;
+      const currentRoot = currentFile?.root || currentRootIdRef.current || "";
+      const isOpenFile =
+        !!currentFile && currentRoot === rootID && currentFile.path === targetPath;
 
       let readMode: "incremental" | "full" = "incremental";
       if (!pluginBypassRef.current) {
         try {
           const plugin = pluginManagerRef.current.match(
             rootID,
-            buildMatchInputFromPath(changedPath, pluginQueryRef.current),
+            buildMatchInputFromPath(targetPath, pluginQueryRef.current),
           );
           readMode = inferReadModeFromPlugin(plugin);
         } catch {
@@ -4562,17 +4574,17 @@ export function App({ onGoHome }: AppProps) {
       try {
         const next = await fetchFile({
           rootId: rootID,
-          path: changedPath,
+          path: targetPath,
           readMode,
-          cursor: fileCursorRef.current || 0,
+          cursor: options?.initialLoad ? 0 : fileCursorRef.current || 0,
         });
+        if (!next) return;
         const latestFile = fileRef.current;
         const latestRoot = latestFile?.root || currentRootIdRef.current || "";
         if (
-          !next ||
           !latestFile ||
           latestRoot !== rootID ||
-          latestFile.path !== changedPath
+          latestFile.path !== targetPath
         ) {
           return;
         }
@@ -4584,12 +4596,17 @@ export function App({ onGoHome }: AppProps) {
       } catch (err) {
         console.error("[file.refresh.changed] failed", {
           rootID,
-          changedPath,
+          changedPath: targetPath,
           err,
         });
       }
     },
     [],
+  );
+
+  const refreshCurrentFileContent = useCallback(
+    (rootID: string, changedPath: string) => loadFileForPath(rootID, changedPath),
+    [loadFileForPath],
   );
 
   const refreshGitStatus = useCallback(async (rootID: string) => {
@@ -5940,6 +5957,73 @@ export function App({ onGoHome }: AppProps) {
     ],
   );
 
+  // Delete-last-message: the server truncates the history and broadcasts
+  // session.truncated for every client; this one applies the cut immediately so
+  // the deleted turn cannot be resurrected by a re-read racing the broadcast.
+  const handleDeleteLastMessage = useCallback(
+    async (target: { seq: number; content: string; timestamp: string }) => {
+      const rootID = currentRootIdRef.current;
+      const key = String(
+        selectedSessionRef.current?.key ||
+          selectedSessionRef.current?.session_key ||
+          boundSessionByRootRef.current[rootID || ""] ||
+          "",
+      ).trim();
+      if (!rootID || !key || !target?.timestamp) return;
+      try {
+        await sessionService.removeLastMessage(rootID, key, target.seq || 0, target.content || "", target.timestamp);
+        // Applying the truncation here, before session.truncated arrives, is
+        // what keeps it from being undone: the event handler ignores events
+        // older than the cached revision, and any re-read that starts before
+        // the broadcast would otherwise restore the deleted messages from the
+        // local copy.
+        const seq = Number(target.seq || 0);
+        const cacheKey = rootSessionKey(rootID, key);
+        const current = sessionCacheRef.current[cacheKey];
+        if (current) {
+          const revision = Number((current as any).history_revision || 0);
+          const currentExchanges: any[] = Array.isArray(current.exchanges) ? current.exchanges : [];
+          let removeAt = -1;
+          currentExchanges.forEach((item, index) => {
+            if (item?.role === "user" && item?.timestamp === target.timestamp) {
+              removeAt = index;
+            }
+          });
+          const kept = removeAt >= 0
+            ? currentExchanges.slice(0, removeAt)
+            : seq > 0
+              ? currentExchanges.filter((item) => Number(item?.seq || 0) < seq)
+              : currentExchanges;
+          sessionCacheRef.current[cacheKey] = {
+            ...(current as any),
+            history_revision: revision + 1,
+            exchanges: kept,
+            exchange_aux: Object.fromEntries(
+              Object.entries(current.exchange_aux || {}).filter(([auxSeq]) =>
+                seq <= 0 || Number(auxSeq) < seq,
+              ),
+            ),
+            pending: resolvePendingForSession(rootID, key, false),
+          } as Session;
+          // Drop the reply overlay whose turn was just discarded; the next turn
+          // repopulates it.
+          delete pendingBySessionRef.current[cacheKey];
+          cancelRequestedBySessionRef.current[cacheKey] = false;
+          if ((selectedSessionRef.current?.key || selectedSessionRef.current?.session_key) === key) {
+            setSelectedPendingByKey(key, false);
+          }
+          bumpCacheVersion();
+        }
+      } catch (err) {
+        reportError(
+          "session.delete_last_failed",
+          err instanceof Error ? err.message : t("session.deleteLastFailed"),
+        );
+      }
+    },
+    [bumpCacheVersion, resolvePendingForSession, rootSessionKey, t],
+  );
+
   useEffect(() => {
     handleSelectSessionRef.current = handleSelectSession;
   }, [handleSelectSession]);
@@ -7232,6 +7316,11 @@ export function App({ onGoHome }: AppProps) {
               targetLine: parsedLocation.targetLine,
               targetColumn: parsedLocation.targetColumn,
             });
+          } else if (cached) {
+            // /api/file returned "no file". A cache hit shown a moment ago must
+            // not stay on screen as if the text were current — the file may have
+            // been deleted or turned into a directory since it was cached.
+            setFile(null);
           }
           fileCursorRef.current = cursor;
           setSelectedSession(null);
@@ -7293,6 +7382,7 @@ export function App({ onGoHome }: AppProps) {
           replaceURLState({
             root,
             file: "",
+            dir: targetIsRoot ? "" : targetPath,
             session: "",
             cursor: 0,
             pluginQuery: nextPluginQuery,
@@ -9699,6 +9789,27 @@ export function App({ onGoHome }: AppProps) {
         }
       }
     };
+    // Re-fetch what is on screen after the WebSocket comes back. The server
+    // drops change events while the socket is down and fsnotify drops them while
+    // its buffer overflows, so a reconnect is the one moment the view is
+    // guaranteed to be stale; the server also reconciles and pushes a batch, but
+    // this covers a batch that was missed too.
+    const refreshViewAfterReconnect = () => {
+      const rootID = currentRootIdRef.current;
+      if (!rootID) return;
+      const currentFile = fileRef.current;
+      if (currentFile?.path) {
+        const fileRoot = currentFile.root || rootID;
+        void refreshCurrentFileContent(fileRoot, currentFile.path);
+      }
+      const dir = currentDirAPI(rootID);
+      invalidTreeCacheKeysRef.current.add(treeCacheKey(rootID, dir));
+      void refreshTreeDir(rootID, dir, true);
+      // Commits made while the socket was down never arrived as events, so the
+      // history panel would otherwise keep its cached head until a reload.
+      void refreshGitHistory(rootID, { force: true });
+      void refreshGitStatus(rootID);
+    };
     const handleFileChanged = (payload: any) => {
       const rootID =
         typeof payload?.root_id === "string" ? payload.root_id : "";
@@ -9738,6 +9849,7 @@ export function App({ onGoHome }: AppProps) {
             void loadMultiProjectSessionGroups();
           }
           replayTargetsForAllRoots();
+          refreshViewAfterReconnect();
           break;
         case "ws.reconnecting":
           setStatus("reconnecting");
@@ -9757,6 +9869,7 @@ export function App({ onGoHome }: AppProps) {
             void loadMultiProjectSessionGroups();
           }
           replayTargetsForAllRoots();
+          refreshViewAfterReconnect();
           break;
         case "ws.closed":
           setStatus(currentRootIdRef.current ? "reconnecting" : "disconnected");
@@ -10029,6 +10142,40 @@ export function App({ onGoHome }: AppProps) {
             }
             setMultiProjectSessionPending(rootID, sessionKey, false);
             handleSessionStreamDone(rootID, sessionKey);
+            // The client that sent the message never receives it back as an
+            // event, so its local copy is the seq-0 placeholder it appended on
+            // send. Re-reading once the turn ends replaces it with the server's
+            // persisted message (real seq, final content) — without which the
+            // "latest message" the edit button relies on is the placeholder,
+            // and after an edit the rewritten message never appears.
+            void syncSession(rootID, sessionKey).then((result) => {
+              const latest = result?.session;
+              if (!latest) return;
+              const cacheKey = rootSessionKey(rootID, sessionKey);
+              if (!sessionCacheRef.current[cacheKey]) return;
+              const resolvedPending = resolvePendingForSession(rootID, sessionKey, false);
+              sessionCacheRef.current[cacheKey] = {
+                ...(latest as any),
+                key: sessionKey,
+                pending: resolvedPending,
+              } as Session;
+              bumpCacheVersion();
+              setSelectedSession((prev) => {
+                const prevKey = prev?.key || prev?.session_key;
+                const prevRoot = (prev?.root_id as string | undefined) || rootID;
+                if (!prev || prevKey !== sessionKey || prevRoot !== rootID) return prev;
+                return toSessionItem(rootID, {
+                  ...(prev as any),
+                  ...(latest as any),
+                  pending: resolvedPending,
+                });
+              });
+              if (boundSessionByRootRef.current[rootID] === sessionKey) {
+                setDrawerSessionForRoot(rootID, latest);
+              }
+            }).catch((err) => {
+              console.warn("[session/ws] refresh after done failed", { rootID, sessionKey, err });
+            });
             const newest = sessionsRef.current[0]?.updated_at || "";
             void loadSessionsForRoot(
               rootID,
@@ -10216,6 +10363,63 @@ export function App({ onGoHome }: AppProps) {
             }
           }
           break;
+        case "session.truncated": {
+          const rootID = String(payload?.root_id || "");
+          const key = String(payload?.session_key || "");
+          if (rootID && key) {
+            const cacheKey = rootSessionKey(rootID, key);
+            const cached = sessionCacheRef.current[cacheKey];
+            if (cached && Number(cached.history_revision || 0) >= Number(payload.history_revision)) break;
+            const truncated = truncateSessionHistory(cached, payload);
+            const next = truncated || payload.recovered_session || {
+              ...cached, key, root_id: rootID, history_revision: payload.history_revision,
+              exchanges: [], exchange_aux: {}, pending: false, context_window: undefined,
+            };
+            // This client's own user message is cached with seq 0 until the
+            // server replies. An edit/delete replaces the message locally and
+            // the replacement is persisted under a new seq, so a seq-0 user
+            // entry older than the truncation boundary would linger forever and
+            // become the "latest user message" again. Identical, still in-flight
+            // entries stay: the replacement turn is supposed to add them.
+            const boundary = Number(payload?.from_seq || 0);
+            const persisted = (next.exchanges || []).filter(
+              (item: Exchange) => Number((item as any)?.seq || 0) > 0,
+            );
+            const transient = ((cached?.exchanges || []) as Exchange[]).filter(
+              (item) =>
+                Number((item as any)?.seq || 0) === 0 &&
+                !persisted.some(
+                  (kept: Exchange) =>
+                    kept.role === (item as any).role &&
+                    kept.content === (item as any).content &&
+                    kept.timestamp === (item as any).timestamp,
+                ),
+            );
+            if (boundary > 0 && transient.length > 0) {
+              next.exchanges = [...(next.exchanges || []), ...transient];
+            }
+            // The session is no longer answering once history was replaced:
+            // without this an edited message stays covered by the stale stream
+            // overlay until the replacement turn produces an event.
+            if (truncated) {
+              delete pendingBySessionRef.current[cacheKey];
+              cancelRequestedBySessionRef.current[cacheKey] = false;
+              next.pending = false;
+              if ((selectedSessionRef.current?.key || selectedSessionRef.current?.session_key) === key) {
+                setSelectedPendingByKey(key, false);
+              }
+            }
+            sessionCacheRef.current[cacheKey] = next;
+            loadedSessionRef.current[cacheKey] = !!(truncated || payload.recovered_session);
+            if (boundSessionByRootRef.current[rootID] === key) setDrawerSessionForRoot(rootID, next);
+            bumpCacheVersion();
+            if (!truncated && !payload.recovered_session) void restoreActiveSession(rootID, key);
+            // The reset above means this session's history was rewritten; any
+            // reply that was still streaming belongs to the discarded turn.
+            sessionService.reloadSessionStreamState(rootID, key);
+          }
+          break;
+        }
         case "session.meta.updated":
           if (
             typeof payload?.root_id === "string" &&
@@ -10494,6 +10698,7 @@ export function App({ onGoHome }: AppProps) {
     invalidatePluginsForRoot,
     refreshTreeDir,
     refreshCurrentFileContent,
+    refreshGitHistory,
     refreshGitStatus,
     refreshManagedRoots,
     updateSessionRelatedWorktreeForKey,
@@ -10600,6 +10805,17 @@ export function App({ onGoHome }: AppProps) {
             preservePluginQuery: true,
           });
         } else {
+          if (urlState.dir && urlState.dir !== ".") {
+            await ensurePluginsLoaded(preferredRoot);
+            if (cancelled) return;
+            actionHandlersRef.current.open_dir({
+              path: urlState.dir,
+              root: preferredRoot,
+              forceDirectory: true,
+              preservePluginQuery: true,
+            });
+            return;
+          }
           const restored = await tryShowBoundSessionForRoot(preferredRoot, {
             pluginQuery: urlState.pluginQuery,
           });
@@ -10792,6 +11008,15 @@ export function App({ onGoHome }: AppProps) {
             preservePluginQuery: true,
           });
         }
+        return;
+      }
+      if (state.dir && state.dir !== ".") {
+        actionHandlers.open_dir({
+          path: state.dir,
+          root: state.root,
+          forceDirectory: true,
+          preservePluginQuery: true,
+        });
         return;
       }
       void (async () => {
@@ -11272,12 +11497,35 @@ export function App({ onGoHome }: AppProps) {
     [],
   );
 
+  // The in-place editor lives inside the composer, which only exists on the
+  // session tab. When the user is on another tab the message lands in the
+  // composer and we switch back, instead of writing into an unmounted editor.
   const handleEditUserMessage = useCallback((content: string) => {
+    const rootID = currentRootIdRef.current;
+    if (rootID) {
+      setMainContentViewForRoot(rootID, "session");
+      setMainViewPreferenceForRoot(rootID, "session");
+    }
     setEditDraftRequest((prev) => ({
       id: (prev?.id || 0) + 1,
       content,
     }));
+  }, [setMainContentViewForRoot, setMainViewPreferenceForRoot]);
+
+  const handleHandoffPack = useCallback((session: SessionItem) => {
+    setHandoffPackSession(session);
   }, []);
+
+  const handleHandoffPackInsert = useCallback((pack: string) => {
+    setEditDraftRequest((prev) => ({
+      id: (prev?.id || 0) + 1,
+      content: pack,
+      mode: "append",
+    }));
+    if (isMobile) {
+      setIsRightOpen(false);
+    }
+  }, [isMobile]);
 
   const currentFileScrollKey = buildFileScrollKey(
     file?.root || currentRootId,
@@ -11522,6 +11770,7 @@ export function App({ onGoHome }: AppProps) {
       }
       onAskUserAnswer={handleAskUserAnswer}
       onEditUserMessage={handleEditUserMessage}
+      onDeleteLastMessage={handleDeleteLastMessage}
       onForkAgentMessage={(seq) =>
         void handleForkAgentMessage(
           selectedSession?.root_id || currentRootId,
@@ -13626,6 +13875,7 @@ export function App({ onGoHome }: AppProps) {
           <FileViewer
             file={file}
             isVisible={!selectedSession}
+            onRefreshFile={(root, path) => loadFileForPath(root, path)}
             onSelectionChange={handleViewerSelectionChange}
             initialScrollTop={
               fileScrollPositionsRef.current[currentFileScrollKey] || 0
@@ -13656,6 +13906,22 @@ export function App({ onGoHome }: AppProps) {
               if (reloadRoot && file?.path) {
                 invalidateFileCache(reloadRoot, file.path);
                 void refreshCurrentFileContent(reloadRoot, file.path);
+              }
+            }}
+            onFileActionComplete={async (outcome: FileActionOutcome) => {
+              const actionRoot = file?.root || currentRootIdRef.current || "";
+              if (!actionRoot) return;
+              const parent = outcome.path.replace(/\\/g, "/").split("/").slice(0, -1).join("/") || ".";
+              invalidateFileCache(actionRoot, outcome.path);
+              void refreshTreeDir(actionRoot, parent, parent === ".");
+              if (parent !== ".") {
+                void refreshTreeDir(actionRoot, ".", false);
+              }
+              void refreshGitStatus(actionRoot);
+              if (outcome.action === "rename" && outcome.nextPath) {
+                await actionHandlers.open({ path: outcome.nextPath, root: actionRoot });
+              } else if (file?.path === outcome.path) {
+                setFile(null);
               }
             }}
           />
@@ -14087,6 +14353,7 @@ export function App({ onGoHome }: AppProps) {
         onPin={handlePinSession}
         onRename={handleRenameSession}
         onDelete={handleDeleteSession}
+        onHandoffPack={handleHandoffPack}
         onProjectClick={(rootId) => {
           actionHandlers.open_dir({
             path: rootId,
@@ -14173,6 +14440,7 @@ export function App({ onGoHome }: AppProps) {
         onPin={handlePinSession}
         onRename={handleRenameSession}
         onDelete={handleDeleteSession}
+        onHandoffPack={handleHandoffPack}
         onLoadChildren={
           sessionSearchOpen && sessionSearchResultsMode
             ? undefined
@@ -14506,6 +14774,7 @@ export function App({ onGoHome }: AppProps) {
                 }
                 onAskUserAnswer={handleAskUserAnswer}
                 onEditUserMessage={handleEditUserMessage}
+                onDeleteLastMessage={handleDeleteLastMessage}
                 onForkAgentMessage={(seq) =>
                   void handleForkAgentMessage(
                     currentRootId,
@@ -15399,6 +15668,11 @@ export function App({ onGoHome }: AppProps) {
         template={taskTemplateDialogTemplate}
         onClose={() => setTaskTemplateDialogOpen(false)}
         onSaved={handleTaskTemplateSaved}
+      />
+      <HandoffPackDialog
+        session={handoffPackSession}
+        onClose={() => setHandoffPackSession(null)}
+        onInsert={handleHandoffPackInsert}
       />
       <VersioningSettingsDialog
         open={versioningSettingsOpen}

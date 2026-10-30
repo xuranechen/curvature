@@ -32,7 +32,7 @@ const (
 	exchangeFileTpl  = "sessions/%s.jsonl"
 	auxFileTpl       = "sessions/%s.aux.jsonl"
 	selectSessionSQL = `
-	SELECT key, type, parent_session_key, parent_tool_call_id, source, task_id, model, shell, plan_mode, name, related_files_json, related_worktree_json, last_context_window_total_tokens, last_context_window_model_context_window, pinned_at, created_at, updated_at, closed_at
+	SELECT key, type, parent_session_key, parent_tool_call_id, source, task_id, model, shell, plan_mode, name, related_files_json, related_worktree_json, last_context_window_total_tokens, last_context_window_model_context_window, pinned_at, created_at, updated_at, closed_at, history_revision
 	FROM sessions`
 	deleteSessionSQL = `
 DELETE FROM sessions
@@ -515,7 +515,16 @@ func (m *Manager) addExchangeForAgentAt(session *Session, role, content, agent, 
 		session.ClosedAt = nil
 	}
 	resolvedAgent := strings.TrimSpace(agent)
-	nextSeq := len(session.Exchanges) + 1
+	// Count is not the high-water mark: editing or deleting the last message
+	// drops a slice of history, and len+1 would then reuse seq numbers that
+	// still exist in the file after a crash rollback, or that a client cached
+	// before the truncation. Allocation must only ever move forward.
+	nextSeq := 1
+	for _, e := range session.Exchanges {
+		if e.Seq >= nextSeq {
+			nextSeq = e.Seq + 1
+		}
+	}
 	ts := timestamp.UTC()
 	if ts.IsZero() {
 		ts = m.now().UTC()
@@ -1138,9 +1147,13 @@ func (m *Manager) ExchangeLogPath(key string) string {
 
 func (m *Manager) ExchangeLogAbsolutePath(key string) string {
 	path, err := m.exchangePath(key)
-	if err != nil { return "" }
+	if err != nil {
+		return ""
+	}
 	metaDir := m.root.MetaDir()
-	if metaDir == "" { return "" }
+	if metaDir == "" {
+		return ""
+	}
 	return filepath.Join(metaDir, filepath.FromSlash(path))
 }
 
@@ -1174,6 +1187,9 @@ func (m *Manager) createSessionUnsafe(session *Session) error {
 }
 
 func (m *Manager) getSessionUnsafe(key string, afterSeq int) (*Session, error) {
+	if err := m.recoverHistoryEdit(key); err != nil {
+		return nil, err
+	}
 	if afterSeq <= 0 {
 		if cached, ok := m.sessions[key]; ok && cached != nil {
 			return cached, nil
@@ -1738,6 +1754,8 @@ func openSessionMetaDB(dbFile string) (db *sql.DB, err error) {
 		return nil, err
 	}
 	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS session_edit_journal (session_key TEXT PRIMARY KEY, history BLOB, auxiliary BLOB)`,
+		`ALTER TABLE sessions ADD COLUMN history_revision INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sessions ADD COLUMN parent_session_key TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN parent_tool_call_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT ''`,
@@ -1882,6 +1900,7 @@ func scanSessionMetaRow(scanner rowScanner) (*Session, error) {
 		createdAtRaw        string
 		updatedAtRaw        string
 		closedAtRaw         sql.NullString
+		historyRevision     int
 	)
 	if err := scanner.Scan(
 		&key,
@@ -1902,10 +1921,12 @@ func scanSessionMetaRow(scanner rowScanner) (*Session, error) {
 		&createdAtRaw,
 		&updatedAtRaw,
 		&closedAtRaw,
+		&historyRevision,
 	); err != nil {
 		return nil, err
 	}
 	session := &Session{
+		HistoryRevision:  historyRevision,
 		Key:              key,
 		Type:             typ,
 		ParentSessionKey: parentSessionKey,

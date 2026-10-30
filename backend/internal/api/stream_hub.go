@@ -31,6 +31,8 @@ type StreamHub struct {
 	pendingSessions map[string]*SessionPendingState
 	replayStates    map[string]*ClientReplayState
 	completed       map[string]*CompletedSessionState
+	edits           map[string]bool
+	jobs            map[string]int
 	nextTurnID      uint64
 }
 
@@ -145,6 +147,8 @@ func NewStreamHub(e2eeManager *e2ee.Manager) *StreamHub {
 		pendingSessions: make(map[string]*SessionPendingState),
 		replayStates:    make(map[string]*ClientReplayState),
 		completed:       make(map[string]*CompletedSessionState),
+		edits:           make(map[string]bool),
+		jobs:            make(map[string]int),
 	}
 }
 
